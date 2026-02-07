@@ -40,6 +40,13 @@ async fn main() -> Result<()> {
     // Run migrations
     valka_db::migrations::run_migrations(&pool).await?;
 
+    // Recover orphaned DISPATCHING tasks (crash recovery)
+    let recovered =
+        valka_db::queries::tasks::recover_orphaned_dispatching(&pool).await?;
+    if !recovered.is_empty() {
+        info!(count = recovered.len(), "Recovered orphaned DISPATCHING tasks to PENDING");
+    }
+
     // Shutdown signal
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -69,7 +76,6 @@ async fn main() -> Result<()> {
 
     // Handle dead workers
     let dispatcher_clone = dispatcher.clone();
-    let _matching_clone = matching.clone();
     tokio::spawn(async move {
         while let Some(worker_id) = dead_rx.recv().await {
             dispatcher_clone.deregister_worker(&worker_id).await;
@@ -90,6 +96,16 @@ async fn main() -> Result<()> {
     let log_shutdown = shutdown_rx.clone();
     tokio::spawn(async move {
         server::run_log_ingester(log_pool, log_config, log_rx, log_shutdown).await;
+    });
+
+    // Start TaskReaders for all partitions (they'll handle any queue dynamically)
+    // For now, we start a task reader discovery loop that spawns readers for known queues
+    let tr_pool = pool.clone();
+    let tr_matching = matching.clone();
+    let tr_config = config.matching.clone();
+    let tr_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        server::run_task_reader_manager(tr_pool, tr_matching, tr_config, tr_shutdown).await;
     });
 
     // Install metrics exporter
@@ -124,7 +140,8 @@ async fn main() -> Result<()> {
     let rest_pool = pool.clone();
     let rest_event_tx = event_tx.clone();
     let rest_matching = matching.clone();
-    let _rest_node_id = node_id.clone();
+    let rest_dispatcher = dispatcher.clone();
+    let rest_shutdown = shutdown_rx.clone();
 
     let http_handle = tokio::spawn(async move {
         rest::serve_rest(
@@ -132,7 +149,10 @@ async fn main() -> Result<()> {
             rest_pool,
             rest_event_tx,
             rest_matching,
+            rest_dispatcher,
             metrics_handle,
+            config.web_dir.clone(),
+            rest_shutdown,
         )
         .await
     });

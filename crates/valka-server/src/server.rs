@@ -1,9 +1,12 @@
 use sqlx::PgPool;
+use std::collections::HashSet;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Duration, interval};
 use tracing::{error, info};
-use valka_core::{LogIngesterConfig, SchedulerConfig};
+use valka_core::{LogIngesterConfig, MatchingConfig, PartitionId, SchedulerConfig};
 use valka_db::queries::task_logs::{InsertLogEntry, batch_insert_logs};
+use valka_matching::MatchingService;
+use valka_matching::task_reader::TaskReader;
 
 /// Run the scheduler loop (leader election + periodic tasks)
 pub async fn run_scheduler(
@@ -139,4 +142,77 @@ fn log_level_to_string(level: i32) -> String {
         4 => "ERROR".to_string(),
         _ => "INFO".to_string(),
     }
+}
+
+/// Discover queues from PG and start TaskReaders for them
+pub async fn run_task_reader_manager(
+    pool: PgPool,
+    matching: MatchingService,
+    config: MatchingConfig,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut known_queues: HashSet<String> = HashSet::new();
+    let mut check_interval = interval(Duration::from_secs(5));
+
+    info!("TaskReader manager started");
+
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    info!("TaskReader manager shutting down");
+                    return;
+                }
+            }
+            _ = check_interval.tick() => {
+                // Discover queues from the tasks table
+                match discover_queues(&pool).await {
+                    Ok(queues) => {
+                        for queue_name in queues {
+                            if known_queues.contains(&queue_name) {
+                                continue;
+                            }
+                            known_queues.insert(queue_name.clone());
+
+                            // Ensure queue partitions exist
+                            matching.ensure_queue(&queue_name);
+
+                            // Start a TaskReader for each partition
+                            for pid in 0..config.num_partitions {
+                                let reader = TaskReader::new(
+                                    pool.clone(),
+                                    matching.clone(),
+                                    queue_name.clone(),
+                                    PartitionId(pid),
+                                    config.clone(),
+                                    shutdown.clone(),
+                                );
+                                tokio::spawn(reader.run());
+                            }
+
+                            info!(queue = %queue_name, partitions = config.num_partitions, "Started TaskReaders for queue");
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Failed to discover queues");
+                    }
+                }
+
+                // Update pending tasks metrics
+                if let Ok(counts) = valka_db::queries::tasks::count_pending_by_queue(&pool).await {
+                    for (queue, count) in counts {
+                        valka_core::metrics::set_pending_tasks(&queue, count as f64);
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn discover_queues(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT DISTINCT queue_name FROM tasks")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(name,)| name).collect())
 }

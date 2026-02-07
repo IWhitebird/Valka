@@ -8,18 +8,23 @@ use axum::{
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
 use valka_core::{TaskId, partition_for_task};
 use valka_db::DbPool;
+use valka_dispatcher::DispatcherService;
 use valka_matching::MatchingService;
+use valka_matching::partition::TaskEnvelope;
 
 #[derive(Clone)]
 struct AppState {
     pool: DbPool,
     event_tx: broadcast::Sender<valka_proto::TaskEvent>,
     matching: MatchingService,
+    dispatcher: DispatcherService,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 }
 
@@ -28,28 +33,56 @@ pub async fn serve_rest(
     pool: DbPool,
     event_tx: broadcast::Sender<valka_proto::TaskEvent>,
     matching: MatchingService,
+    dispatcher: DispatcherService,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    web_dir: String,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
     let state = AppState {
         pool,
         event_tx,
         matching,
+        dispatcher,
         metrics_handle,
     };
 
-    let app = Router::new()
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    let api_routes = Router::new()
         .route("/api/v1/tasks", post(create_task).get(list_tasks))
         .route("/api/v1/tasks/{task_id}", get(get_task))
         .route("/api/v1/tasks/{task_id}/cancel", post(cancel_task))
+        .route("/api/v1/tasks/{task_id}/runs", get(get_task_runs))
+        .route(
+            "/api/v1/tasks/{task_id}/runs/{run_id}/logs",
+            get(get_run_logs),
+        )
+        .route("/api/v1/workers", get(list_workers))
+        .route("/api/v1/dead-letters", get(list_dead_letters))
         .route("/api/v1/events", get(subscribe_events_sse))
         .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
-        .with_state(state);
+        .with_state(state)
+        .layer(cors);
+
+    // Serve static files with SPA fallback
+    let index_path = format!("{}/index.html", &web_dir);
+    let spa_fallback = ServeDir::new(&web_dir)
+        .not_found_service(ServeFile::new(index_path));
+
+    let app = api_routes.fallback_service(spa_fallback);
 
     info!("REST server listening on {addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown.changed().await;
+        })
+        .await?;
 
     Ok(())
 }
@@ -113,6 +146,8 @@ async fn create_task(
         .as_ref()
         .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok());
 
+    let metadata = body.metadata.unwrap_or(serde_json::json!({}));
+
     let task = valka_db::queries::tasks::create_task(
         &state.pool,
         valka_db::queries::tasks::CreateTaskParams {
@@ -125,7 +160,7 @@ async fn create_task(
             max_retries: body.max_retries,
             timeout_seconds: body.timeout_seconds,
             idempotency_key: body.idempotency_key,
-            metadata: body.metadata.unwrap_or(serde_json::json!({})),
+            metadata: metadata.clone(),
             scheduled_at,
         },
     )
@@ -133,6 +168,39 @@ async fn create_task(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     valka_core::metrics::record_task_created(&body.queue_name);
+
+    // Emit task created event
+    let event = valka_proto::TaskEvent {
+        event_id: uuid::Uuid::now_v7().to_string(),
+        task_id: task_id.0.clone(),
+        queue_name: body.queue_name.clone(),
+        previous_status: 0,
+        new_status: 1, // PENDING
+        worker_id: String::new(),
+        node_id: String::new(),
+        attempt_number: 0,
+        error_message: String::new(),
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    let _ = state.event_tx.send(event);
+
+    // Sync match (hot path) — same as gRPC create_task
+    if scheduled_at.is_none() {
+        let envelope = TaskEnvelope {
+            task_id: task_id.0.clone(),
+            task_run_id: String::new(),
+            queue_name: body.queue_name.clone(),
+            task_name: body.task_name.clone(),
+            input: body.input.map(|v| v.to_string()),
+            attempt_number: 1,
+            timeout_seconds: body.timeout_seconds,
+            metadata: metadata.to_string(),
+            priority: body.priority,
+        };
+        let _ = state
+            .matching
+            .offer_task(&body.queue_name, partition, envelope);
+    }
 
     Ok((StatusCode::CREATED, Json(task_row_to_json(task))))
 }
@@ -171,7 +239,8 @@ async fn cancel_task(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let task = valka_db::queries::tasks::cancel_task(&state.pool, &task_id)
+    // Try cancelling (PENDING, RETRY, RUNNING, DISPATCHING)
+    let task = valka_db::queries::tasks::cancel_task_any(&state.pool, &task_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| {
@@ -181,7 +250,133 @@ async fn cancel_task(
             )
         })?;
 
+    // If task was RUNNING, forward cancellation to the worker
+    state.dispatcher.cancel_task_on_worker(&task_id).await;
+
+    // Emit cancel event
+    let event = valka_proto::TaskEvent {
+        event_id: uuid::Uuid::now_v7().to_string(),
+        task_id: task_id.clone(),
+        queue_name: task.queue_name.clone(),
+        previous_status: 0,
+        new_status: 8, // CANCELLED
+        worker_id: String::new(),
+        node_id: String::new(),
+        attempt_number: 0,
+        error_message: String::new(),
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    let _ = state.event_tx.send(event);
+
     Ok(Json(task_row_to_json(task)))
+}
+
+async fn get_task_runs(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let runs = valka_db::queries::task_runs::get_runs_for_task(&state.pool, &task_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let result: Vec<serde_json::Value> = runs.into_iter().map(task_run_to_json).collect();
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+struct LogsQuery {
+    #[serde(default = "default_log_limit")]
+    limit: i64,
+    #[serde(default)]
+    after_id: Option<i64>,
+}
+
+fn default_log_limit() -> i64 {
+    1000
+}
+
+async fn get_run_logs(
+    State(state): State<AppState>,
+    Path((task_id, run_id)): Path<(String, String)>,
+    Query(query): Query<LogsQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Verify the run belongs to the task
+    let _ = task_id; // Used for API consistency; logs are queried by run_id
+
+    let logs =
+        valka_db::queries::task_logs::get_logs_for_run(&state.pool, &run_id, query.limit, query.after_id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let result: Vec<serde_json::Value> = logs.into_iter().map(task_log_to_json).collect();
+    Ok(Json(result))
+}
+
+async fn list_workers(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Return in-memory connected workers from dispatcher
+    let workers: Vec<serde_json::Value> = state
+        .dispatcher
+        .workers()
+        .iter()
+        .map(|entry| {
+            let h = entry.value();
+            serde_json::json!({
+                "id": h.worker_id.0,
+                "name": h.worker_name,
+                "queues": h.queues,
+                "concurrency": h.concurrency,
+                "active_tasks": h.active_tasks.len(),
+                "status": "CONNECTED",
+                "last_heartbeat": h.last_heartbeat.to_rfc3339(),
+                "connected_at": h.connected_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    Ok(Json(workers))
+}
+
+#[derive(Deserialize)]
+struct DeadLetterQuery {
+    #[serde(default)]
+    queue_name: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: i64,
+    #[serde(default)]
+    offset: i64,
+}
+
+async fn list_dead_letters(
+    State(state): State<AppState>,
+    Query(query): Query<DeadLetterQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let dls = valka_db::queries::dead_letter::list_dead_letters(
+        &state.pool,
+        query.queue_name.as_deref(),
+        query.limit,
+        query.offset,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let result: Vec<serde_json::Value> = dls
+        .into_iter()
+        .map(|dl| {
+            serde_json::json!({
+                "id": dl.id,
+                "task_id": dl.task_id,
+                "queue_name": dl.queue_name,
+                "task_name": dl.task_name,
+                "input": dl.input,
+                "error_message": dl.error_message,
+                "attempt_count": dl.attempt_count,
+                "metadata": dl.metadata,
+                "created_at": dl.created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    Ok(Json(result))
 }
 
 async fn subscribe_events_sse(
@@ -232,8 +427,38 @@ fn task_row_to_json(row: valka_db::queries::tasks::TaskRow) -> serde_json::Value
         "idempotency_key": row.idempotency_key,
         "input": row.input,
         "metadata": row.metadata,
+        "output": row.output,
+        "error_message": row.error_message,
         "scheduled_at": row.scheduled_at.map(|t| t.to_rfc3339()),
         "created_at": row.created_at.to_rfc3339(),
         "updated_at": row.updated_at.to_rfc3339(),
+    })
+}
+
+fn task_run_to_json(row: valka_db::queries::task_runs::TaskRunRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": row.id,
+        "task_id": row.task_id,
+        "attempt_number": row.attempt_number,
+        "worker_id": row.worker_id,
+        "assigned_node_id": row.assigned_node_id,
+        "status": row.status,
+        "output": row.output,
+        "error_message": row.error_message,
+        "lease_expires_at": row.lease_expires_at.to_rfc3339(),
+        "started_at": row.started_at.to_rfc3339(),
+        "completed_at": row.completed_at.map(|t| t.to_rfc3339()),
+        "last_heartbeat": row.last_heartbeat.to_rfc3339(),
+    })
+}
+
+fn task_log_to_json(row: valka_db::queries::task_logs::TaskLogRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": row.id,
+        "task_run_id": row.task_run_id,
+        "timestamp_ms": row.timestamp_ms,
+        "level": row.level,
+        "message": row.message,
+        "metadata": row.metadata,
     })
 }

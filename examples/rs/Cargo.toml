@@ -1,0 +1,23 @@
+[package]
+name = "valka-examples"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+valka-sdk = { path = "../../crates/valka-sdk" }
+tokio = { version = "1.49", features = ["full"] }
+serde_json = "1.0"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "producer"
+path = "producer.rs"
+
+[[example]]
+name = "worker"
+path = "worker.rs"
+
+[[example]]
+name = "full_lifecycle"
+path = "full_lifecycle.rs"

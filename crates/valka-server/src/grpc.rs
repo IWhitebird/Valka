@@ -17,6 +17,7 @@ use valka_proto::*;
 pub struct ApiServiceImpl {
     pool: DbPool,
     matching: MatchingService,
+    dispatcher: DispatcherService,
     event_tx: broadcast::Sender<TaskEvent>,
     _node_id: NodeId,
 }
@@ -111,6 +112,21 @@ impl api_service_server::ApiService for ApiServiceImpl {
 
         valka_core::metrics::record_task_created(&req.queue_name);
 
+        // Emit task created event
+        let event = TaskEvent {
+            event_id: uuid::Uuid::now_v7().to_string(),
+            task_id: task_id.0.clone(),
+            queue_name: req.queue_name.clone(),
+            previous_status: 0,
+            new_status: 1, // PENDING
+            worker_id: String::new(),
+            node_id: String::new(),
+            attempt_number: 0,
+            error_message: String::new(),
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let _ = self.event_tx.send(event);
+
         // Try sync match (hot path)
         if scheduled_at.is_none() {
             let envelope = TaskEnvelope {
@@ -202,7 +218,7 @@ impl api_service_server::ApiService for ApiServiceImpl {
         request: Request<CancelTaskRequest>,
     ) -> Result<Response<CancelTaskResponse>, Status> {
         let req = request.into_inner();
-        let task = valka_db::queries::tasks::cancel_task(&self.pool, &req.task_id)
+        let task = valka_db::queries::tasks::cancel_task_any(&self.pool, &req.task_id)
             .await
             .map_err(|e| Status::internal(format!("Database error: {e}")))?
             .ok_or_else(|| {
@@ -211,6 +227,26 @@ impl api_service_server::ApiService for ApiServiceImpl {
                     req.task_id
                 ))
             })?;
+
+        // Forward cancellation to worker if running
+        self.dispatcher
+            .cancel_task_on_worker(&req.task_id)
+            .await;
+
+        // Emit cancel event
+        let event = TaskEvent {
+            event_id: uuid::Uuid::now_v7().to_string(),
+            task_id: req.task_id.clone(),
+            queue_name: task.queue_name.clone(),
+            previous_status: 0,
+            new_status: 8, // CANCELLED
+            worker_id: String::new(),
+            node_id: String::new(),
+            attempt_number: 0,
+            error_message: String::new(),
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let _ = self.event_tx.send(event);
 
         Ok(Response::new(CancelTaskResponse {
             task: Some(task_row_to_proto(task)),
@@ -320,6 +356,7 @@ pub async fn serve_grpc(
     let api_service = ApiServiceImpl {
         pool,
         matching,
+        dispatcher: dispatcher.clone(),
         event_tx,
         _node_id: node_id,
     };
@@ -338,6 +375,8 @@ pub async fn serve_grpc(
     info!("gRPC server listening on {addr}");
 
     tonic::transport::Server::builder()
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(10)))
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(5)))
         .add_service(health_service)
         .add_service(reflection_service)
         .add_service(api_service_server::ApiServiceServer::new(api_service))
@@ -367,8 +406,8 @@ fn task_row_to_proto(row: valka_db::queries::tasks::TaskRow) -> TaskMeta {
         idempotency_key: row.idempotency_key.unwrap_or_default(),
         input: row.input.map(|v| v.to_string()).unwrap_or_default(),
         metadata: row.metadata.to_string(),
-        output: String::new(),
-        error_message: String::new(),
+        output: row.output.map(|v| v.to_string()).unwrap_or_default(),
+        error_message: row.error_message.unwrap_or_default(),
         scheduled_at: row.scheduled_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
         created_at: row.created_at.to_rfc3339(),
         updated_at: row.updated_at.to_rfc3339(),

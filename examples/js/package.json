@@ -1,0 +1,19 @@
+{
+  "name": "valka-examples-js",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "producer": "tsx producer.ts",
+    "worker": "tsx worker.ts",
+    "full-lifecycle": "tsx full-lifecycle.ts"
+  },
+  "dependencies": {
+    "@valka/sdk": "file:../../sdks/typescript"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.1",
+    "tsx": "^4.19.0",
+    "typescript": "~5.7.0"
+  }
+}

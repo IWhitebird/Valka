@@ -76,3 +76,80 @@ fn test_sdk_retry_policy_max_cap() {
         "Delay should not exceed max_delay + jitter"
     );
 }
+
+#[test]
+fn test_retry_delay_zero_base() {
+    // With base_delay = 0, all delays should be 0
+    for attempt in 0..10 {
+        let d = compute_retry_delay(attempt, 0, 3600);
+        assert_eq!(
+            d.num_seconds(),
+            0,
+            "Zero base should always produce zero delay"
+        );
+    }
+}
+
+#[test]
+fn test_retry_delay_base_exceeds_max() {
+    // base_delay > max_delay should be capped immediately
+    let d = compute_retry_delay(0, 100, 10);
+    assert_eq!(d.num_seconds(), 10, "Should be capped to max_delay");
+
+    let d1 = compute_retry_delay(1, 100, 10);
+    assert_eq!(d1.num_seconds(), 10, "Should still be capped");
+}
+
+#[test]
+fn test_retry_delay_exact_sequence() {
+    let expected = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
+    for (attempt, &expected_secs) in expected.iter().enumerate() {
+        let d = compute_retry_delay(attempt as i32, 1, 3600);
+        assert_eq!(
+            d.num_seconds(),
+            expected_secs,
+            "Attempt {attempt}: expected {expected_secs}s"
+        );
+    }
+}
+
+#[test]
+fn test_sdk_retry_jitter_bounded() {
+    // Jitter should be at most 10% of the computed delay
+    let mut policy = valka_sdk::retry::RetryPolicy::new();
+
+    for _ in 0..50 {
+        let d = policy.next_delay();
+        // Max possible: 30s * 1.1 = 33s
+        assert!(
+            d <= std::time::Duration::from_millis(33000),
+            "Delay with jitter should not exceed 33s, got {d:?}"
+        );
+    }
+}
+
+#[test]
+fn test_sdk_retry_reset_restarts_sequence() {
+    let mut policy = valka_sdk::retry::RetryPolicy::new();
+    let first = policy.next_delay();
+
+    // Advance several times
+    for _ in 0..5 {
+        let _ = policy.next_delay();
+    }
+
+    policy.reset();
+    let after_reset = policy.next_delay();
+
+    // Both should be in the initial range (100-120ms)
+    assert!(
+        first.as_millis() < 200,
+        "First delay should be <200ms, got {}ms",
+        first.as_millis()
+    );
+    assert!(
+        after_reset.as_millis() < 200,
+        "After reset, delay should be <200ms, got {}ms",
+        after_reset.as_millis()
+    );
+}

@@ -1,0 +1,13 @@
+target/
+web/node_modules/
+web/dist/
+sdks/
+.git/
+.idea/
+.vscode/
+*.log
+*.swp
+*.swo
+*~
+.DS_Store
+.env
