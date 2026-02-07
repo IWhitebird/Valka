@@ -14,20 +14,25 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
+    shm_size: 128mb
 
   valka-server:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      VALKA__DATABASE_URL: postgresql://valka:valka@postgres:5432/valka
-      VALKA__GRPC_ADDR: "[::]:50051"
-      VALKA__HTTP_ADDR: "0.0.0.0:8080"
+      VALKA_DATABASE_URL: postgresql://valka:valka@postgres:5432/valka
+      VALKA_GRPC_ADDR: "[::]:50051"
+      VALKA_HTTP_ADDR: "0.0.0.0:8080"
       RUST_LOG: valka=info,tower_http=info
     ports:
       - "50051:50051"
       - "8080:8080"
+    restart: unless-stopped
 
 volumes:
   pgdata:

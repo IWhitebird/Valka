@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 300" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0f172a;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1e293b;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#38bdf8;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#818cf8;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="accent2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#818cf8;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#c084fc;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="900" height="300" rx="16" fill="url(#bg)"/>
+
+  <!-- Logo mark -->
+  <!-- V shape -->
+  <path d="M 80 60 L 155 210 L 145 210 L 70 60 Z" fill="url(#accent)" opacity="0.95"/>
+  <path d="M 230 60 L 165 210 L 175 210 L 240 60 Z" fill="url(#accent2)" opacity="0.95"/>
+  <!-- Center diamond -->
+  <rect x="140" y="198" width="24" height="24" rx="3" transform="rotate(45 152 210)" fill="url(#accent)" opacity="0.85"/>
+  <!-- Stream lines -->
+  <line x1="92" y1="90" x2="68" y2="90" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round" opacity="0.5"/>
+  <line x1="100" y1="108" x2="76" y2="108" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" opacity="0.4"/>
+  <line x1="218" y1="90" x2="242" y2="90" stroke="#c084fc" stroke-width="2.5" stroke-linecap="round" opacity="0.5"/>
+  <line x1="210" y1="108" x2="234" y2="108" stroke="#c084fc" stroke-width="2" stroke-linecap="round" opacity="0.4"/>
+  <!-- Task dots -->
+  <circle cx="155" cy="240" r="3.5" fill="#38bdf8" opacity="0.7"/>
+  <circle cx="144" cy="252" r="2.5" fill="#818cf8" opacity="0.5"/>
+  <circle cx="166" cy="252" r="2.5" fill="#c084fc" opacity="0.5"/>
+
+  <!-- VALKA text -->
+  <text x="370" y="138" font-family="'Inter', 'SF Pro Display', -apple-system, sans-serif" font-weight="800" font-size="72" letter-spacing="8" fill="white" opacity="0.95">VALKA</text>
+
+  <!-- Tagline -->
+  <text x="370" y="178" font-family="'Inter', 'SF Pro Display', -apple-system, sans-serif" font-weight="400" font-size="20" letter-spacing="2" fill="#94a3b8">DISTRIBUTED TASK QUEUE</text>
+
+  <!-- Subtitle -->
+  <text x="370" y="215" font-family="'Inter', 'SF Pro Display', -apple-system, sans-serif" font-weight="400" font-size="15" fill="#64748b">Rust-native. PostgreSQL-powered. Built for simplicity.</text>
+
+  <!-- Tech badges area -->
+  <!-- Rust badge -->
+  <rect x="370" y="235" width="60" height="24" rx="12" fill="#38bdf8" opacity="0.15" stroke="#38bdf8" stroke-width="1" stroke-opacity="0.3"/>
+  <text x="400" y="251" text-anchor="middle" font-family="'Inter', monospace" font-weight="500" font-size="11" fill="#38bdf8">Rust</text>
+
+  <!-- gRPC badge -->
+  <rect x="440" y="235" width="60" height="24" rx="12" fill="#818cf8" opacity="0.15" stroke="#818cf8" stroke-width="1" stroke-opacity="0.3"/>
+  <text x="470" y="251" text-anchor="middle" font-family="'Inter', monospace" font-weight="500" font-size="11" fill="#818cf8">gRPC</text>
+
+  <!-- PostgreSQL badge -->
+  <rect x="510" y="235" width="90" height="24" rx="12" fill="#c084fc" opacity="0.15" stroke="#c084fc" stroke-width="1" stroke-opacity="0.3"/>
+  <text x="555" y="251" text-anchor="middle" font-family="'Inter', monospace" font-weight="500" font-size="11" fill="#c084fc">PostgreSQL</text>
+</svg>

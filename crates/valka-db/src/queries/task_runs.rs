@@ -117,6 +117,25 @@ pub async fn find_expired_leases(pool: &PgPool) -> Result<Vec<TaskRunRow>, sqlx:
     Ok(rows)
 }
 
+/// Update heartbeat for all running runs of a given task
+pub async fn update_heartbeat_by_task(
+    pool: &PgPool,
+    task_id: &str,
+    new_lease_expires_at: DateTime<Utc>,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        UPDATE task_runs SET last_heartbeat = NOW(), lease_expires_at = $2
+        WHERE task_id = $1 AND status = 'RUNNING'
+        "#,
+    )
+    .bind(task_id)
+    .bind(new_lease_expires_at)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn get_task_run(pool: &PgPool, run_id: &str) -> Result<Option<TaskRunRow>, sqlx::Error> {
     let row = sqlx::query_as::<_, TaskRunRow>("SELECT * FROM task_runs WHERE id = $1")
         .bind(run_id)

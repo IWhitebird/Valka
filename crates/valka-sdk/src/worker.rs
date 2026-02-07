@@ -1,9 +1,10 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tracing::{error, info, warn};
@@ -37,7 +38,7 @@ impl ValkaWorkerBuilder {
     pub fn new() -> Self {
         Self {
             name: format!("worker-{}", &Uuid::now_v7().to_string()[..8]),
-            server_addr: "http://[::1]:50051".to_string(),
+            server_addr: "http://127.0.0.1:50051".to_string(),
             queues: vec![],
             concurrency: 1,
             handler: None,
@@ -92,6 +93,7 @@ impl ValkaWorkerBuilder {
             concurrency: self.concurrency,
             handler,
             metadata: self.metadata,
+            shutdown: Arc::new(Notify::new()),
         })
     }
 }
@@ -99,6 +101,17 @@ impl ValkaWorkerBuilder {
 impl Default for ValkaWorkerBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Handle to request graceful shutdown of a running worker.
+#[derive(Clone)]
+pub struct ShutdownHandle(Arc<Notify>);
+
+impl ShutdownHandle {
+    /// Signal the worker to shut down gracefully, draining in-flight tasks.
+    pub fn shutdown(&self) {
+        self.0.notify_one();
     }
 }
 
@@ -111,11 +124,17 @@ pub struct ValkaWorker {
     concurrency: i32,
     handler: TaskHandler,
     metadata: String,
+    shutdown: Arc<Notify>,
 }
 
 impl ValkaWorker {
     pub fn builder() -> ValkaWorkerBuilder {
         ValkaWorkerBuilder::new()
+    }
+
+    /// Returns a handle that can be used to trigger graceful shutdown from another task.
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle(self.shutdown.clone())
     }
 
     /// Run the worker event loop. Blocks until shutdown.
@@ -144,6 +163,9 @@ impl ValkaWorker {
     async fn connect_and_run(&self, retry_policy: &mut RetryPolicy) -> Result<(), SdkError> {
         let channel = Channel::from_shared(self.server_addr.clone())
             .map_err(|e| SdkError::Connection(e.to_string()))?
+            .http2_keep_alive_interval(std::time::Duration::from_secs(10))
+            .keep_alive_timeout(std::time::Duration::from_secs(5))
+            .keep_alive_while_idle(true)
             .connect()
             .await?;
 
@@ -174,16 +196,23 @@ impl ValkaWorker {
             .await
             .map_err(|_| SdkError::NotConnected)?;
 
+        // Shared active task tracking
+        let active_tasks: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
         // Start heartbeat loop
         let hb_tx = request_tx.clone();
-        let _worker_id = self.worker_id.clone();
+        let hb_active = active_tasks.clone();
         let hb_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
             loop {
                 interval.tick().await;
+                let task_ids: Vec<String> = {
+                    let guard = hb_active.lock().await;
+                    guard.iter().cloned().collect()
+                };
                 let hb = WorkerRequest {
                     request: Some(worker_request::Request::Heartbeat(Heartbeat {
-                        active_task_ids: vec![],
+                        active_task_ids: task_ids,
                         timestamp_ms: chrono::Utc::now().timestamp_millis(),
                     })),
                 };
@@ -203,11 +232,21 @@ impl ValkaWorker {
                         Some(Ok(response)) => {
                             match response.response {
                                 Some(worker_response::Response::TaskAssignment(assignment)) => {
+                                    // Track active task
+                                    {
+                                        let mut guard = active_tasks.lock().await;
+                                        guard.insert(assignment.task_id.clone());
+                                    }
+
                                     let permit = semaphore.clone().acquire_owned().await
                                         .map_err(|_| SdkError::ShuttingDown)?;
                                     let handler = self.handler.clone();
                                     let tx = request_tx.clone();
+                                    let active = active_tasks.clone();
                                     tokio::spawn(async move {
+                                        let task_id = assignment.task_id.clone();
+                                        let task_run_id = assignment.task_run_id.clone();
+
                                         let ctx = TaskContext::new(
                                             assignment.task_id.clone(),
                                             assignment.task_run_id.clone(),
@@ -223,16 +262,16 @@ impl ValkaWorker {
 
                                         let task_result = match result {
                                             Ok(output) => TaskResult {
-                                                task_id: assignment.task_id,
-                                                task_run_id: assignment.task_run_id,
+                                                task_id: task_id.clone(),
+                                                task_run_id,
                                                 success: true,
                                                 retryable: false,
                                                 output: output.to_string(),
                                                 error_message: String::new(),
                                             },
                                             Err(err) => TaskResult {
-                                                task_id: assignment.task_id,
-                                                task_run_id: assignment.task_run_id,
+                                                task_id: task_id.clone(),
+                                                task_run_id,
                                                 success: false,
                                                 retryable: true,
                                                 output: String::new(),
@@ -244,11 +283,21 @@ impl ValkaWorker {
                                             request: Some(worker_request::Request::TaskResult(task_result)),
                                         };
                                         let _ = tx.send(request).await;
+
+                                        // Remove from active tasks
+                                        {
+                                            let mut guard = active.lock().await;
+                                            guard.remove(&task_id);
+                                        }
+
                                         drop(permit);
                                     });
                                 }
                                 Some(worker_response::Response::TaskCancellation(cancel)) => {
                                     info!(task_id = %cancel.task_id, "Task cancelled by server");
+                                    // Remove from active tasks
+                                    let mut guard = active_tasks.lock().await;
+                                    guard.remove(&cancel.task_id);
                                 }
                                 Some(worker_response::Response::HeartbeatAck(_)) => {}
                                 Some(worker_response::Response::ServerShutdown(shutdown)) => {
@@ -277,6 +326,18 @@ impl ValkaWorker {
                     };
                     let _ = request_tx.send(shutdown).await;
                     // Wait for in-flight tasks
+                    let _ = semaphore.acquire_many(self.concurrency as u32).await;
+                    hb_handle.abort();
+                    return Ok(());
+                }
+                _ = self.shutdown.notified() => {
+                    info!("Shutdown requested via handle, draining gracefully");
+                    let shutdown = WorkerRequest {
+                        request: Some(worker_request::Request::Shutdown(GracefulShutdown {
+                            reason: "shutdown_handle".to_string(),
+                        })),
+                    };
+                    let _ = request_tx.send(shutdown).await;
                     let _ = semaphore.acquire_many(self.concurrency as u32).await;
                     hb_handle.abort();
                     return Ok(());

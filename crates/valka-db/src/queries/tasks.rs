@@ -18,6 +18,8 @@ pub struct TaskRow {
     pub scheduled_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub output: Option<serde_json::Value>,
+    pub error_message: Option<String>,
 }
 
 pub struct CreateTaskParams {
@@ -223,6 +225,95 @@ pub async fn promote_delayed_tasks(pool: &PgPool) -> Result<Vec<TaskRow>, sqlx::
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+/// Update task with completed output
+pub async fn complete_task(
+    pool: &PgPool,
+    task_id: &str,
+    output: Option<serde_json::Value>,
+) -> Result<Option<TaskRow>, sqlx::Error> {
+    let row = sqlx::query_as::<_, TaskRow>(
+        r#"
+        UPDATE tasks SET status = 'COMPLETED', output = $2, updated_at = NOW()
+        WHERE id = $1
+        RETURNING *
+        "#,
+    )
+    .bind(task_id)
+    .bind(output)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Update task with failure info
+pub async fn fail_task(
+    pool: &PgPool,
+    task_id: &str,
+    error_message: &str,
+) -> Result<Option<TaskRow>, sqlx::Error> {
+    let row = sqlx::query_as::<_, TaskRow>(
+        r#"
+        UPDATE tasks SET status = 'FAILED', error_message = $2, updated_at = NOW()
+        WHERE id = $1
+        RETURNING *
+        "#,
+    )
+    .bind(task_id)
+    .bind(error_message)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Cancel a task including RUNNING tasks (for forwarding cancellation to workers)
+pub async fn cancel_task_any(pool: &PgPool, task_id: &str) -> Result<Option<TaskRow>, sqlx::Error> {
+    let row = sqlx::query_as::<_, TaskRow>(
+        r#"
+        UPDATE tasks SET status = 'CANCELLED', updated_at = NOW()
+        WHERE id = $1 AND status IN ('PENDING', 'RETRY', 'RUNNING', 'DISPATCHING')
+        RETURNING *
+        "#,
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Count pending tasks per queue (for metrics)
+pub async fn count_pending_by_queue(pool: &PgPool) -> Result<Vec<(String, i64)>, sqlx::Error> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT queue_name, COUNT(*) as count FROM tasks WHERE status = 'PENDING' GROUP BY queue_name",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// List workers from the workers table
+pub async fn list_workers_db(pool: &PgPool) -> Result<Vec<WorkerRow>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, WorkerRow>(
+        "SELECT * FROM workers ORDER BY connected_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct WorkerRow {
+    pub id: String,
+    pub node_id: String,
+    pub worker_name: String,
+    pub queues: serde_json::Value,
+    pub concurrency: i32,
+    pub status: String,
+    pub metadata: serde_json::Value,
+    pub last_heartbeat: DateTime<Utc>,
+    pub connected_at: DateTime<Utc>,
+    pub disconnected_at: Option<DateTime<Utc>>,
 }
 
 /// Find DISPATCHING tasks with no active runs (crash recovery)

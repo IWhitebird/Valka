@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package valka.v1;
+
+import "valka/v1/common.proto";
+import "valka/v1/events.proto";
+import "valka/v1/worker.proto";
+
+service ApiService {
+    // Task CRUD
+    rpc CreateTask(CreateTaskRequest) returns (CreateTaskResponse);
+    rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+    rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+    rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
+
+    // Event streaming
+    rpc SubscribeEvents(SubscribeEventsRequest) returns (stream TaskEvent);
+
+    // Log streaming
+    rpc SubscribeLogs(SubscribeLogsRequest) returns (stream LogEntry);
+}
+
+// --- CreateTask ---
+message CreateTaskRequest {
+    string queue_name = 1;
+    string task_name = 2;
+    string input = 3;              // JSON string
+    int32 priority = 4;
+    int32 max_retries = 5;
+    int32 timeout_seconds = 6;
+    string idempotency_key = 7;
+    string metadata = 8;           // JSON string
+    string scheduled_at = 9;       // RFC3339, empty = immediate
+}
+
+message CreateTaskResponse {
+    TaskMeta task = 1;
+}
+
+// --- GetTask ---
+message GetTaskRequest {
+    string task_id = 1;
+}
+
+message GetTaskResponse {
+    TaskMeta task = 1;
+}
+
+// --- ListTasks ---
+message ListTasksRequest {
+    string queue_name = 1;          // optional filter
+    TaskStatus status = 2;          // optional filter
+    Pagination pagination = 3;
+}
+
+message ListTasksResponse {
+    repeated TaskMeta tasks = 1;
+    string next_page_token = 2;
+}
+
+// --- CancelTask ---
+message CancelTaskRequest {
+    string task_id = 1;
+}
+
+message CancelTaskResponse {
+    TaskMeta task = 1;
+}
+
+// --- SubscribeLogs ---
+message SubscribeLogsRequest {
+    string task_run_id = 1;
+    bool include_history = 2;
+}
+
+// --- SubscribeEvents ---
+message SubscribeEventsRequest {
+    string queue_name = 1;          // optional filter
+}

@@ -7,3 +7,14 @@
 .idea/
 .vscode/
 *.log
+
+# WebUI
+web/node_modules/
+web/dist/
+
+# TypeScript SDK
+sdks/typescript/node_modules/
+sdks/typescript/dist/
+
+# JS Examples
+examples/js/node_modules/

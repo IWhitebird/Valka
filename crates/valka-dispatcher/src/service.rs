@@ -10,7 +10,8 @@ use valka_db::DbPool;
 use valka_matching::MatchingService;
 use valka_matching::partition::TaskEnvelope;
 use valka_proto::{
-    Heartbeat, LogBatch, TaskAssignment, TaskResult, WorkerResponse, worker_response,
+    Heartbeat, LogBatch, TaskAssignment, TaskCancellation, TaskEvent, TaskResult, WorkerResponse,
+    worker_response,
 };
 
 /// The dispatcher manages all connected workers and their gRPC streams.
@@ -20,7 +21,7 @@ pub struct DispatcherService {
     matching: MatchingService,
     pool: DbPool,
     node_id: NodeId,
-    _event_tx: broadcast::Sender<valka_proto::TaskEvent>,
+    event_tx: broadcast::Sender<TaskEvent>,
     log_tx: mpsc::Sender<valka_proto::LogEntry>,
 }
 
@@ -29,7 +30,7 @@ impl DispatcherService {
         matching: MatchingService,
         pool: DbPool,
         node_id: NodeId,
-        event_tx: broadcast::Sender<valka_proto::TaskEvent>,
+        event_tx: broadcast::Sender<TaskEvent>,
         log_tx: mpsc::Sender<valka_proto::LogEntry>,
     ) -> Self {
         Self {
@@ -37,7 +38,7 @@ impl DispatcherService {
             matching,
             pool,
             node_id,
-            _event_tx: event_tx,
+            event_tx,
             log_tx,
         }
     }
@@ -64,6 +65,8 @@ impl DispatcherService {
 
     /// Background loop: register as waiting in matching service, receive tasks, push to worker
     pub async fn run_worker_match_loop(&self, worker_id: WorkerId, queues: Vec<String>) {
+        let num_partitions = self.matching.config().num_partitions;
+
         loop {
             let available = {
                 match self.workers.get(worker_id.as_ref()) {
@@ -77,22 +80,34 @@ impl DispatcherService {
                 continue;
             }
 
-            // Register as waiting on each queue
+            // Register as waiting on ALL partitions for all queues simultaneously
+            let mut receivers = Vec::new();
             for queue in &queues {
-                let partition_id = PartitionId(0); // TODO: proper partition assignment
-                let rx = self
-                    .matching
-                    .register_worker(queue, partition_id, worker_id.clone());
+                for pid in 0..num_partitions {
+                    let rx = self
+                        .matching
+                        .register_worker(queue, PartitionId(pid), worker_id.clone());
+                    receivers.push(Box::pin(rx));
+                }
+            }
 
-                // Wait for a match
-                match rx.await {
-                    Ok(envelope) => {
-                        self.dispatch_to_worker(&worker_id, envelope).await;
-                    }
-                    Err(_) => {
-                        // Channel closed, matching service reset
-                        debug!(worker_id = %worker_id, "Match channel closed");
-                    }
+            if receivers.is_empty() {
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                continue;
+            }
+
+            // Wait for the FIRST match from any partition (non-blocking across all)
+            let (result, _index, _remaining) =
+                futures::future::select_all(receivers).await;
+            // Remaining receivers are dropped — their senders become stale and will
+            // be cleaned up on the next offer_task (try_match_task pops + retries).
+
+            match result {
+                Ok(envelope) => {
+                    self.dispatch_to_worker(&worker_id, envelope).await;
+                }
+                Err(_) => {
+                    debug!(worker_id = %worker_id, "Match channel closed");
                 }
             }
         }
@@ -106,7 +121,14 @@ impl DispatcherService {
         let lease_duration = Duration::seconds(envelope.timeout_seconds as i64 + 30);
         let lease_expires = Utc::now() + lease_duration;
 
-        // Update task status to RUNNING and create task_run
+        // Increment attempt count
+        if let Err(e) =
+            valka_db::queries::tasks::increment_attempt_count(&self.pool, &envelope.task_id).await
+        {
+            error!(task_id = %envelope.task_id, error = %e, "Failed to increment attempt count");
+        }
+
+        // Update task status to RUNNING
         if let Err(e) =
             valka_db::queries::tasks::update_task_status(&self.pool, &envelope.task_id, "RUNNING")
                 .await
@@ -131,6 +153,12 @@ impl DispatcherService {
             error!(task_id = %envelope.task_id, error = %e, "Failed to create task run");
             return;
         }
+
+        // Record dispatch latency metric
+        valka_core::metrics::record_dispatch_latency(&envelope.queue_name, 0.0);
+
+        // Emit TaskEvent for RUNNING
+        self.emit_event(&envelope.task_id, &envelope.queue_name, 3); // 3 = RUNNING
 
         // Build assignment message
         let assignment = TaskAssignment {
@@ -173,24 +201,22 @@ impl DispatcherService {
             if let Err(e) = valka_db::queries::task_runs::complete_task_run(
                 &self.pool,
                 &result.task_run_id,
-                output,
+                output.clone(),
             )
             .await
             {
                 error!(task_run_id = %result.task_run_id, error = %e, "Failed to complete task run");
             }
 
-            if let Err(e) = valka_db::queries::tasks::update_task_status(
-                &self.pool,
-                &result.task_id,
-                "COMPLETED",
-            )
-            .await
+            // Update task with output
+            if let Err(e) =
+                valka_db::queries::tasks::complete_task(&self.pool, &result.task_id, output).await
             {
-                error!(task_id = %result.task_id, error = %e, "Failed to update task to COMPLETED");
+                error!(task_id = %result.task_id, error = %e, "Failed to complete task");
             }
 
             valka_core::metrics::record_task_completed("");
+            self.emit_event(&result.task_id, "", 4); // 4 = COMPLETED
         } else {
             // Fail the task run
             if let Err(e) = valka_db::queries::task_runs::fail_task_run(
@@ -215,24 +241,41 @@ impl DispatcherService {
                     error!(task_id = %result.task_id, error = %e, "Failed to update task to RETRY");
                 }
                 valka_core::metrics::record_task_retried("");
+                self.emit_event(&result.task_id, "", 6); // 6 = RETRY
             } else {
-                if let Err(e) = valka_db::queries::tasks::update_task_status(
+                if let Err(e) = valka_db::queries::tasks::fail_task(
                     &self.pool,
                     &result.task_id,
-                    "FAILED",
+                    &result.error_message,
                 )
                 .await
                 {
-                    error!(task_id = %result.task_id, error = %e, "Failed to update task to FAILED");
+                    error!(task_id = %result.task_id, error = %e, "Failed to fail task");
                 }
                 valka_core::metrics::record_task_failed("");
+                self.emit_event(&result.task_id, "", 5); // 5 = FAILED
             }
         }
     }
 
-    pub async fn handle_heartbeat(&self, worker_id: &WorkerId, _heartbeat: Heartbeat) {
+    pub async fn handle_heartbeat(&self, worker_id: &WorkerId, heartbeat: Heartbeat) {
         if let Some(mut handle) = self.workers.get_mut(worker_id.as_ref()) {
             handle.update_heartbeat();
+
+            // Extend leases for active tasks
+            for task_id in &heartbeat.active_task_ids {
+                // Look up the task run ID from active tasks
+                // We use the task_id to update the lease on any RUNNING run
+                let lease_extension = Duration::seconds(60); // Extend by 60 seconds
+                let new_lease = Utc::now() + lease_extension;
+                // Update heartbeat for all running runs of this task
+                if let Err(e) =
+                    valka_db::queries::task_runs::update_heartbeat_by_task(&self.pool, task_id, new_lease)
+                        .await
+                {
+                    error!(task_id = %task_id, error = %e, "Failed to extend task run lease");
+                }
+            }
         }
     }
 
@@ -242,8 +285,49 @@ impl DispatcherService {
         }
     }
 
+    /// Cancel a task on the worker that's running it
+    pub async fn cancel_task_on_worker(&self, task_id: &str) -> bool {
+        for entry in self.workers.iter() {
+            let handle = entry.value();
+            if handle.active_tasks.contains(task_id) {
+                let cancel = WorkerResponse {
+                    response: Some(worker_response::Response::TaskCancellation(
+                        TaskCancellation {
+                            task_id: task_id.to_string(),
+                            reason: "Cancelled by user".to_string(),
+                        },
+                    )),
+                };
+                let _ = handle.response_tx.send(cancel).await;
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn workers(&self) -> &Arc<DashMap<String, WorkerHandle>> {
         &self.workers
+    }
+
+    pub fn event_tx(&self) -> &broadcast::Sender<TaskEvent> {
+        &self.event_tx
+    }
+
+    /// Emit a task event
+    fn emit_event(&self, task_id: &str, queue_name: &str, new_status: i32) {
+        let event = TaskEvent {
+            event_id: uuid::Uuid::now_v7().to_string(),
+            task_id: task_id.to_string(),
+            queue_name: queue_name.to_string(),
+            previous_status: 0,
+            new_status,
+            worker_id: String::new(),
+            node_id: self.node_id.0.clone(),
+            attempt_number: 0,
+            error_message: String::new(),
+            timestamp_ms: Utc::now().timestamp_millis(),
+        };
+        let _ = self.event_tx.send(event);
     }
 
     /// Start the heartbeat checker background task

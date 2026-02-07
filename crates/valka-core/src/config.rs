@@ -10,6 +10,7 @@ pub struct ServerConfig {
     pub grpc_addr: String,
     pub http_addr: String,
     pub database_url: String,
+    pub web_dir: String,
     pub gossip: GossipConfig,
     pub matching: MatchingConfig,
     pub scheduler: SchedulerConfig,
@@ -53,9 +54,10 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             node_id: String::new(),
-            grpc_addr: "[::1]:50051".to_string(),
+            grpc_addr: "0.0.0.0:50051".to_string(),
             http_addr: "0.0.0.0:8080".to_string(),
             database_url: "postgresql://valka:valka@localhost:5432/valka".to_string(),
+            web_dir: "web/dist".to_string(),
             gossip: GossipConfig::default(),
             matching: MatchingConfig::default(),
             scheduler: SchedulerConfig::default(),

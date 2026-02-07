@@ -1,25 +1,43 @@
-FROM rust:1.85-bookworm AS builder
+# Stage 1: Build WebUI
+FROM oven/bun:1.3 AS web-builder
+
+WORKDIR /app/web
+COPY web/package.json web/bun.lock* web/package-lock.json* ./
+RUN bun install
+COPY web/ ./
+RUN bun run build
+
+# Stage 2: Build Rust binaries
+FROM rust:1.88-bookworm AS builder
 
 WORKDIR /app
 
 # Install protobuf compiler
 RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
 
-# Copy workspace files
+# Copy workspace manifest + lock first (for dependency caching)
 COPY Cargo.toml Cargo.lock ./
 COPY proto/ proto/
 COPY crates/ crates/
+COPY examples/ examples/
 
-# Build release
-RUN cargo build --release -p valka-server -p valka-cli
+# Build release with BuildKit cache mounts for cargo registry + target
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release -p valka-server -p valka-cli \
+    && cp target/release/valka-server target/release/valka /tmp/
 
-# Runtime image
+# Stage 3: Runtime image
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/valka-server /usr/local/bin/valka-server
-COPY --from=builder /app/target/release/valka /usr/local/bin/valka
+COPY --from=builder /tmp/valka-server /usr/local/bin/valka-server
+COPY --from=builder /tmp/valka /usr/local/bin/valka
+COPY --from=web-builder /app/web/dist /usr/share/valka/web
+
+ENV VALKA_WEB_DIR=/usr/share/valka/web
 
 EXPOSE 50051 8080
 

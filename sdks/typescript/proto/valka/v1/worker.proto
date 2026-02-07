@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package valka.v1;
+
+import "valka/v1/common.proto";
+
+service WorkerService {
+    // Primary bidirectional stream for ALL worker communication
+    rpc Session(stream WorkerRequest) returns (stream WorkerResponse);
+}
+
+// Worker -> Server
+message WorkerRequest {
+    oneof request {
+        WorkerHello hello = 1;
+        TaskResult task_result = 2;
+        Heartbeat heartbeat = 3;
+        LogBatch log_batch = 4;
+        GracefulShutdown shutdown = 5;
+    }
+}
+
+// Server -> Worker
+message WorkerResponse {
+    oneof response {
+        TaskAssignment task_assignment = 1;
+        TaskCancellation task_cancellation = 2;
+        HeartbeatAck heartbeat_ack = 3;
+        ServerShutdown server_shutdown = 4;
+    }
+}
+
+// --- Worker -> Server messages ---
+
+message WorkerHello {
+    string worker_id = 1;
+    string worker_name = 2;
+    repeated string queues = 3;
+    int32 concurrency = 4;
+    string metadata = 5;           // JSON string
+}
+
+message TaskResult {
+    string task_id = 1;
+    string task_run_id = 2;
+    bool success = 3;
+    bool retryable = 4;
+    string output = 5;             // JSON string
+    string error_message = 6;
+}
+
+message Heartbeat {
+    repeated string active_task_ids = 1;
+    int64 timestamp_ms = 2;
+}
+
+message LogBatch {
+    repeated LogEntry entries = 1;
+}
+
+message LogEntry {
+    string task_run_id = 1;
+    int64 timestamp_ms = 2;
+    LogLevel level = 3;
+    string message = 4;
+    string metadata = 5;           // JSON string
+}
+
+message GracefulShutdown {
+    string reason = 1;
+}
+
+// --- Server -> Worker messages ---
+
+message TaskAssignment {
+    string task_id = 1;
+    string task_run_id = 2;
+    string queue_name = 3;
+    string task_name = 4;
+    string input = 5;              // JSON string
+    int32 attempt_number = 6;
+    int32 timeout_seconds = 7;
+    string metadata = 8;           // JSON string
+}
+
+message TaskCancellation {
+    string task_id = 1;
+    string reason = 2;
+}
+
+message HeartbeatAck {
+    int64 server_timestamp_ms = 1;
+}
+
+message ServerShutdown {
+    string reason = 1;
+    int32 drain_seconds = 2;
+}

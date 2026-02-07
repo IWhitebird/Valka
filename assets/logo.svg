@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0f172a;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1e293b;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#38bdf8;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#818cf8;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="accent2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#818cf8;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#c084fc;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="glow" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" style="stop-color:#38bdf8;stop-opacity:0.3" />
+      <stop offset="100%" style="stop-color:#818cf8;stop-opacity:0" />
+    </linearGradient>
+  </defs>
+
+  <!-- Background circle -->
+  <circle cx="256" cy="256" r="250" fill="url(#bg)" stroke="url(#accent)" stroke-width="3"/>
+
+  <!-- Subtle glow -->
+  <ellipse cx="256" cy="200" rx="160" ry="100" fill="url(#glow)" opacity="0.5"/>
+
+  <!-- Viking V shape (stylized as task queue arrows/streams) -->
+  <!-- Left arm of V -->
+  <path d="M 128 120 L 240 340 L 220 340 L 108 120 Z" fill="url(#accent)" opacity="0.95"/>
+  <!-- Right arm of V -->
+  <path d="M 384 120 L 272 340 L 292 340 L 404 120 Z" fill="url(#accent2)" opacity="0.95"/>
+
+  <!-- Center diamond (task node) -->
+  <rect x="236" y="320" width="40" height="40" rx="4" transform="rotate(45 256 340)" fill="url(#accent)" opacity="0.9"/>
+
+  <!-- Stream lines (representing bidirectional gRPC streams) -->
+  <!-- Left stream -->
+  <line x1="148" y1="160" x2="108" y2="160" stroke="#38bdf8" stroke-width="3" stroke-linecap="round" opacity="0.6"/>
+  <line x1="160" y1="185" x2="120" y2="185" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round" opacity="0.5"/>
+  <line x1="172" y1="210" x2="132" y2="210" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" opacity="0.4"/>
+
+  <!-- Right stream -->
+  <line x1="364" y1="160" x2="404" y2="160" stroke="#c084fc" stroke-width="3" stroke-linecap="round" opacity="0.6"/>
+  <line x1="352" y1="185" x2="392" y2="185" stroke="#c084fc" stroke-width="2.5" stroke-linecap="round" opacity="0.5"/>
+  <line x1="340" y1="210" x2="380" y2="210" stroke="#c084fc" stroke-width="2" stroke-linecap="round" opacity="0.4"/>
+
+  <!-- Three small dots (tasks being queued) -->
+  <circle cx="256" cy="395" r="5" fill="#38bdf8" opacity="0.8"/>
+  <circle cx="240" cy="412" r="4" fill="#818cf8" opacity="0.6"/>
+  <circle cx="272" cy="412" r="4" fill="#c084fc" opacity="0.6"/>
+
+  <!-- VALKA text -->
+  <text x="256" y="460" text-anchor="middle" font-family="'Inter', 'SF Pro Display', -apple-system, sans-serif" font-weight="700" font-size="42" letter-spacing="12" fill="white" opacity="0.95">VALKA</text>
+</svg>

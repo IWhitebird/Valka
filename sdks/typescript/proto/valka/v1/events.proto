@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package valka.v1;
+
+import "valka/v1/common.proto";
+
+message TaskEvent {
+    string event_id = 1;
+    string task_id = 2;
+    string queue_name = 3;
+    TaskStatus previous_status = 4;
+    TaskStatus new_status = 5;
+    string worker_id = 6;
+    string node_id = 7;
+    int32 attempt_number = 8;
+    string error_message = 9;
+    int64 timestamp_ms = 10;
+}

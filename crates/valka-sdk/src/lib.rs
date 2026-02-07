@@ -7,4 +7,4 @@ pub mod worker;
 pub use client::ValkaClient;
 pub use context::TaskContext;
 pub use error::SdkError;
-pub use worker::ValkaWorker;
+pub use worker::{ShutdownHandle, ValkaWorker};
