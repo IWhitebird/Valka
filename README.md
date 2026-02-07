@@ -18,8 +18,6 @@
 
 <p align="center">
   <img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-blue.svg"/>
-  <img alt="Rust" src="https://img.shields.io/badge/rust-1.85+-orange.svg"/>
-  <img alt="PostgreSQL" src="https://img.shields.io/badge/postgresql-17-336791.svg"/>
 </p>
 
 ---

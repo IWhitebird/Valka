@@ -24,11 +24,11 @@
   <!-- Subtle glow -->
   <ellipse cx="256" cy="200" rx="160" ry="100" fill="url(#glow)" opacity="0.5"/>
 
-  <!-- Viking V shape (stylized as task queue arrows/streams) -->
+  <!-- Viking V shape — both inner edges converge at (256, 340) -->
   <!-- Left arm of V -->
-  <path d="M 128 120 L 240 340 L 220 340 L 108 120 Z" fill="url(#accent)" opacity="0.95"/>
+  <path d="M 128 120 L 256 340 L 236 340 L 108 120 Z" fill="url(#accent)" opacity="0.95"/>
   <!-- Right arm of V -->
-  <path d="M 384 120 L 272 340 L 292 340 L 404 120 Z" fill="url(#accent2)" opacity="0.95"/>
+  <path d="M 384 120 L 256 340 L 276 340 L 404 120 Z" fill="url(#accent2)" opacity="0.95"/>
 
   <!-- Center diamond (task node) -->
   <rect x="236" y="320" width="40" height="40" rx="4" transform="rotate(45 256 340)" fill="url(#accent)" opacity="0.9"/>
