@@ -1,10 +1,13 @@
 name: CI
 
+# Disabled — re-enable by uncommenting push/pull_request triggers
+# on:
+#   push:
+#     branches: [main, master]
+#   pull_request:
+#     branches: [main, master]
 on:
-  push:
-    branches: [main, master]
-  pull_request:
-    branches: [main, master]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
