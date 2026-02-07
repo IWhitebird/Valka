@@ -1,0 +1,95 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/valka-proto",
+    "crates/valka-core",
+    "crates/valka-db",
+    "crates/valka-matching",
+    "crates/valka-dispatcher",
+    "crates/valka-scheduler",
+    "crates/valka-cluster",
+    "crates/valka-server",
+    "crates/valka-sdk",
+    "crates/valka-cli",
+    "crates/valka-tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.49", features = ["full"] }
+
+# gRPC / Protobuf
+tonic = "0.14"
+tonic-build = "0.14"
+tonic-prost-build = "0.14"
+tonic-prost = "0.14"
+tonic-health = "0.14"
+tonic-reflection = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+
+# HTTP
+axum = { version = "0.8", features = ["json", "macros"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "json", "chrono", "uuid"] }
+
+# Cluster
+chitchat = "0.10"
+hashring = "0.3"
+
+# Concurrent state
+dashmap = "6"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# IDs
+uuid = { version = "1.20", features = ["v7", "serde"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Config
+figment = { version = "0.10", features = ["toml", "env"] }
+
+# Errors
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Allocator
+tikv-jemallocator = "0.6"
+
+# Workspace crates
+valka-proto = { path = "crates/valka-proto" }
+valka-core = { path = "crates/valka-core" }
+valka-db = { path = "crates/valka-db" }
+valka-matching = { path = "crates/valka-matching" }
+valka-dispatcher = { path = "crates/valka-dispatcher" }
+valka-scheduler = { path = "crates/valka-scheduler" }
+valka-cluster = { path = "crates/valka-cluster" }
+valka-sdk = { path = "crates/valka-sdk" }
+
+# Misc
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+async-stream = "0.3"

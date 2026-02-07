@@ -1,0 +1,26 @@
+[package]
+name = "valka-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "valka"
+path = "src/main.rs"
+
+[dependencies]
+valka-core = { workspace = true }
+valka-proto = { workspace = true }
+valka-sdk = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true }

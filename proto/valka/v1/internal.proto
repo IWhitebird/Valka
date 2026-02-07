@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package valka.v1;
+
+import "valka/v1/common.proto";
+import "valka/v1/worker.proto";
+import "valka/v1/events.proto";
+
+service InternalService {
+    // Forward a task to the owning node
+    rpc ForwardTask(ForwardTaskRequest) returns (ForwardTaskResponse);
+
+    // Relay logs from one node to another (for live tail)
+    rpc RelayLogs(RelayLogsRequest) returns (stream LogEntry);
+
+    // Forward events between nodes
+    rpc ForwardEvent(ForwardEventRequest) returns (ForwardEventResponse);
+
+    // Health check between nodes
+    rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message ForwardTaskRequest {
+    string task_id = 1;
+    string queue_name = 2;
+    int32 partition_id = 3;
+}
+
+message ForwardTaskResponse {
+    bool accepted = 1;
+}
+
+message RelayLogsRequest {
+    string task_run_id = 1;
+}
+
+message ForwardEventRequest {
+    TaskEvent event = 1;
+}
+
+message ForwardEventResponse {}
+
+message PingRequest {
+    string node_id = 1;
+}
+
+message PingResponse {
+    string node_id = 1;
+    int64 timestamp_ms = 2;
+}
