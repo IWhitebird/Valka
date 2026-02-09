@@ -3094,6 +3094,7 @@ dependencies = [
  "futures",
  "metrics",
  "serde_json",
+ "sqlx",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -3187,6 +3188,7 @@ dependencies = [
  "async-stream",
  "axum",
  "chrono",
+ "dotenvy",
  "figment",
  "futures",
  "metrics",
@@ -3218,13 +3220,19 @@ dependencies = [
 name = "valka-tests"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "chrono",
  "dashmap",
  "futures",
+ "http-body-util",
+ "hyper",
+ "metrics-exporter-prometheus",
  "serde_json",
  "sqlx",
  "tokio",
  "tonic",
+ "tower",
+ "tower-http",
  "uuid",
  "valka-cluster",
  "valka-core",
@@ -3234,6 +3242,7 @@ dependencies = [
  "valka-proto",
  "valka-scheduler",
  "valka-sdk",
+ "valka-server",
 ]
 
 [[package]]

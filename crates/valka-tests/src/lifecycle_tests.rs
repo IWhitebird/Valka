@@ -72,8 +72,8 @@ fn test_config_defaults() {
 #[test]
 fn test_server_config_defaults() {
     let config = valka_core::ServerConfig::default();
-    assert_eq!(config.grpc_addr, "[::1]:50051");
-    assert_eq!(config.http_addr, "0.0.0.0:8080");
+    assert_eq!(config.grpc_addr, "0.0.0.0:50051");
+    assert_eq!(config.http_addr, "0.0.0.0:8989");
     assert!(!config.database_url.is_empty());
     assert_eq!(config.scheduler.reaper_interval_secs, 10);
     assert_eq!(config.scheduler.lease_timeout_secs, 60);

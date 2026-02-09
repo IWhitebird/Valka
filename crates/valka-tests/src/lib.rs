@@ -1,3 +1,6 @@
+#[cfg(all(test, feature = "integration"))]
+mod integration;
+
 #[cfg(test)]
 mod cluster_tests;
 #[cfg(test)]

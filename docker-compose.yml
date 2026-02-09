@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: valka
       POSTGRES_DB: valka
     ports:
-      - "5432:5432"
+      - "5454:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -27,11 +27,11 @@ services:
     environment:
       VALKA_DATABASE_URL: postgresql://valka:valka@postgres:5432/valka
       VALKA_GRPC_ADDR: "[::]:50051"
-      VALKA_HTTP_ADDR: "0.0.0.0:8080"
+      VALKA_HTTP_ADDR: "0.0.0.0:8989"
       RUST_LOG: valka=info,tower_http=info
     ports:
       - "50051:50051"
-      - "8080:8080"
+      - "8989:8989"
     restart: unless-stopped
 
 volumes:

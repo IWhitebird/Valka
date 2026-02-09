@@ -1,7 +1,8 @@
 import { useNavigate } from "react-router-dom";
-import { ChevronLeft, ChevronRight, ListTodo } from "lucide-react";
+import { ChevronLeft, ChevronRight, ListTodo, Trash2 } from "lucide-react";
 import type { Task } from "@/api/types";
 import { truncateId, formatRelative } from "@/lib/utils";
+import { useDeleteTask } from "@/hooks/use-tasks";
 import { TaskStatusBadge } from "./task-status-badge";
 import {
   Table,
@@ -62,6 +63,7 @@ export function TaskTable({
   onPageChange,
 }: TaskTableProps) {
   const navigate = useNavigate();
+  const deleteTask = useDeleteTask();
 
   if (!isLoading && tasks.length === 0) {
     return (
@@ -102,6 +104,7 @@ export function TaskTable({
               <TableHead className="px-4 text-xs uppercase tracking-wider text-muted-foreground">
                 Created
               </TableHead>
+              <TableHead className="w-12 px-4" />
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -132,6 +135,21 @@ export function TaskTable({
                   </TableCell>
                   <TableCell className="px-4 text-xs text-muted-foreground">
                     {formatRelative(task.created_at)}
+                  </TableCell>
+                  <TableCell className="px-4">
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      className="text-muted-foreground hover:text-destructive"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (window.confirm(`Delete task ${task.id.slice(0, 8)}...?`)) {
+                          deleteTask.mutate(task.id);
+                        }
+                      }}
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
                   </TableCell>
                 </TableRow>
               ))

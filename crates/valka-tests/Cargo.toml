@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+integration = []
+
 [dependencies]
 valka-core = { workspace = true }
 valka-proto = { workspace = true }
@@ -14,6 +17,7 @@ valka-dispatcher = { workspace = true }
 valka-scheduler = { workspace = true }
 valka-cluster = { workspace = true }
 valka-sdk = { workspace = true }
+valka-server = { path = "../valka-server" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
@@ -22,3 +26,9 @@ futures = { workspace = true }
 tonic = { workspace = true }
 dashmap = { workspace = true }
 sqlx = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+http-body-util = "0.1"
+hyper = { version = "1.6", features = ["full"] }
+metrics-exporter-prometheus = { workspace = true }

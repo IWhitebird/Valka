@@ -40,8 +40,8 @@ fn test_gossip_config_defaults() {
 #[test]
 fn test_server_config_all_sub_configs() {
     let config = ServerConfig::default();
-    assert_eq!(config.grpc_addr, "[::1]:50051");
-    assert_eq!(config.http_addr, "0.0.0.0:8080");
+    assert_eq!(config.grpc_addr, "0.0.0.0:50051");
+    assert_eq!(config.http_addr, "0.0.0.0:8989");
     assert!(!config.database_url.is_empty());
     // Verify sub-configs are nested correctly
     assert_eq!(config.matching.num_partitions, 4);

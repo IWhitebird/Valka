@@ -20,7 +20,7 @@ use valka_matching::MatchingService;
 use valka_matching::partition::TaskEnvelope;
 
 #[derive(Clone)]
-struct AppState {
+pub struct AppState {
     pool: DbPool,
     event_tx: broadcast::Sender<valka_proto::TaskEvent>,
     matching: MatchingService,
@@ -28,16 +28,14 @@ struct AppState {
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 }
 
-pub async fn serve_rest(
-    addr: SocketAddr,
+/// Build the API router (useful for testing with tower::ServiceExt::oneshot)
+pub fn build_api_router(
     pool: DbPool,
     event_tx: broadcast::Sender<valka_proto::TaskEvent>,
     matching: MatchingService,
     dispatcher: DispatcherService,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
-    web_dir: String,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<(), anyhow::Error> {
+) -> Router {
     let state = AppState {
         pool,
         event_tx,
@@ -51,9 +49,9 @@ pub async fn serve_rest(
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let api_routes = Router::new()
-        .route("/api/v1/tasks", post(create_task).get(list_tasks))
-        .route("/api/v1/tasks/{task_id}", get(get_task))
+    Router::new()
+        .route("/api/v1/tasks", post(create_task).get(list_tasks).delete(clear_all_tasks))
+        .route("/api/v1/tasks/{task_id}", get(get_task).delete(delete_task))
         .route("/api/v1/tasks/{task_id}/cancel", post(cancel_task))
         .route("/api/v1/tasks/{task_id}/runs", get(get_task_runs))
         .route(
@@ -66,12 +64,24 @@ pub async fn serve_rest(
         .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
         .with_state(state)
-        .layer(cors);
+        .layer(cors)
+}
+
+pub async fn serve_rest(
+    addr: SocketAddr,
+    pool: DbPool,
+    event_tx: broadcast::Sender<valka_proto::TaskEvent>,
+    matching: MatchingService,
+    dispatcher: DispatcherService,
+    metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    web_dir: String,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), anyhow::Error> {
+    let api_routes = build_api_router(pool, event_tx, matching, dispatcher, metrics_handle);
 
     // Serve static files with SPA fallback
     let index_path = format!("{}/index.html", &web_dir);
-    let spa_fallback = ServeDir::new(&web_dir)
-        .not_found_service(ServeFile::new(index_path));
+    let spa_fallback = ServeDir::new(&web_dir).not_found_service(ServeFile::new(index_path));
 
     let app = api_routes.fallback_service(spa_fallback);
 
@@ -271,6 +281,31 @@ async fn cancel_task(
     Ok(Json(task_row_to_json(task)))
 }
 
+async fn delete_task(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let deleted = valka_db::queries::tasks::delete_task(&state.pool, &task_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "Task not found".to_string()));
+    }
+
+    Ok(Json(serde_json::json!({ "deleted": true })))
+}
+
+async fn clear_all_tasks(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let count = valka_db::queries::tasks::clear_all_tasks(&state.pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "deleted_count": count })))
+}
+
 async fn get_task_runs(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
@@ -303,10 +338,14 @@ async fn get_run_logs(
     // Verify the run belongs to the task
     let _ = task_id; // Used for API consistency; logs are queried by run_id
 
-    let logs =
-        valka_db::queries::task_logs::get_logs_for_run(&state.pool, &run_id, query.limit, query.after_id)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let logs = valka_db::queries::task_logs::get_logs_for_run(
+        &state.pool,
+        &run_id,
+        query.limit,
+        query.after_id,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let result: Vec<serde_json::Value> = logs.into_iter().map(task_log_to_json).collect();
     Ok(Json(result))

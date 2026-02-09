@@ -1,7 +1,7 @@
 import { ValkaClient, ValkaWorker, type TaskContext } from "@valka/sdk";
 
 async function main() {
-  const restAddr = "http://localhost:8080";
+  const restAddr = "http://localhost:8989";
   const grpcAddr = "localhost:50051";
 
   // Start the worker in the background
