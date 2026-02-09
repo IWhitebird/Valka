@@ -316,6 +316,58 @@ pub struct WorkerRow {
     pub disconnected_at: Option<DateTime<Utc>>,
 }
 
+/// Delete a single task and all its associated data (runs, logs, dead letters)
+pub async fn delete_task(pool: &PgPool, task_id: &str) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("DELETE FROM task_logs WHERE task_run_id IN (SELECT id FROM task_runs WHERE task_id = $1)")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query("DELETE FROM task_runs WHERE task_id = $1")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query("DELETE FROM dead_letter_queue WHERE task_id = $1")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+
+    let result = sqlx::query("DELETE FROM tasks WHERE id = $1")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Delete all tasks and associated data (runs, logs, dead letters)
+pub async fn clear_all_tasks(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("DELETE FROM task_logs")
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query("DELETE FROM task_runs")
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query("DELETE FROM dead_letter_queue")
+        .execute(&mut *tx)
+        .await?;
+
+    let result = sqlx::query("DELETE FROM tasks")
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(result.rows_affected())
+}
+
 /// Find DISPATCHING tasks with no active runs (crash recovery)
 pub async fn recover_orphaned_dispatching(pool: &PgPool) -> Result<Vec<TaskRow>, sqlx::Error> {
     let rows = sqlx::query_as::<_, TaskRow>(

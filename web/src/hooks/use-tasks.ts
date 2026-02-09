@@ -42,6 +42,27 @@ export function useCancelTask() {
   });
 }
 
+export function useDeleteTask() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (taskId: string) => tasksApi.delete(taskId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["tasks"] });
+    },
+  });
+}
+
+export function useClearAllTasks() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => tasksApi.clearAll(),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["dead-letters"] });
+    },
+  });
+}
+
 export function useTaskRuns(taskId: string) {
   return useQuery({
     queryKey: ["tasks", taskId, "runs"],

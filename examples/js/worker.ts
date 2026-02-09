@@ -2,6 +2,7 @@ import { ValkaWorker, type TaskContext } from "@valka/sdk";
 
 async function handleTask(ctx: TaskContext): Promise<unknown> {
   ctx.log(`Processing task '${ctx.taskName}' (attempt ${ctx.attemptNumber})`);
+  console.log(`Processing task '${ctx.taskName}' (attempt ${ctx.attemptNumber})`);
 
   const input = ctx.input<{ to?: string; subject?: string; body?: string }>();
   const to = input.to ?? "unknown";

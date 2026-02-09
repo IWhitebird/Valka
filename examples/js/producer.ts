@@ -1,7 +1,7 @@
 import { ValkaClient } from "@valka/sdk";
 
 async function main() {
-  const client = new ValkaClient("http://localhost:8080");
+  const client = new ValkaClient("http://localhost:8989");
   console.log("Connected to Valka server");
 
   // Create a task with JSON input

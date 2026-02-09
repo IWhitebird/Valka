@@ -125,14 +125,28 @@ impl TaskReader {
                         .matching
                         .buffer_task(&self.queue_name, self.partition_id, envelope)
                     {
-                        // Buffer full, task stays DISPATCHING in PG
-                        // The reaper will eventually reset it to PENDING
+                        // Buffer full — reset task back to PENDING so it can be
+                        // picked up on the next poll instead of being stuck in
+                        // DISPATCHING indefinitely.
                         warn!(
                             queue = %self.queue_name,
                             partition = self.partition_id.0,
                             task_id = %task_row.id,
-                            "Buffer full, task remains in DISPATCHING state"
+                            "Buffer full, resetting task to PENDING"
                         );
+                        if let Err(e) = valka_db::queries::tasks::update_task_status(
+                            &self.pool,
+                            &task_row.id,
+                            "PENDING",
+                        )
+                        .await
+                        {
+                            error!(
+                                task_id = %task_row.id,
+                                error = %e,
+                                "Failed to reset DISPATCHING task to PENDING"
+                            );
+                        }
                     }
                 }
             }

@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn handle_task(ctx: TaskContext) -> Result<serde_json::Value, String> {
     ctx.log(&format!(
-        "Processing task '{}' (attempt {})",
+        "Processing task rust '{}' (attempt {})",
         ctx.task_name, ctx.attempt_number
     ))
     .await;

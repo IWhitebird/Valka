@@ -103,9 +103,7 @@ impl api_service_server::ApiService for ApiServiceImpl {
             if let sqlx::Error::Database(ref db_err) = e
                 && db_err.constraint() == Some("idx_tasks_idempotency")
             {
-                return Status::already_exists(
-                    "Task with this idempotency key already exists",
-                );
+                return Status::already_exists("Task with this idempotency key already exists");
             }
             Status::internal(format!("Database error: {e}"))
         })?;
@@ -229,9 +227,7 @@ impl api_service_server::ApiService for ApiServiceImpl {
             })?;
 
         // Forward cancellation to worker if running
-        self.dispatcher
-            .cancel_task_on_worker(&req.task_id)
-            .await;
+        self.dispatcher.cancel_task_on_worker(&req.task_id).await;
 
         // Emit cancel event
         let event = TaskEvent {

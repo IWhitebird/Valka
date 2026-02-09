@@ -55,7 +55,7 @@ impl Default for ServerConfig {
         Self {
             node_id: String::new(),
             grpc_addr: "0.0.0.0:50051".to_string(),
-            http_addr: "0.0.0.0:8080".to_string(),
+            http_addr: "0.0.0.0:8989".to_string(),
             database_url: "postgresql://valka:valka@localhost:5432/valka".to_string(),
             web_dir: "web/dist".to_string(),
             gossip: GossipConfig::default(),

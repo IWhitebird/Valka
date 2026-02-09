@@ -39,6 +39,6 @@ COPY --from=web-builder /app/web/dist /usr/share/valka/web
 
 ENV VALKA_WEB_DIR=/usr/share/valka/web
 
-EXPOSE 50051 8080
+EXPOSE 50051 8989
 
 ENTRYPOINT ["valka-server"]

@@ -7,12 +7,16 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::info;
 
 mod grpc;
-mod rest;
-mod server;
 mod shutdown;
+
+use valka_server::rest;
+use valka_server::server;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load .env file (if present) before anything reads env vars
+    dotenvy::dotenv().ok();
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -41,10 +45,12 @@ async fn main() -> Result<()> {
     valka_db::migrations::run_migrations(&pool).await?;
 
     // Recover orphaned DISPATCHING tasks (crash recovery)
-    let recovered =
-        valka_db::queries::tasks::recover_orphaned_dispatching(&pool).await?;
+    let recovered = valka_db::queries::tasks::recover_orphaned_dispatching(&pool).await?;
     if !recovered.is_empty() {
-        info!(count = recovered.len(), "Recovered orphaned DISPATCHING tasks to PENDING");
+        info!(
+            count = recovered.len(),
+            "Recovered orphaned DISPATCHING tasks to PENDING"
+        );
     }
 
     // Shutdown signal
@@ -122,8 +128,9 @@ async fn main() -> Result<()> {
     let grpc_node_id = node_id.clone();
     let grpc_shutdown = shutdown_rx.clone();
 
+    let shutdown_tx_grpc = shutdown_tx.clone();
     let grpc_handle = tokio::spawn(async move {
-        grpc::serve_grpc(
+        if let Err(e) = grpc::serve_grpc(
             grpc_addr,
             grpc_pool,
             grpc_dispatcher,
@@ -133,6 +140,10 @@ async fn main() -> Result<()> {
             grpc_shutdown,
         )
         .await
+        {
+            tracing::error!(error = %e, "gRPC server failed");
+            let _ = shutdown_tx_grpc.send(true);
+        }
     });
 
     // Start REST/HTTP server
@@ -143,8 +154,9 @@ async fn main() -> Result<()> {
     let rest_dispatcher = dispatcher.clone();
     let rest_shutdown = shutdown_rx.clone();
 
+    let shutdown_tx_rest = shutdown_tx.clone();
     let http_handle = tokio::spawn(async move {
-        rest::serve_rest(
+        if let Err(e) = rest::serve_rest(
             http_addr,
             rest_pool,
             rest_event_tx,
@@ -155,6 +167,10 @@ async fn main() -> Result<()> {
             rest_shutdown,
         )
         .await
+        {
+            tracing::error!(error = %e, "REST server failed");
+            let _ = shutdown_tx_rest.send(true);
+        }
     });
 
     info!(

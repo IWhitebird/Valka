@@ -121,36 +121,62 @@ impl DispatcherService {
         let lease_duration = Duration::seconds(envelope.timeout_seconds as i64 + 30);
         let lease_expires = Utc::now() + lease_duration;
 
+        // Use a transaction to atomically: increment attempt, set RUNNING, create run
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                error!(task_id = %envelope.task_id, error = %e, "Failed to begin transaction");
+                return;
+            }
+        };
+
         // Increment attempt count
-        if let Err(e) =
-            valka_db::queries::tasks::increment_attempt_count(&self.pool, &envelope.task_id).await
+        if let Err(e) = sqlx::query(
+            "UPDATE tasks SET attempt_count = attempt_count + 1, updated_at = NOW() WHERE id = $1",
+        )
+        .bind(&envelope.task_id)
+        .execute(&mut *tx)
+        .await
         {
             error!(task_id = %envelope.task_id, error = %e, "Failed to increment attempt count");
-        }
-
-        // Update task status to RUNNING
-        if let Err(e) =
-            valka_db::queries::tasks::update_task_status(&self.pool, &envelope.task_id, "RUNNING")
-                .await
-        {
-            error!(task_id = %envelope.task_id, error = %e, "Failed to update task status");
+            let _ = tx.rollback().await;
             return;
         }
 
-        if let Err(e) = valka_db::queries::task_runs::create_task_run(
-            &self.pool,
-            valka_db::queries::task_runs::CreateTaskRunParams {
-                id: run_id.0.clone(),
-                task_id: envelope.task_id.clone(),
-                attempt_number: envelope.attempt_number,
-                worker_id: worker_id.0.clone(),
-                assigned_node_id: self.node_id.0.clone(),
-                lease_expires_at: lease_expires,
-            },
+        // Update task status to RUNNING
+        if let Err(e) = sqlx::query(
+            "UPDATE tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1",
         )
+        .bind(&envelope.task_id)
+        .execute(&mut *tx)
+        .await
+        {
+            error!(task_id = %envelope.task_id, error = %e, "Failed to update task status");
+            let _ = tx.rollback().await;
+            return;
+        }
+
+        // Create task run
+        if let Err(e) = sqlx::query(
+            r#"INSERT INTO task_runs (id, task_id, attempt_number, worker_id, assigned_node_id, lease_expires_at)
+               VALUES ($1, $2, $3, $4, $5, $6)"#,
+        )
+        .bind(&run_id.0)
+        .bind(&envelope.task_id)
+        .bind(envelope.attempt_number)
+        .bind(&worker_id.0)
+        .bind(&self.node_id.0)
+        .bind(lease_expires)
+        .execute(&mut *tx)
         .await
         {
             error!(task_id = %envelope.task_id, error = %e, "Failed to create task run");
+            let _ = tx.rollback().await;
+            return;
+        }
+
+        if let Err(e) = tx.commit().await {
+            error!(task_id = %envelope.task_id, error = %e, "Failed to commit dispatch transaction");
             return;
         }
 
@@ -191,67 +217,100 @@ impl DispatcherService {
         }
 
         if result.success {
-            // Complete the task run
-            let output = if result.output.is_empty() {
+            let output: Option<serde_json::Value> = if result.output.is_empty() {
                 None
             } else {
                 serde_json::from_str(&result.output).ok()
             };
 
-            if let Err(e) = valka_db::queries::task_runs::complete_task_run(
-                &self.pool,
-                &result.task_run_id,
-                output.clone(),
-            )
-            .await
-            {
-                error!(task_run_id = %result.task_run_id, error = %e, "Failed to complete task run");
-            }
+            // Atomically complete both run and task in a single transaction
+            let tx_result: Result<(), sqlx::Error> = async {
+                let mut tx = self.pool.begin().await?;
 
-            // Update task with output
-            if let Err(e) =
-                valka_db::queries::tasks::complete_task(&self.pool, &result.task_id, output).await
-            {
-                error!(task_id = %result.task_id, error = %e, "Failed to complete task");
+                sqlx::query(
+                    "UPDATE task_runs SET status = 'COMPLETED', output = $2, completed_at = NOW() \
+                     WHERE id = $1 AND status = 'RUNNING'",
+                )
+                .bind(&result.task_run_id)
+                .bind(&output)
+                .execute(&mut *tx)
+                .await?;
+
+                sqlx::query(
+                    "UPDATE tasks SET status = 'COMPLETED', output = $2, updated_at = NOW() \
+                     WHERE id = $1",
+                )
+                .bind(&result.task_id)
+                .bind(&output)
+                .execute(&mut *tx)
+                .await?;
+
+                tx.commit().await?;
+                Ok(())
+            }
+            .await;
+
+            if let Err(e) = tx_result {
+                error!(
+                    task_id = %result.task_id,
+                    task_run_id = %result.task_run_id,
+                    error = %e,
+                    "Failed to complete task/run transaction"
+                );
             }
 
             valka_core::metrics::record_task_completed("");
             self.emit_event(&result.task_id, "", 4); // 4 = COMPLETED
         } else {
-            // Fail the task run
-            if let Err(e) = valka_db::queries::task_runs::fail_task_run(
-                &self.pool,
-                &result.task_run_id,
-                &result.error_message,
-            )
-            .await
-            {
-                error!(task_run_id = %result.task_run_id, error = %e, "Failed to fail task run");
+            // Atomically fail run and update task status in a single transaction
+            let tx_result: Result<(), sqlx::Error> = async {
+                let mut tx = self.pool.begin().await?;
+
+                sqlx::query(
+                    "UPDATE task_runs SET status = 'FAILED', error_message = $2, \
+                     completed_at = NOW() WHERE id = $1 AND status = 'RUNNING'",
+                )
+                .bind(&result.task_run_id)
+                .bind(&result.error_message)
+                .execute(&mut *tx)
+                .await?;
+
+                if result.retryable {
+                    sqlx::query(
+                        "UPDATE tasks SET status = 'RETRY', updated_at = NOW() WHERE id = $1",
+                    )
+                    .bind(&result.task_id)
+                    .execute(&mut *tx)
+                    .await?;
+                } else {
+                    sqlx::query(
+                        "UPDATE tasks SET status = 'FAILED', error_message = $2, \
+                         updated_at = NOW() WHERE id = $1",
+                    )
+                    .bind(&result.task_id)
+                    .bind(&result.error_message)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+
+                tx.commit().await?;
+                Ok(())
+            }
+            .await;
+
+            if let Err(e) = tx_result {
+                error!(
+                    task_id = %result.task_id,
+                    task_run_id = %result.task_run_id,
+                    error = %e,
+                    "Failed to process task result transaction"
+                );
             }
 
             if result.retryable {
-                // Mark for retry - scheduler will handle re-dispatch
-                if let Err(e) = valka_db::queries::tasks::update_task_status(
-                    &self.pool,
-                    &result.task_id,
-                    "RETRY",
-                )
-                .await
-                {
-                    error!(task_id = %result.task_id, error = %e, "Failed to update task to RETRY");
-                }
                 valka_core::metrics::record_task_retried("");
                 self.emit_event(&result.task_id, "", 6); // 6 = RETRY
             } else {
-                if let Err(e) = valka_db::queries::tasks::fail_task(
-                    &self.pool,
-                    &result.task_id,
-                    &result.error_message,
-                )
-                .await
-                {
-                    error!(task_id = %result.task_id, error = %e, "Failed to fail task");
-                }
                 valka_core::metrics::record_task_failed("");
                 self.emit_event(&result.task_id, "", 5); // 5 = FAILED
             }

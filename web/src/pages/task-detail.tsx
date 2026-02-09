@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
-import { useParams, Link } from "react-router-dom";
-import { ArrowLeft } from "lucide-react";
-import { useTask, useTaskRuns } from "@/hooks/use-tasks";
+import { useParams, Link, useNavigate } from "react-router-dom";
+import { ArrowLeft, Trash2 } from "lucide-react";
+import { useTask, useTaskRuns, useDeleteTask } from "@/hooks/use-tasks";
 import { TaskDetailPanel } from "@/components/task-detail/task-detail-panel";
 import { TaskRunsTable } from "@/components/task-detail/task-runs-table";
 import { TaskLogsViewer } from "@/components/task-detail/task-logs-viewer";
@@ -10,8 +10,10 @@ import { Separator } from "@/components/ui/separator";
 
 export function TaskDetailPage() {
   const { taskId } = useParams<{ taskId: string }>();
+  const navigate = useNavigate();
   const { data: task, isLoading: taskLoading } = useTask(taskId!);
   const { data: runs = [], isLoading: runsLoading } = useTaskRuns(taskId!);
+  const deleteTask = useDeleteTask();
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
 
   // Auto-select the latest run when runs load
@@ -47,13 +49,31 @@ export function TaskDetailPage() {
 
   return (
     <div className="space-y-6">
-      <Link
-        to="/tasks"
-        className="inline-flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
-      >
-        <ArrowLeft className="h-4 w-4" />
-        Back to tasks
-      </Link>
+      <div className="flex items-center justify-between">
+        <Link
+          to="/tasks"
+          className="inline-flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          Back to tasks
+        </Link>
+        <Button
+          variant="outline"
+          size="sm"
+          className="text-destructive hover:text-destructive"
+          disabled={deleteTask.isPending}
+          onClick={() => {
+            if (window.confirm("Delete this task and all its runs/logs?")) {
+              deleteTask.mutate(taskId!, {
+                onSuccess: () => navigate("/tasks"),
+              });
+            }
+          }}
+        >
+          <Trash2 className="mr-1.5 h-4 w-4" />
+          Delete
+        </Button>
+      </div>
 
       <TaskDetailPanel task={task} />
 

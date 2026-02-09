@@ -42,7 +42,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "json", "chrono", "uuid"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "json", "chrono", "uuid", "migrate"] }
 
 # Cluster
 chitchat = "0.10"
@@ -89,6 +89,9 @@ valka-dispatcher = { path = "crates/valka-dispatcher" }
 valka-scheduler = { path = "crates/valka-scheduler" }
 valka-cluster = { path = "crates/valka-cluster" }
 valka-sdk = { path = "crates/valka-sdk" }
+
+# Env
+dotenvy = "0.15"
 
 # Misc
 tokio-stream = { version = "0.1", features = ["sync"] }

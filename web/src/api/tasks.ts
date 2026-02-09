@@ -40,6 +40,18 @@ export const tasksApi = {
     });
   },
 
+  delete(taskId: string): Promise<{ deleted: boolean }> {
+    return fetchAPI<{ deleted: boolean }>(`/api/v1/tasks/${taskId}`, {
+      method: "DELETE",
+    });
+  },
+
+  clearAll(): Promise<{ deleted_count: number }> {
+    return fetchAPI<{ deleted_count: number }>("/api/v1/tasks", {
+      method: "DELETE",
+    });
+  },
+
   getRuns(taskId: string): Promise<TaskRun[]> {
     return fetchAPI<TaskRun[]>(`/api/v1/tasks/${taskId}/runs`);
   },

@@ -210,9 +210,8 @@ pub async fn run_task_reader_manager(
 }
 
 async fn discover_queues(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
-    let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT DISTINCT queue_name FROM tasks")
-            .fetch_all(pool)
-            .await?;
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT DISTINCT queue_name FROM tasks")
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(|(name,)| name).collect())
 }

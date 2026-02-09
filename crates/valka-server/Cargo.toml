@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "valka_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "valka-server"
 path = "src/main.rs"
@@ -34,6 +38,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
 figment = { workspace = true }
+dotenvy = { workspace = true }
 tikv-jemallocator = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
