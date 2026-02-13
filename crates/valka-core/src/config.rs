@@ -22,6 +22,7 @@ pub struct GossipConfig {
     pub listen_addr: String,
     pub seed_nodes: Vec<String>,
     pub cluster_id: String,
+    pub advertise_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +73,7 @@ impl Default for GossipConfig {
             listen_addr: "0.0.0.0:7280".to_string(),
             seed_nodes: vec![],
             cluster_id: "valka".to_string(),
+            advertise_addr: None,
         }
     }
 }

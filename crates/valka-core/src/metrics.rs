@@ -43,3 +43,15 @@ pub fn record_sync_match() {
 pub fn record_async_match() {
     counter!("valka_async_matches_total").increment(1);
 }
+
+pub fn set_cluster_members(count: f64) {
+    gauge!("valka_cluster_members").set(count);
+}
+
+pub fn record_task_forwarded(queue: &str) {
+    counter!("valka_tasks_forwarded_total", "queue" => queue.to_string()).increment(1);
+}
+
+pub fn record_forward_circuit_open(addr: &str) {
+    counter!("valka_forward_circuit_open_total", "addr" => addr.to_string()).increment(1);
+}
