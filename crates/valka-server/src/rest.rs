@@ -8,11 +8,13 @@ use axum::{
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
+use valka_cluster::{ClusterManager, NodeForwarder};
 use valka_core::{TaskId, partition_for_task};
 use valka_db::DbPool;
 use valka_dispatcher::DispatcherService;
@@ -26,6 +28,9 @@ pub struct AppState {
     matching: MatchingService,
     dispatcher: DispatcherService,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    cluster: Arc<ClusterManager>,
+    forwarder: NodeForwarder,
+    node_id: String,
 }
 
 /// Build the API router (useful for testing with tower::ServiceExt::oneshot)
@@ -35,13 +40,19 @@ pub fn build_api_router(
     matching: MatchingService,
     dispatcher: DispatcherService,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    cluster: Arc<ClusterManager>,
+    forwarder: NodeForwarder,
 ) -> Router {
+    let node_id = cluster.node_id().0.clone();
     let state = AppState {
         pool,
         event_tx,
         matching,
         dispatcher,
         metrics_handle,
+        cluster,
+        forwarder,
+        node_id,
     };
 
     let cors = CorsLayer::new()
@@ -74,10 +85,14 @@ pub async fn serve_rest(
     matching: MatchingService,
     dispatcher: DispatcherService,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    cluster: Arc<ClusterManager>,
+    forwarder: NodeForwarder,
     web_dir: String,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
-    let api_routes = build_api_router(pool, event_tx, matching, dispatcher, metrics_handle);
+    let api_routes = build_api_router(
+        pool, event_tx, matching, dispatcher, metrics_handle, cluster, forwarder,
+    );
 
     // Serve static files with SPA fallback
     let index_path = format!("{}/index.html", &web_dir);
@@ -187,12 +202,31 @@ async fn create_task(
         previous_status: 0,
         new_status: 1, // PENDING
         worker_id: String::new(),
-        node_id: String::new(),
+        node_id: state.node_id.clone(),
         attempt_number: 0,
         error_message: String::new(),
         timestamp_ms: chrono::Utc::now().timestamp_millis(),
     };
     let _ = state.event_tx.send(event);
+
+    // Check if we own this partition; if not, forward to owner
+    if !state
+        .cluster
+        .owns_partition(&body.queue_name, partition.0)
+        .await
+        && let Some(owner_addr) = state
+            .cluster
+            .get_partition_owner_addr(&body.queue_name, partition.0)
+            .await
+    {
+        let _ = state
+            .forwarder
+            .forward_task(&owner_addr, &task_id.0, &body.queue_name, partition.0)
+            .await;
+        valka_core::metrics::record_task_forwarded(&body.queue_name);
+        return Ok((StatusCode::CREATED, Json(task_row_to_json(task))));
+    }
+    // If owner unknown, fall through to local sync match (safety)
 
     // Sync match (hot path) — same as gRPC create_task
     if scheduled_at.is_none() {
@@ -271,7 +305,7 @@ async fn cancel_task(
         previous_status: 0,
         new_status: 8, // CANCELLED
         worker_id: String::new(),
-        node_id: String::new(),
+        node_id: state.node_id.clone(),
         attempt_number: 0,
         error_message: String::new(),
         timestamp_ms: chrono::Utc::now().timestamp_millis(),

@@ -6,9 +6,16 @@ license.workspace = true
 
 [dependencies]
 valka-core = { workspace = true }
+valka-proto = { workspace = true }
 chitchat = { workspace = true }
 hashring = { workspace = true }
 tokio = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }

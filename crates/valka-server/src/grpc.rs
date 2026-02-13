@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -7,19 +8,23 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::info;
 
+use valka_cluster::{ClusterManager, NodeForwarder};
 use valka_core::{NodeId, TaskId, partition_for_task};
 use valka_db::DbPool;
 use valka_dispatcher::DispatcherService;
 use valka_matching::MatchingService;
 use valka_matching::partition::TaskEnvelope;
 use valka_proto::*;
+use valka_server::internal_grpc::InternalServiceImpl;
 
 pub struct ApiServiceImpl {
     pool: DbPool,
     matching: MatchingService,
     dispatcher: DispatcherService,
     event_tx: broadcast::Sender<TaskEvent>,
-    _node_id: NodeId,
+    node_id: NodeId,
+    cluster: Arc<ClusterManager>,
+    forwarder: NodeForwarder,
 }
 
 pub struct WorkerServiceImpl {
@@ -118,12 +123,30 @@ impl api_service_server::ApiService for ApiServiceImpl {
             previous_status: 0,
             new_status: 1, // PENDING
             worker_id: String::new(),
-            node_id: String::new(),
+            node_id: self.node_id.0.clone(),
             attempt_number: 0,
             error_message: String::new(),
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
         };
         let _ = self.event_tx.send(event);
+
+        // Check if we own this partition; if not, forward to owner
+        if !self.cluster.owns_partition(&req.queue_name, partition.0).await
+            && let Some(owner_addr) = self
+                .cluster
+                .get_partition_owner_addr(&req.queue_name, partition.0)
+                .await
+        {
+            let _ = self
+                .forwarder
+                .forward_task(&owner_addr, &task_id.0, &req.queue_name, partition.0)
+                .await;
+            valka_core::metrics::record_task_forwarded(&req.queue_name);
+            return Ok(Response::new(CreateTaskResponse {
+                task: Some(task_row_to_proto(task_row)),
+            }));
+        }
+        // If owner unknown, fall through to local sync match (safety)
 
         // Try sync match (hot path)
         if scheduled_at.is_none() {
@@ -237,7 +260,7 @@ impl api_service_server::ApiService for ApiServiceImpl {
             previous_status: 0,
             new_status: 8, // CANCELLED
             worker_id: String::new(),
-            node_id: String::new(),
+            node_id: self.node_id.0.clone(),
             attempt_number: 0,
             error_message: String::new(),
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
@@ -347,17 +370,29 @@ pub async fn serve_grpc(
     matching: MatchingService,
     event_tx: broadcast::Sender<TaskEvent>,
     node_id: NodeId,
+    cluster: Arc<ClusterManager>,
+    forwarder: NodeForwarder,
+    _log_tx: mpsc::Sender<LogEntry>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
     let api_service = ApiServiceImpl {
-        pool,
-        matching,
+        pool: pool.clone(),
+        matching: matching.clone(),
         dispatcher: dispatcher.clone(),
-        event_tx,
-        _node_id: node_id,
+        event_tx: event_tx.clone(),
+        node_id: node_id.clone(),
+        cluster,
+        forwarder,
     };
 
     let worker_service = WorkerServiceImpl { dispatcher };
+
+    let internal_service = InternalServiceImpl {
+        pool,
+        matching,
+        node_id,
+        event_tx,
+    };
 
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
@@ -378,6 +413,9 @@ pub async fn serve_grpc(
         .add_service(api_service_server::ApiServiceServer::new(api_service))
         .add_service(worker_service_server::WorkerServiceServer::new(
             worker_service,
+        ))
+        .add_service(internal_service_server::InternalServiceServer::new(
+            internal_service,
         ))
         .serve_with_shutdown(addr, async move {
             let _ = shutdown.changed().await;

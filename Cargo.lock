@@ -3043,13 +3043,20 @@ dependencies = [
 name = "valka-cluster"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chitchat",
+ "chrono",
+ "futures",
  "hashring",
  "serde",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
  "tracing",
  "valka-core",
+ "valka-proto",
 ]
 
 [[package]]

@@ -2,6 +2,8 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::info;
@@ -64,10 +66,29 @@ async fn main() -> Result<()> {
 
     // Initialize services
     let matching = valka_matching::MatchingService::new(config.matching.clone());
-    let _cluster = valka_cluster::ClusterManager::new_single_node(
-        node_id.clone(),
-        config.matching.num_partitions,
-    );
+
+    // Initialize cluster: single-node if no seed_nodes, clustered otherwise
+    let cluster = Arc::new(if config.gossip.seed_nodes.is_empty() {
+        info!("Starting in single-node mode (no seed_nodes configured)");
+        valka_cluster::ClusterManager::new_single_node(
+            node_id.clone(),
+            config.matching.num_partitions,
+        )
+    } else {
+        info!(
+            seeds = ?config.gossip.seed_nodes,
+            "Starting in clustered mode"
+        );
+        valka_cluster::ClusterManager::new_clustered(
+            node_id.clone(),
+            config.matching.num_partitions,
+            &config.gossip,
+            &config.grpc_addr,
+        )
+        .await?
+    });
+
+    let forwarder = valka_cluster::NodeForwarder::new();
 
     let dispatcher = valka_dispatcher::DispatcherService::new(
         matching.clone(),
@@ -104,15 +125,33 @@ async fn main() -> Result<()> {
         server::run_log_ingester(log_pool, log_config, log_rx, log_shutdown).await;
     });
 
-    // Start TaskReaders for all partitions (they'll handle any queue dynamically)
-    // For now, we start a task reader discovery loop that spawns readers for known queues
+    // Start TaskReaders for owned partitions
     let tr_pool = pool.clone();
     let tr_matching = matching.clone();
     let tr_config = config.matching.clone();
+    let tr_cluster = cluster.clone();
     let tr_shutdown = shutdown_rx.clone();
     tokio::spawn(async move {
-        server::run_task_reader_manager(tr_pool, tr_matching, tr_config, tr_shutdown).await;
+        server::run_task_reader_manager(tr_pool, tr_matching, tr_config, tr_cluster, tr_shutdown)
+            .await;
     });
+
+    // Start event relay (only in clustered mode)
+    if cluster.is_clustered() {
+        let relay_cluster = cluster.clone();
+        let relay_forwarder = forwarder.clone();
+        let relay_event_rx = event_tx.subscribe();
+        let relay_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            valka_cluster::event_relay::run_event_relay(
+                relay_cluster,
+                relay_forwarder,
+                relay_event_rx,
+                relay_shutdown,
+            )
+            .await;
+        });
+    }
 
     // Install metrics exporter
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
@@ -126,6 +165,9 @@ async fn main() -> Result<()> {
     let grpc_event_tx = event_tx.clone();
     let grpc_matching = matching.clone();
     let grpc_node_id = node_id.clone();
+    let grpc_cluster = cluster.clone();
+    let grpc_forwarder = forwarder.clone();
+    let grpc_log_tx = log_tx.clone();
     let grpc_shutdown = shutdown_rx.clone();
 
     let shutdown_tx_grpc = shutdown_tx.clone();
@@ -137,6 +179,9 @@ async fn main() -> Result<()> {
             grpc_matching,
             grpc_event_tx,
             grpc_node_id,
+            grpc_cluster,
+            grpc_forwarder,
+            grpc_log_tx,
             grpc_shutdown,
         )
         .await
@@ -152,6 +197,8 @@ async fn main() -> Result<()> {
     let rest_event_tx = event_tx.clone();
     let rest_matching = matching.clone();
     let rest_dispatcher = dispatcher.clone();
+    let rest_cluster = cluster.clone();
+    let rest_forwarder = forwarder.clone();
     let rest_shutdown = shutdown_rx.clone();
 
     let shutdown_tx_rest = shutdown_tx.clone();
@@ -163,6 +210,8 @@ async fn main() -> Result<()> {
             rest_matching,
             rest_dispatcher,
             metrics_handle,
+            rest_cluster,
+            rest_forwarder,
             config.web_dir.clone(),
             rest_shutdown,
         )
@@ -190,6 +239,13 @@ async fn main() -> Result<()> {
         let _ = http_handle.await;
     })
     .await;
+
+    // Shutdown cluster gossip
+    // Note: We need to unwrap Arc to call shutdown which consumes self.
+    // If other references still exist, we just skip graceful shutdown.
+    if let Ok(cluster) = Arc::try_unwrap(cluster) {
+        cluster.shutdown().await;
+    }
 
     info!("Valka server stopped");
     Ok(())

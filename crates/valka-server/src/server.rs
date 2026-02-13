@@ -1,8 +1,10 @@
 use sqlx::PgPool;
-use std::collections::HashSet;
-use tokio::sync::{mpsc, watch};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::{Duration, interval};
 use tracing::{error, info};
+use valka_cluster::ClusterManager;
 use valka_core::{LogIngesterConfig, MatchingConfig, PartitionId, SchedulerConfig};
 use valka_db::queries::task_logs::{InsertLogEntry, batch_insert_logs};
 use valka_matching::MatchingService;
@@ -144,15 +146,21 @@ fn log_level_to_string(level: i32) -> String {
     }
 }
 
-/// Discover queues from PG and start TaskReaders for them
+/// Discover queues from PG and start TaskReaders for owned partitions.
+/// When cluster membership changes (PartitionsRebalanced), reconciles readers:
+/// stops readers for partitions we no longer own, starts readers for newly owned ones.
 pub async fn run_task_reader_manager(
     pool: PgPool,
     matching: MatchingService,
     config: MatchingConfig,
+    cluster: Arc<ClusterManager>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut known_queues: HashSet<String> = HashSet::new();
+    // (queue_name, partition_id) -> shutdown sender for that reader
+    let mut reader_shutdowns: HashMap<(String, i32), watch::Sender<bool>> = HashMap::new();
     let mut check_interval = interval(Duration::from_secs(5));
+    let mut cluster_events = cluster.subscribe_events();
 
     info!("TaskReader manager started");
 
@@ -160,37 +168,84 @@ pub async fn run_task_reader_manager(
         tokio::select! {
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
+                    // Shut down all readers
+                    for (_, tx) in reader_shutdowns.drain() {
+                        let _ = tx.send(true);
+                    }
                     info!("TaskReader manager shutting down");
                     return;
+                }
+            }
+            event = cluster_events.recv() => {
+                match event {
+                    Ok(valka_cluster::ClusterEvent::PartitionsRebalanced) => {
+                        // Reconcile readers on rebalance
+                        reconcile_readers(
+                            &pool,
+                            &matching,
+                            &config,
+                            &cluster,
+                            &known_queues,
+                            &mut reader_shutdowns,
+                        ).await;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(n, "TaskReader manager lagged on cluster events, reconciling");
+                        reconcile_readers(
+                            &pool,
+                            &matching,
+                            &config,
+                            &cluster,
+                            &known_queues,
+                            &mut reader_shutdowns,
+                        ).await;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!("Cluster event channel closed");
+                    }
+                    _ => {}
                 }
             }
             _ = check_interval.tick() => {
                 // Discover queues from the tasks table
                 match discover_queues(&pool).await {
                     Ok(queues) => {
+                        let mut new_queues = false;
                         for queue_name in queues {
                             if known_queues.contains(&queue_name) {
                                 continue;
                             }
                             known_queues.insert(queue_name.clone());
+                            new_queues = true;
 
                             // Ensure queue partitions exist
                             matching.ensure_queue(&queue_name);
 
-                            // Start a TaskReader for each partition
+                            // Start readers only for partitions we own
                             for pid in 0..config.num_partitions {
-                                let reader = TaskReader::new(
-                                    pool.clone(),
-                                    matching.clone(),
-                                    queue_name.clone(),
-                                    PartitionId(pid),
-                                    config.clone(),
-                                    shutdown.clone(),
+                                let key = (queue_name.clone(), pid);
+                                if reader_shutdowns.contains_key(&key) {
+                                    continue;
+                                }
+                                if !cluster.owns_partition(&queue_name, pid).await {
+                                    continue;
+                                }
+                                start_reader(
+                                    &pool,
+                                    &matching,
+                                    &config,
+                                    &queue_name,
+                                    pid,
+                                    &mut reader_shutdowns,
                                 );
-                                tokio::spawn(reader.run());
                             }
 
-                            info!(queue = %queue_name, partitions = config.num_partitions, "Started TaskReaders for queue");
+                            info!(queue = %queue_name, "Started TaskReaders for owned partitions");
+                        }
+
+                        if !new_queues {
+                            // Even if no new queues, periodically reconcile
+                            // to handle ownership changes without explicit event
                         }
                     }
                     Err(e) => {
@@ -207,6 +262,73 @@ pub async fn run_task_reader_manager(
             }
         }
     }
+}
+
+/// Reconcile readers: stop readers for partitions we no longer own,
+/// start readers for partitions we now own.
+async fn reconcile_readers(
+    pool: &PgPool,
+    matching: &MatchingService,
+    config: &MatchingConfig,
+    cluster: &Arc<ClusterManager>,
+    known_queues: &HashSet<String>,
+    reader_shutdowns: &mut HashMap<(String, i32), watch::Sender<bool>>,
+) {
+    // Stop readers for partitions we no longer own
+    let keys_to_check: Vec<(String, i32)> = reader_shutdowns.keys().cloned().collect();
+    for key in keys_to_check {
+        if !cluster.owns_partition(&key.0, key.1).await
+            && let Some(tx) = reader_shutdowns.remove(&key)
+        {
+            let _ = tx.send(true);
+            info!(
+                queue = %key.0,
+                partition = key.1,
+                "Stopped TaskReader (partition no longer owned)"
+            );
+        }
+    }
+
+    // Start readers for partitions we now own but don't have a reader for
+    for queue_name in known_queues {
+        matching.ensure_queue(queue_name);
+        for pid in 0..config.num_partitions {
+            let key = (queue_name.clone(), pid);
+            if reader_shutdowns.contains_key(&key) {
+                continue;
+            }
+            if !cluster.owns_partition(queue_name, pid).await {
+                continue;
+            }
+            start_reader(pool, matching, config, queue_name, pid, reader_shutdowns);
+            info!(
+                queue = %queue_name,
+                partition = pid,
+                "Started TaskReader (newly owned partition)"
+            );
+        }
+    }
+}
+
+fn start_reader(
+    pool: &PgPool,
+    matching: &MatchingService,
+    config: &MatchingConfig,
+    queue_name: &str,
+    partition_id: i32,
+    reader_shutdowns: &mut HashMap<(String, i32), watch::Sender<bool>>,
+) {
+    let (reader_shutdown_tx, reader_shutdown_rx) = watch::channel(false);
+    let reader = TaskReader::new(
+        pool.clone(),
+        matching.clone(),
+        queue_name.to_string(),
+        PartitionId(partition_id),
+        config.clone(),
+        reader_shutdown_rx,
+    );
+    tokio::spawn(reader.run());
+    reader_shutdowns.insert((queue_name.to_string(), partition_id), reader_shutdown_tx);
 }
 
 async fn discover_queues(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
