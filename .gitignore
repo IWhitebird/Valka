@@ -16,6 +16,7 @@ sdks/go/proto/valkav1/*.pb.go
 # Node / TypeScript
 node_modules/
 *.tsbuildinfo
+dist
 
 # WebUI
 web/dist/
