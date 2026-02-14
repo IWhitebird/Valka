@@ -9,9 +9,9 @@ const currentDir =
     ? __dirname
     : path.dirname(fileURLToPath(import.meta.url));
 
-// Proto files are at <package-root>/proto/valka/v1/
-// dist/ is at <package-root>/dist/
-const PROTO_DIR = path.resolve(currentDir, "..", "proto");
+// Proto files are at <repo-root>/proto/valka/v1/
+// dist/ is at <repo-root>/sdks/typescript/dist/
+const PROTO_DIR = path.resolve(currentDir, "..", "..", "..", "proto");
 
 // --- Typed message interfaces matching proto definitions ---
 
