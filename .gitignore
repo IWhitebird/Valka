@@ -1,20 +1,37 @@
-/target
+# Rust
+/target/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+sdks/python/src/valka/_proto/
+
+# Go (generated proto stubs)
+sdks/go/proto/valkav1/*.pb.go
+
+# Node / TypeScript
+node_modules/
+*.tsbuildinfo
+
+# WebUI
+web/dist/
+
+# IDE
+.idea/
+.vscode/
 *.swp
 *.swo
 *~
+
+# OS
 .DS_Store
-.env
-.idea/
-.vscode/
+Thumbs.db
+
+# Logs & env
 *.log
-
-# WebUI
-web/node_modules/
-web/dist/
-
-# TypeScript SDK
-sdks/typescript/node_modules/
-sdks/typescript/dist/
-
-# JS Examples
-examples/js/node_modules/
+.env
+.env.*
