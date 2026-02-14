@@ -8,11 +8,6 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
-sdks/python/src/valka/_proto/
-
-# Go (generated proto stubs)
-sdks/go/proto/valkav1/*.pb.go
-
 # Node / TypeScript
 node_modules/
 *.tsbuildinfo
