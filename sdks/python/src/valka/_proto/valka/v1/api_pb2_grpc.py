@@ -56,6 +56,11 @@ class ApiServiceStub(object):
                 request_serializer=valka_dot_v1_dot_api__pb2.CancelTaskRequest.SerializeToString,
                 response_deserializer=valka_dot_v1_dot_api__pb2.CancelTaskResponse.FromString,
                 _registered_method=True)
+        self.SendSignal = channel.unary_unary(
+                '/valka.v1.ApiService/SendSignal',
+                request_serializer=valka_dot_v1_dot_api__pb2.SendSignalRequest.SerializeToString,
+                response_deserializer=valka_dot_v1_dot_api__pb2.SendSignalResponse.FromString,
+                _registered_method=True)
         self.SubscribeEvents = channel.unary_stream(
                 '/valka.v1.ApiService/SubscribeEvents',
                 request_serializer=valka_dot_v1_dot_api__pb2.SubscribeEventsRequest.SerializeToString,
@@ -96,6 +101,13 @@ class ApiServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SendSignal(self, request, context):
+        """Signals
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def SubscribeEvents(self, request, context):
         """Event streaming
         """
@@ -132,6 +144,11 @@ def add_ApiServiceServicer_to_server(servicer, server):
                     servicer.CancelTask,
                     request_deserializer=valka_dot_v1_dot_api__pb2.CancelTaskRequest.FromString,
                     response_serializer=valka_dot_v1_dot_api__pb2.CancelTaskResponse.SerializeToString,
+            ),
+            'SendSignal': grpc.unary_unary_rpc_method_handler(
+                    servicer.SendSignal,
+                    request_deserializer=valka_dot_v1_dot_api__pb2.SendSignalRequest.FromString,
+                    response_serializer=valka_dot_v1_dot_api__pb2.SendSignalResponse.SerializeToString,
             ),
             'SubscribeEvents': grpc.unary_stream_rpc_method_handler(
                     servicer.SubscribeEvents,
@@ -252,6 +269,33 @@ class ApiService(object):
             '/valka.v1.ApiService/CancelTask',
             valka_dot_v1_dot_api__pb2.CancelTaskRequest.SerializeToString,
             valka_dot_v1_dot_api__pb2.CancelTaskResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SendSignal(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/valka.v1.ApiService/SendSignal',
+            valka_dot_v1_dot_api__pb2.SendSignalRequest.SerializeToString,
+            valka_dot_v1_dot_api__pb2.SendSignalResponse.FromString,
             options,
             channel_credentials,
             insecure,

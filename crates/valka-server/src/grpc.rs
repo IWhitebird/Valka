@@ -272,6 +272,79 @@ impl api_service_server::ApiService for ApiServiceImpl {
         }))
     }
 
+    async fn send_signal(
+        &self,
+        request: Request<SendSignalRequest>,
+    ) -> Result<Response<SendSignalResponse>, Status> {
+        let req = request.into_inner();
+
+        // Validate task exists
+        let task = valka_db::queries::tasks::get_task(&self.pool, &req.task_id)
+            .await
+            .map_err(|e| Status::internal(format!("Database error: {e}")))?
+            .ok_or_else(|| Status::not_found(format!("Task not found: {}", req.task_id)))?;
+
+        // Reject if terminal status
+        match task.status.as_str() {
+            "COMPLETED" | "FAILED" | "DEAD_LETTER" | "CANCELLED" => {
+                return Err(Status::failed_precondition(format!(
+                    "Cannot send signal to task in {} state",
+                    task.status
+                )));
+            }
+            _ => {}
+        }
+
+        // Validate payload is valid JSON if non-empty
+        let payload: Option<serde_json::Value> = if req.payload.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_str(&req.payload)
+                    .map_err(|e| Status::invalid_argument(format!("Invalid payload JSON: {e}")))?,
+            )
+        };
+
+        // Insert signal
+        let signal_id = uuid::Uuid::now_v7().to_string();
+        let signal = valka_db::queries::signals::create_signal(
+            &self.pool,
+            &signal_id,
+            &req.task_id,
+            &req.signal_name,
+            payload,
+        )
+        .await
+        .map_err(|e| Status::internal(format!("Database error: {e}")))?;
+
+        // Try immediate delivery
+        let task_signal = valka_proto::TaskSignal {
+            signal_id: signal.id.clone(),
+            task_id: signal.task_id,
+            signal_name: signal.signal_name,
+            payload: signal
+                .payload
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            timestamp_ms: signal.created_at.timestamp_millis(),
+        };
+
+        let delivered = self
+            .dispatcher
+            .send_signal_to_worker(&req.task_id, task_signal)
+            .await;
+
+        if delivered {
+            let _ =
+                valka_db::queries::signals::mark_delivered(&self.pool, &signal.id).await;
+        }
+
+        Ok(Response::new(SendSignalResponse {
+            signal_id: signal.id,
+            delivered,
+        }))
+    }
+
     type SubscribeEventsStream =
         Pin<Box<dyn Stream<Item = Result<TaskEvent, Status>> + Send + 'static>>;
 

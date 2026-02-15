@@ -87,6 +87,9 @@ pub async fn handle_worker_stream(
                 Some(worker_request::Request::LogBatch(batch)) => {
                     dispatcher.handle_log_batch(&worker_id, batch).await;
                 }
+                Some(worker_request::Request::SignalAck(ack)) => {
+                    dispatcher.handle_signal_ack(&ack).await;
+                }
                 Some(worker_request::Request::Shutdown(shutdown)) => {
                     info!(
                         worker_id = %worker_id,

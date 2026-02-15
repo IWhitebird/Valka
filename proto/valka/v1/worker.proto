@@ -17,6 +17,7 @@ message WorkerRequest {
         Heartbeat heartbeat = 3;
         LogBatch log_batch = 4;
         GracefulShutdown shutdown = 5;
+        SignalAck signal_ack = 6;
     }
 }
 
@@ -27,6 +28,7 @@ message WorkerResponse {
         TaskCancellation task_cancellation = 2;
         HeartbeatAck heartbeat_ack = 3;
         ServerShutdown server_shutdown = 4;
+        TaskSignal task_signal = 5;
     }
 }
 
@@ -95,4 +97,16 @@ message HeartbeatAck {
 message ServerShutdown {
     string reason = 1;
     int32 drain_seconds = 2;
+}
+
+message TaskSignal {
+    string signal_id = 1;
+    string task_id = 2;
+    string signal_name = 3;
+    string payload = 4;          // JSON string
+    int64 timestamp_ms = 5;
+}
+
+message SignalAck {
+    string signal_id = 1;
 }

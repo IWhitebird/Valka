@@ -23,6 +23,7 @@ const (
 	ApiService_GetTask_FullMethodName         = "/valka.v1.ApiService/GetTask"
 	ApiService_ListTasks_FullMethodName       = "/valka.v1.ApiService/ListTasks"
 	ApiService_CancelTask_FullMethodName      = "/valka.v1.ApiService/CancelTask"
+	ApiService_SendSignal_FullMethodName      = "/valka.v1.ApiService/SendSignal"
 	ApiService_SubscribeEvents_FullMethodName = "/valka.v1.ApiService/SubscribeEvents"
 	ApiService_SubscribeLogs_FullMethodName   = "/valka.v1.ApiService/SubscribeLogs"
 )
@@ -36,6 +37,8 @@ type ApiServiceClient interface {
 	GetTask(ctx context.Context, in *GetTaskRequest, opts ...grpc.CallOption) (*GetTaskResponse, error)
 	ListTasks(ctx context.Context, in *ListTasksRequest, opts ...grpc.CallOption) (*ListTasksResponse, error)
 	CancelTask(ctx context.Context, in *CancelTaskRequest, opts ...grpc.CallOption) (*CancelTaskResponse, error)
+	// Signals
+	SendSignal(ctx context.Context, in *SendSignalRequest, opts ...grpc.CallOption) (*SendSignalResponse, error)
 	// Event streaming
 	SubscribeEvents(ctx context.Context, in *SubscribeEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TaskEvent], error)
 	// Log streaming
@@ -90,6 +93,16 @@ func (c *apiServiceClient) CancelTask(ctx context.Context, in *CancelTaskRequest
 	return out, nil
 }
 
+func (c *apiServiceClient) SendSignal(ctx context.Context, in *SendSignalRequest, opts ...grpc.CallOption) (*SendSignalResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SendSignalResponse)
+	err := c.cc.Invoke(ctx, ApiService_SendSignal_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *apiServiceClient) SubscribeEvents(ctx context.Context, in *SubscribeEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TaskEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &ApiService_ServiceDesc.Streams[0], ApiService_SubscribeEvents_FullMethodName, cOpts...)
@@ -137,6 +150,8 @@ type ApiServiceServer interface {
 	GetTask(context.Context, *GetTaskRequest) (*GetTaskResponse, error)
 	ListTasks(context.Context, *ListTasksRequest) (*ListTasksResponse, error)
 	CancelTask(context.Context, *CancelTaskRequest) (*CancelTaskResponse, error)
+	// Signals
+	SendSignal(context.Context, *SendSignalRequest) (*SendSignalResponse, error)
 	// Event streaming
 	SubscribeEvents(*SubscribeEventsRequest, grpc.ServerStreamingServer[TaskEvent]) error
 	// Log streaming
@@ -162,6 +177,9 @@ func (UnimplementedApiServiceServer) ListTasks(context.Context, *ListTasksReques
 }
 func (UnimplementedApiServiceServer) CancelTask(context.Context, *CancelTaskRequest) (*CancelTaskResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CancelTask not implemented")
+}
+func (UnimplementedApiServiceServer) SendSignal(context.Context, *SendSignalRequest) (*SendSignalResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SendSignal not implemented")
 }
 func (UnimplementedApiServiceServer) SubscribeEvents(*SubscribeEventsRequest, grpc.ServerStreamingServer[TaskEvent]) error {
 	return status.Errorf(codes.Unimplemented, "method SubscribeEvents not implemented")
@@ -262,6 +280,24 @@ func _ApiService_CancelTask_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ApiService_SendSignal_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SendSignalRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ApiServiceServer).SendSignal(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ApiService_SendSignal_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ApiServiceServer).SendSignal(ctx, req.(*SendSignalRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _ApiService_SubscribeEvents_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(SubscribeEventsRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -306,6 +342,10 @@ var ApiService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CancelTask",
 			Handler:    _ApiService_CancelTask_Handler,
+		},
+		{
+			MethodName: "SendSignal",
+			Handler:    _ApiService_SendSignal_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

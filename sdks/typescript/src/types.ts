@@ -141,6 +141,24 @@ export interface ValkaWorkerOptions {
   handler: TaskHandler;
 }
 
+// --- Signal types ---
+
+export interface Signal {
+  id: string;
+  task_id: string;
+  signal_name: string;
+  payload: unknown | null;
+  status: string;
+  created_at: string;
+  delivered_at: string | null;
+  acknowledged_at: string | null;
+}
+
+export interface SendSignalResponse {
+  signal_id: string;
+  delivered: boolean;
+}
+
 // --- Handler type ---
 
 export type TaskHandler = (ctx: import("./context").TaskContext) => Promise<unknown>;

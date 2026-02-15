@@ -27,7 +27,7 @@ from . import events_pb2 as valka_dot_v1_dot_events__pb2
 from . import worker_pb2 as valka_dot_v1_dot_worker__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x12valka/v1/api.proto\x12\x08valka.v1\x1a\x15valka/v1/common.proto\x1a\x15valka/v1/events.proto\x1a\x15valka/v1/worker.proto\"\xca\x01\n\x11\x43reateTaskRequest\x12\x12\n\nqueue_name\x18\x01 \x01(\t\x12\x11\n\ttask_name\x18\x02 \x01(\t\x12\r\n\x05input\x18\x03 \x01(\t\x12\x10\n\x08priority\x18\x04 \x01(\x05\x12\x13\n\x0bmax_retries\x18\x05 \x01(\x05\x12\x17\n\x0ftimeout_seconds\x18\x06 \x01(\x05\x12\x17\n\x0fidempotency_key\x18\x07 \x01(\t\x12\x10\n\x08metadata\x18\x08 \x01(\t\x12\x14\n\x0cscheduled_at\x18\t \x01(\t\"6\n\x12\x43reateTaskResponse\x12 \n\x04task\x18\x01 \x01(\x0b\x32\x12.valka.v1.TaskMeta\"!\n\x0eGetTaskRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\"3\n\x0fGetTaskResponse\x12 \n\x04task\x18\x01 \x01(\x0b\x32\x12.valka.v1.TaskMeta\"v\n\x10ListTasksRequest\x12\x12\n\nqueue_name\x18\x01 \x01(\t\x12$\n\x06status\x18\x02 \x01(\x0e\x32\x14.valka.v1.TaskStatus\x12(\n\npagination\x18\x03 \x01(\x0b\x32\x14.valka.v1.Pagination\"O\n\x11ListTasksResponse\x12!\n\x05tasks\x18\x01 \x03(\x0b\x32\x12.valka.v1.TaskMeta\x12\x17\n\x0fnext_page_token\x18\x02 \x01(\t\"$\n\x11\x43\x61ncelTaskRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\"6\n\x12\x43\x61ncelTaskResponse\x12 \n\x04task\x18\x01 \x01(\x0b\x32\x12.valka.v1.TaskMeta\"D\n\x14SubscribeLogsRequest\x12\x13\n\x0btask_run_id\x18\x01 \x01(\t\x12\x17\n\x0finclude_history\x18\x02 \x01(\x08\",\n\x16SubscribeEventsRequest\x12\x12\n\nqueue_name\x18\x01 \x01(\t2\xb7\x03\n\nApiService\x12G\n\nCreateTask\x12\x1b.valka.v1.CreateTaskRequest\x1a\x1c.valka.v1.CreateTaskResponse\x12>\n\x07GetTask\x12\x18.valka.v1.GetTaskRequest\x1a\x19.valka.v1.GetTaskResponse\x12\x44\n\tListTasks\x12\x1a.valka.v1.ListTasksRequest\x1a\x1b.valka.v1.ListTasksResponse\x12G\n\nCancelTask\x12\x1b.valka.v1.CancelTaskRequest\x1a\x1c.valka.v1.CancelTaskResponse\x12J\n\x0fSubscribeEvents\x12 .valka.v1.SubscribeEventsRequest\x1a\x13.valka.v1.TaskEvent0\x01\x12\x45\n\rSubscribeLogs\x12\x1e.valka.v1.SubscribeLogsRequest\x1a\x12.valka.v1.LogEntry0\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x12valka/v1/api.proto\x12\x08valka.v1\x1a\x15valka/v1/common.proto\x1a\x15valka/v1/events.proto\x1a\x15valka/v1/worker.proto\"\xca\x01\n\x11\x43reateTaskRequest\x12\x12\n\nqueue_name\x18\x01 \x01(\t\x12\x11\n\ttask_name\x18\x02 \x01(\t\x12\r\n\x05input\x18\x03 \x01(\t\x12\x10\n\x08priority\x18\x04 \x01(\x05\x12\x13\n\x0bmax_retries\x18\x05 \x01(\x05\x12\x17\n\x0ftimeout_seconds\x18\x06 \x01(\x05\x12\x17\n\x0fidempotency_key\x18\x07 \x01(\t\x12\x10\n\x08metadata\x18\x08 \x01(\t\x12\x14\n\x0cscheduled_at\x18\t \x01(\t\"6\n\x12\x43reateTaskResponse\x12 \n\x04task\x18\x01 \x01(\x0b\x32\x12.valka.v1.TaskMeta\"!\n\x0eGetTaskRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\"3\n\x0fGetTaskResponse\x12 \n\x04task\x18\x01 \x01(\x0b\x32\x12.valka.v1.TaskMeta\"v\n\x10ListTasksRequest\x12\x12\n\nqueue_name\x18\x01 \x01(\t\x12$\n\x06status\x18\x02 \x01(\x0e\x32\x14.valka.v1.TaskStatus\x12(\n\npagination\x18\x03 \x01(\x0b\x32\x14.valka.v1.Pagination\"O\n\x11ListTasksResponse\x12!\n\x05tasks\x18\x01 \x03(\x0b\x32\x12.valka.v1.TaskMeta\x12\x17\n\x0fnext_page_token\x18\x02 \x01(\t\"$\n\x11\x43\x61ncelTaskRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\"6\n\x12\x43\x61ncelTaskResponse\x12 \n\x04task\x18\x01 \x01(\x0b\x32\x12.valka.v1.TaskMeta\"J\n\x11SendSignalRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x13\n\x0bsignal_name\x18\x02 \x01(\t\x12\x0f\n\x07payload\x18\x03 \x01(\t\":\n\x12SendSignalResponse\x12\x11\n\tsignal_id\x18\x01 \x01(\t\x12\x11\n\tdelivered\x18\x02 \x01(\x08\"D\n\x14SubscribeLogsRequest\x12\x13\n\x0btask_run_id\x18\x01 \x01(\t\x12\x17\n\x0finclude_history\x18\x02 \x01(\x08\",\n\x16SubscribeEventsRequest\x12\x12\n\nqueue_name\x18\x01 \x01(\t2\x80\x04\n\nApiService\x12G\n\nCreateTask\x12\x1b.valka.v1.CreateTaskRequest\x1a\x1c.valka.v1.CreateTaskResponse\x12>\n\x07GetTask\x12\x18.valka.v1.GetTaskRequest\x1a\x19.valka.v1.GetTaskResponse\x12\x44\n\tListTasks\x12\x1a.valka.v1.ListTasksRequest\x1a\x1b.valka.v1.ListTasksResponse\x12G\n\nCancelTask\x12\x1b.valka.v1.CancelTaskRequest\x1a\x1c.valka.v1.CancelTaskResponse\x12G\n\nSendSignal\x12\x1b.valka.v1.SendSignalRequest\x1a\x1c.valka.v1.SendSignalResponse\x12J\n\x0fSubscribeEvents\x12 .valka.v1.SubscribeEventsRequest\x1a\x13.valka.v1.TaskEvent0\x01\x12\x45\n\rSubscribeLogs\x12\x1e.valka.v1.SubscribeLogsRequest\x1a\x12.valka.v1.LogEntry0\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -50,10 +50,14 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_CANCELTASKREQUEST']._serialized_end=687
   _globals['_CANCELTASKRESPONSE']._serialized_start=689
   _globals['_CANCELTASKRESPONSE']._serialized_end=743
-  _globals['_SUBSCRIBELOGSREQUEST']._serialized_start=745
-  _globals['_SUBSCRIBELOGSREQUEST']._serialized_end=813
-  _globals['_SUBSCRIBEEVENTSREQUEST']._serialized_start=815
-  _globals['_SUBSCRIBEEVENTSREQUEST']._serialized_end=859
-  _globals['_APISERVICE']._serialized_start=862
-  _globals['_APISERVICE']._serialized_end=1301
+  _globals['_SENDSIGNALREQUEST']._serialized_start=745
+  _globals['_SENDSIGNALREQUEST']._serialized_end=819
+  _globals['_SENDSIGNALRESPONSE']._serialized_start=821
+  _globals['_SENDSIGNALRESPONSE']._serialized_end=879
+  _globals['_SUBSCRIBELOGSREQUEST']._serialized_start=881
+  _globals['_SUBSCRIBELOGSREQUEST']._serialized_end=949
+  _globals['_SUBSCRIBEEVENTSREQUEST']._serialized_start=951
+  _globals['_SUBSCRIBEEVENTSREQUEST']._serialized_end=995
+  _globals['_APISERVICE']._serialized_start=998
+  _globals['_APISERVICE']._serialized_end=1510
 # @@protoc_insertion_point(module_scope)

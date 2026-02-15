@@ -60,6 +60,7 @@ class ValkaWorker:
 
         self._semaphore = asyncio.Semaphore(concurrency)
         self._active_tasks: dict[str, asyncio.Task[None]] = {}
+        self._task_contexts: dict[str, TaskContext] = {}
         self._shutting_down = False
         self._shutdown_event = asyncio.Event()
         self._stream: grpc.aio.StreamStreamCall | None = None  # type: ignore[type-arg]
@@ -213,9 +214,11 @@ class ValkaWorker:
                 break
 
     async def _handle_response(self, response: Any) -> None:
-        kind = response.WhichOneof("message")
+        kind = response.WhichOneof("response")
         if kind == "task_assignment":
             await self._handle_task_assignment(response.task_assignment)
+        elif kind == "task_signal":
+            self._handle_task_signal(response.task_signal)
         elif kind == "task_cancellation":
             self._handle_task_cancellation(response.task_cancellation)
         elif kind == "server_shutdown":
@@ -230,8 +233,14 @@ class ValkaWorker:
         self._active_tasks[assignment.task_id] = task
         task.add_done_callback(lambda _t: self._task_done(assignment.task_id))
 
+    def _handle_task_signal(self, signal: Any) -> None:
+        ctx = self._task_contexts.get(signal.task_id)
+        if ctx is not None:
+            ctx._deliver_signal(signal)
+
     def _task_done(self, task_id: str) -> None:
         self._active_tasks.pop(task_id, None)
+        self._task_contexts.pop(task_id, None)
         self._semaphore.release()
 
     async def _execute_task(self, assignment: Any) -> None:
@@ -247,6 +256,7 @@ class ValkaWorker:
             raw_metadata=assignment.metadata,
             send_fn=self._send,
         )
+        self._task_contexts[assignment.task_id] = ctx
 
         success = False
         retryable = True

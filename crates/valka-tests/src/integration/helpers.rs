@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use axum::Router;
 use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use tokio::sync::{broadcast, mpsc};
+use valka_cluster::{ClusterManager, NodeForwarder};
 use valka_core::{MatchingConfig, NodeId, TaskId, partition_for_task};
 use valka_db::queries::task_runs::{CreateTaskRunParams, TaskRunRow};
 use valka_db::queries::tasks::{CreateTaskParams, TaskRow};
@@ -81,7 +84,7 @@ pub fn build_test_router(pool: PgPool) -> Router {
     let dispatcher = DispatcherService::new(
         matching.clone(),
         pool.clone(),
-        node_id,
+        node_id.clone(),
         event_tx.clone(),
         log_tx,
     );
@@ -90,7 +93,15 @@ pub fn build_test_router(pool: PgPool) -> Router {
         .build_recorder()
         .handle();
 
-    valka_server::rest::build_api_router(pool, event_tx, matching, dispatcher, metrics_handle)
+    let cluster = Arc::new(ClusterManager::new_single_node(
+        node_id,
+        matching.config().num_partitions as i32,
+    ));
+    let forwarder = NodeForwarder::new();
+
+    valka_server::rest::build_api_router(
+        pool, event_tx, matching, dispatcher, metrics_handle, cluster, forwarder,
+    )
 }
 
 /// Convert a serde_json::Value into an axum-compatible request body.
