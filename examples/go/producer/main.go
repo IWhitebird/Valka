@@ -8,7 +8,7 @@ import (
 )
 
 func main() {
-	client := valka.NewClient("http://localhost:8080")
+	client := valka.NewClient("http://localhost:8989")
 
 	// Health check
 	health, err := client.HealthCheck()

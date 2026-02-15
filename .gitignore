@@ -31,3 +31,6 @@ Thumbs.db
 *.log
 .env
 .env.*
+
+
+experiments/

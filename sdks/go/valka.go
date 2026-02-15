@@ -7,7 +7,7 @@
 //
 // # Client Usage
 //
-//	client := valka.NewClient("http://localhost:8080")
+//	client := valka.NewClient("http://localhost:8989")
 //	task, err := client.CreateTask(valka.CreateTaskRequest{
 //	    QueueName: "emails",
 //	    TaskName:  "send-welcome",

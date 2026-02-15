@@ -6,7 +6,7 @@ from valka import ValkaClient
 
 
 async def main() -> None:
-    async with ValkaClient("http://localhost:8080") as client:
+    async with ValkaClient("http://localhost:8989") as client:
         # Health check
         health = await client.health_check()
         print(f"Server health: {health}")

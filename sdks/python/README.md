@@ -17,7 +17,7 @@ import asyncio
 from valka import ValkaClient
 
 async def main():
-    async with ValkaClient("http://localhost:8080") as client:
+    async with ValkaClient("http://localhost:8989") as client:
         # Create a task
         task = await client.create_task(
             queue_name="emails",
