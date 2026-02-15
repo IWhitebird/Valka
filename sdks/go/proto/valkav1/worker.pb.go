@@ -31,6 +31,7 @@ type WorkerRequest struct {
 	//	*WorkerRequest_Heartbeat
 	//	*WorkerRequest_LogBatch
 	//	*WorkerRequest_Shutdown
+	//	*WorkerRequest_SignalAck
 	Request       isWorkerRequest_Request `protobuf_oneof:"request"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -118,6 +119,15 @@ func (x *WorkerRequest) GetShutdown() *GracefulShutdown {
 	return nil
 }
 
+func (x *WorkerRequest) GetSignalAck() *SignalAck {
+	if x != nil {
+		if x, ok := x.Request.(*WorkerRequest_SignalAck); ok {
+			return x.SignalAck
+		}
+	}
+	return nil
+}
+
 type isWorkerRequest_Request interface {
 	isWorkerRequest_Request()
 }
@@ -142,6 +152,10 @@ type WorkerRequest_Shutdown struct {
 	Shutdown *GracefulShutdown `protobuf:"bytes,5,opt,name=shutdown,proto3,oneof"`
 }
 
+type WorkerRequest_SignalAck struct {
+	SignalAck *SignalAck `protobuf:"bytes,6,opt,name=signal_ack,json=signalAck,proto3,oneof"`
+}
+
 func (*WorkerRequest_Hello) isWorkerRequest_Request() {}
 
 func (*WorkerRequest_TaskResult) isWorkerRequest_Request() {}
@@ -152,6 +166,8 @@ func (*WorkerRequest_LogBatch) isWorkerRequest_Request() {}
 
 func (*WorkerRequest_Shutdown) isWorkerRequest_Request() {}
 
+func (*WorkerRequest_SignalAck) isWorkerRequest_Request() {}
+
 // Server -> Worker
 type WorkerResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -161,6 +177,7 @@ type WorkerResponse struct {
 	//	*WorkerResponse_TaskCancellation
 	//	*WorkerResponse_HeartbeatAck
 	//	*WorkerResponse_ServerShutdown
+	//	*WorkerResponse_TaskSignal
 	Response      isWorkerResponse_Response `protobuf_oneof:"response"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -239,6 +256,15 @@ func (x *WorkerResponse) GetServerShutdown() *ServerShutdown {
 	return nil
 }
 
+func (x *WorkerResponse) GetTaskSignal() *TaskSignal {
+	if x != nil {
+		if x, ok := x.Response.(*WorkerResponse_TaskSignal); ok {
+			return x.TaskSignal
+		}
+	}
+	return nil
+}
+
 type isWorkerResponse_Response interface {
 	isWorkerResponse_Response()
 }
@@ -259,6 +285,10 @@ type WorkerResponse_ServerShutdown struct {
 	ServerShutdown *ServerShutdown `protobuf:"bytes,4,opt,name=server_shutdown,json=serverShutdown,proto3,oneof"`
 }
 
+type WorkerResponse_TaskSignal struct {
+	TaskSignal *TaskSignal `protobuf:"bytes,5,opt,name=task_signal,json=taskSignal,proto3,oneof"`
+}
+
 func (*WorkerResponse_TaskAssignment) isWorkerResponse_Response() {}
 
 func (*WorkerResponse_TaskCancellation) isWorkerResponse_Response() {}
@@ -266,6 +296,8 @@ func (*WorkerResponse_TaskCancellation) isWorkerResponse_Response() {}
 func (*WorkerResponse_HeartbeatAck) isWorkerResponse_Response() {}
 
 func (*WorkerResponse_ServerShutdown) isWorkerResponse_Response() {}
+
+func (*WorkerResponse_TaskSignal) isWorkerResponse_Response() {}
 
 type WorkerHello struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -891,24 +923,148 @@ func (x *ServerShutdown) GetDrainSeconds() int32 {
 	return 0
 }
 
+type TaskSignal struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SignalId      string                 `protobuf:"bytes,1,opt,name=signal_id,json=signalId,proto3" json:"signal_id,omitempty"`
+	TaskId        string                 `protobuf:"bytes,2,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
+	SignalName    string                 `protobuf:"bytes,3,opt,name=signal_name,json=signalName,proto3" json:"signal_name,omitempty"`
+	Payload       string                 `protobuf:"bytes,4,opt,name=payload,proto3" json:"payload,omitempty"` // JSON string
+	TimestampMs   int64                  `protobuf:"varint,5,opt,name=timestamp_ms,json=timestampMs,proto3" json:"timestamp_ms,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TaskSignal) Reset() {
+	*x = TaskSignal{}
+	mi := &file_valka_v1_worker_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TaskSignal) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TaskSignal) ProtoMessage() {}
+
+func (x *TaskSignal) ProtoReflect() protoreflect.Message {
+	mi := &file_valka_v1_worker_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TaskSignal.ProtoReflect.Descriptor instead.
+func (*TaskSignal) Descriptor() ([]byte, []int) {
+	return file_valka_v1_worker_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *TaskSignal) GetSignalId() string {
+	if x != nil {
+		return x.SignalId
+	}
+	return ""
+}
+
+func (x *TaskSignal) GetTaskId() string {
+	if x != nil {
+		return x.TaskId
+	}
+	return ""
+}
+
+func (x *TaskSignal) GetSignalName() string {
+	if x != nil {
+		return x.SignalName
+	}
+	return ""
+}
+
+func (x *TaskSignal) GetPayload() string {
+	if x != nil {
+		return x.Payload
+	}
+	return ""
+}
+
+func (x *TaskSignal) GetTimestampMs() int64 {
+	if x != nil {
+		return x.TimestampMs
+	}
+	return 0
+}
+
+type SignalAck struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SignalId      string                 `protobuf:"bytes,1,opt,name=signal_id,json=signalId,proto3" json:"signal_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SignalAck) Reset() {
+	*x = SignalAck{}
+	mi := &file_valka_v1_worker_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SignalAck) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SignalAck) ProtoMessage() {}
+
+func (x *SignalAck) ProtoReflect() protoreflect.Message {
+	mi := &file_valka_v1_worker_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SignalAck.ProtoReflect.Descriptor instead.
+func (*SignalAck) Descriptor() ([]byte, []int) {
+	return file_valka_v1_worker_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *SignalAck) GetSignalId() string {
+	if x != nil {
+		return x.SignalId
+	}
+	return ""
+}
+
 var File_valka_v1_worker_proto protoreflect.FileDescriptor
 
 const file_valka_v1_worker_proto_rawDesc = "" +
 	"\n" +
-	"\x15valka/v1/worker.proto\x12\bvalka.v1\x1a\x15valka/v1/common.proto\"\xa4\x02\n" +
+	"\x15valka/v1/worker.proto\x12\bvalka.v1\x1a\x15valka/v1/common.proto\"\xda\x02\n" +
 	"\rWorkerRequest\x12-\n" +
 	"\x05hello\x18\x01 \x01(\v2\x15.valka.v1.WorkerHelloH\x00R\x05hello\x127\n" +
 	"\vtask_result\x18\x02 \x01(\v2\x14.valka.v1.TaskResultH\x00R\n" +
 	"taskResult\x123\n" +
 	"\theartbeat\x18\x03 \x01(\v2\x13.valka.v1.HeartbeatH\x00R\theartbeat\x121\n" +
 	"\tlog_batch\x18\x04 \x01(\v2\x12.valka.v1.LogBatchH\x00R\blogBatch\x128\n" +
-	"\bshutdown\x18\x05 \x01(\v2\x1a.valka.v1.GracefulShutdownH\x00R\bshutdownB\t\n" +
-	"\arequest\"\xb0\x02\n" +
+	"\bshutdown\x18\x05 \x01(\v2\x1a.valka.v1.GracefulShutdownH\x00R\bshutdown\x124\n" +
+	"\n" +
+	"signal_ack\x18\x06 \x01(\v2\x13.valka.v1.SignalAckH\x00R\tsignalAckB\t\n" +
+	"\arequest\"\xe9\x02\n" +
 	"\x0eWorkerResponse\x12C\n" +
 	"\x0ftask_assignment\x18\x01 \x01(\v2\x18.valka.v1.TaskAssignmentH\x00R\x0etaskAssignment\x12I\n" +
 	"\x11task_cancellation\x18\x02 \x01(\v2\x1a.valka.v1.TaskCancellationH\x00R\x10taskCancellation\x12=\n" +
 	"\rheartbeat_ack\x18\x03 \x01(\v2\x16.valka.v1.HeartbeatAckH\x00R\fheartbeatAck\x12C\n" +
-	"\x0fserver_shutdown\x18\x04 \x01(\v2\x18.valka.v1.ServerShutdownH\x00R\x0eserverShutdownB\n" +
+	"\x0fserver_shutdown\x18\x04 \x01(\v2\x18.valka.v1.ServerShutdownH\x00R\x0eserverShutdown\x127\n" +
+	"\vtask_signal\x18\x05 \x01(\v2\x14.valka.v1.TaskSignalH\x00R\n" +
+	"taskSignalB\n" +
 	"\n" +
 	"\bresponse\"\xa1\x01\n" +
 	"\vWorkerHello\x12\x1b\n" +
@@ -956,7 +1112,17 @@ const file_valka_v1_worker_proto_rawDesc = "" +
 	"\x13server_timestamp_ms\x18\x01 \x01(\x03R\x11serverTimestampMs\"M\n" +
 	"\x0eServerShutdown\x12\x16\n" +
 	"\x06reason\x18\x01 \x01(\tR\x06reason\x12#\n" +
-	"\rdrain_seconds\x18\x02 \x01(\x05R\fdrainSeconds2Q\n" +
+	"\rdrain_seconds\x18\x02 \x01(\x05R\fdrainSeconds\"\xa0\x01\n" +
+	"\n" +
+	"TaskSignal\x12\x1b\n" +
+	"\tsignal_id\x18\x01 \x01(\tR\bsignalId\x12\x17\n" +
+	"\atask_id\x18\x02 \x01(\tR\x06taskId\x12\x1f\n" +
+	"\vsignal_name\x18\x03 \x01(\tR\n" +
+	"signalName\x12\x18\n" +
+	"\apayload\x18\x04 \x01(\tR\apayload\x12!\n" +
+	"\ftimestamp_ms\x18\x05 \x01(\x03R\vtimestampMs\"(\n" +
+	"\tSignalAck\x12\x1b\n" +
+	"\tsignal_id\x18\x01 \x01(\tR\bsignalId2Q\n" +
 	"\rWorkerService\x12@\n" +
 	"\aSession\x12\x17.valka.v1.WorkerRequest\x1a\x18.valka.v1.WorkerResponse(\x010\x01b\x06proto3"
 
@@ -972,7 +1138,7 @@ func file_valka_v1_worker_proto_rawDescGZIP() []byte {
 	return file_valka_v1_worker_proto_rawDescData
 }
 
-var file_valka_v1_worker_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_valka_v1_worker_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
 var file_valka_v1_worker_proto_goTypes = []any{
 	(*WorkerRequest)(nil),    // 0: valka.v1.WorkerRequest
 	(*WorkerResponse)(nil),   // 1: valka.v1.WorkerResponse
@@ -986,7 +1152,9 @@ var file_valka_v1_worker_proto_goTypes = []any{
 	(*TaskCancellation)(nil), // 9: valka.v1.TaskCancellation
 	(*HeartbeatAck)(nil),     // 10: valka.v1.HeartbeatAck
 	(*ServerShutdown)(nil),   // 11: valka.v1.ServerShutdown
-	(LogLevel)(0),            // 12: valka.v1.LogLevel
+	(*TaskSignal)(nil),       // 12: valka.v1.TaskSignal
+	(*SignalAck)(nil),        // 13: valka.v1.SignalAck
+	(LogLevel)(0),            // 14: valka.v1.LogLevel
 }
 var file_valka_v1_worker_proto_depIdxs = []int32{
 	2,  // 0: valka.v1.WorkerRequest.hello:type_name -> valka.v1.WorkerHello
@@ -994,19 +1162,21 @@ var file_valka_v1_worker_proto_depIdxs = []int32{
 	4,  // 2: valka.v1.WorkerRequest.heartbeat:type_name -> valka.v1.Heartbeat
 	5,  // 3: valka.v1.WorkerRequest.log_batch:type_name -> valka.v1.LogBatch
 	7,  // 4: valka.v1.WorkerRequest.shutdown:type_name -> valka.v1.GracefulShutdown
-	8,  // 5: valka.v1.WorkerResponse.task_assignment:type_name -> valka.v1.TaskAssignment
-	9,  // 6: valka.v1.WorkerResponse.task_cancellation:type_name -> valka.v1.TaskCancellation
-	10, // 7: valka.v1.WorkerResponse.heartbeat_ack:type_name -> valka.v1.HeartbeatAck
-	11, // 8: valka.v1.WorkerResponse.server_shutdown:type_name -> valka.v1.ServerShutdown
-	6,  // 9: valka.v1.LogBatch.entries:type_name -> valka.v1.LogEntry
-	12, // 10: valka.v1.LogEntry.level:type_name -> valka.v1.LogLevel
-	0,  // 11: valka.v1.WorkerService.Session:input_type -> valka.v1.WorkerRequest
-	1,  // 12: valka.v1.WorkerService.Session:output_type -> valka.v1.WorkerResponse
-	12, // [12:13] is the sub-list for method output_type
-	11, // [11:12] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	13, // 5: valka.v1.WorkerRequest.signal_ack:type_name -> valka.v1.SignalAck
+	8,  // 6: valka.v1.WorkerResponse.task_assignment:type_name -> valka.v1.TaskAssignment
+	9,  // 7: valka.v1.WorkerResponse.task_cancellation:type_name -> valka.v1.TaskCancellation
+	10, // 8: valka.v1.WorkerResponse.heartbeat_ack:type_name -> valka.v1.HeartbeatAck
+	11, // 9: valka.v1.WorkerResponse.server_shutdown:type_name -> valka.v1.ServerShutdown
+	12, // 10: valka.v1.WorkerResponse.task_signal:type_name -> valka.v1.TaskSignal
+	6,  // 11: valka.v1.LogBatch.entries:type_name -> valka.v1.LogEntry
+	14, // 12: valka.v1.LogEntry.level:type_name -> valka.v1.LogLevel
+	0,  // 13: valka.v1.WorkerService.Session:input_type -> valka.v1.WorkerRequest
+	1,  // 14: valka.v1.WorkerService.Session:output_type -> valka.v1.WorkerResponse
+	14, // [14:15] is the sub-list for method output_type
+	13, // [13:14] is the sub-list for method input_type
+	13, // [13:13] is the sub-list for extension type_name
+	13, // [13:13] is the sub-list for extension extendee
+	0,  // [0:13] is the sub-list for field type_name
 }
 
 func init() { file_valka_v1_worker_proto_init() }
@@ -1021,12 +1191,14 @@ func file_valka_v1_worker_proto_init() {
 		(*WorkerRequest_Heartbeat)(nil),
 		(*WorkerRequest_LogBatch)(nil),
 		(*WorkerRequest_Shutdown)(nil),
+		(*WorkerRequest_SignalAck)(nil),
 	}
 	file_valka_v1_worker_proto_msgTypes[1].OneofWrappers = []any{
 		(*WorkerResponse_TaskAssignment)(nil),
 		(*WorkerResponse_TaskCancellation)(nil),
 		(*WorkerResponse_HeartbeatAck)(nil),
 		(*WorkerResponse_ServerShutdown)(nil),
+		(*WorkerResponse_TaskSignal)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -1034,7 +1206,7 @@ func file_valka_v1_worker_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_valka_v1_worker_proto_rawDesc), len(file_valka_v1_worker_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   12,
+			NumMessages:   14,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -88,6 +88,29 @@ export class ValkaClient {
     return this.get<DeadLetter[]>(`/api/v1/dead-letters${qs ? `?${qs}` : ""}`);
   }
 
+  // -- Signals --
+
+  async sendSignal(
+    taskId: string,
+    signalName: string,
+    payload?: unknown,
+  ): Promise<{ signal_id: string; delivered: boolean }> {
+    return this.post(`/api/v1/tasks/${taskId}/signal`, {
+      signal_name: signalName,
+      payload: payload ?? null,
+    });
+  }
+
+  async listSignals(
+    taskId: string,
+    status?: string,
+  ): Promise<unknown[]> {
+    const params = new URLSearchParams();
+    if (status) params.set("status", status);
+    const qs = params.toString();
+    return this.get(`/api/v1/tasks/${taskId}/signals${qs ? `?${qs}` : ""}`);
+  }
+
   // -- Health --
 
   async healthCheck(): Promise<string> {

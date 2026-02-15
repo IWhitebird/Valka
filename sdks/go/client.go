@@ -146,6 +146,30 @@ func (c *ValkaClient) ListDeadLetters(params ListDeadLettersParams) ([]DeadLette
 	return letters, nil
 }
 
+// SendSignalRequest is the body for sending a signal to a task.
+type SendSignalRequest struct {
+	SignalName string      `json:"signal_name"`
+	Payload    interface{} `json:"payload,omitempty"`
+}
+
+// SendSignalResponse is the response from sending a signal.
+type SendSignalResponse struct {
+	SignalID  string `json:"signal_id"`
+	Delivered bool   `json:"delivered"`
+}
+
+// SendSignal sends a named signal to a running task.
+func (c *ValkaClient) SendSignal(taskID, signalName string, payload interface{}) (*SendSignalResponse, error) {
+	var resp SendSignalResponse
+	if err := c.post(fmt.Sprintf("/api/v1/tasks/%s/signal", taskID), SendSignalRequest{
+		SignalName: signalName,
+		Payload:    payload,
+	}, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // HealthCheck checks server health.
 func (c *ValkaClient) HealthCheck() (string, error) {
 	req, err := http.NewRequest("GET", c.baseURL+"/healthz", nil)

@@ -116,3 +116,26 @@ export interface ListDeadLettersParams {
   limit?: number;
   offset?: number;
 }
+
+export type SignalStatus = "PENDING" | "DELIVERED" | "ACKNOWLEDGED";
+
+export interface TaskSignal {
+  id: string;
+  task_id: string;
+  signal_name: string;
+  payload: Record<string, unknown> | null;
+  status: SignalStatus;
+  created_at: string;
+  delivered_at: string | null;
+  acknowledged_at: string | null;
+}
+
+export interface SendSignalRequest {
+  signal_name: string;
+  payload?: Record<string, unknown>;
+}
+
+export interface SendSignalResponse {
+  signal_id: string;
+  delivered: boolean;
+}

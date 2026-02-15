@@ -517,3 +517,278 @@ async fn test_rest_healthz(pool: PgPool) {
         .unwrap();
     assert_eq!(body.as_ref(), b"ok");
 }
+
+// ─── POST /api/v1/tasks/{id}/signal ─────────────────────────────────
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_send_signal(pool: PgPool) {
+    let task = create_test_task(&pool, "q", "t").await;
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(post_json(
+            &format!("/api/v1/tasks/{}/signal", task.id),
+            serde_json::json!({ "signal_name": "approve" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = parse_response_json(resp).await;
+    assert!(!body["signal_id"].as_str().unwrap().is_empty());
+    // No worker connected in tests, so delivered should be false
+    assert_eq!(body["delivered"], false);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_send_signal_with_payload(pool: PgPool) {
+    let task = create_test_task(&pool, "q", "t").await;
+    let app = build_test_router(pool.clone());
+
+    let resp = app
+        .oneshot(post_json(
+            &format!("/api/v1/tasks/{}/signal", task.id),
+            serde_json::json!({
+                "signal_name": "data",
+                "payload": {"key": "value", "count": 42}
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Verify payload persisted via list
+    let app2 = build_test_router(pool);
+    let resp2 = app2
+        .oneshot(get_req(&format!("/api/v1/tasks/{}/signals", task.id)))
+        .await
+        .unwrap();
+    let body = parse_response_json(resp2).await;
+    let signals = body.as_array().unwrap();
+    assert_eq!(signals.len(), 1);
+    assert_eq!(signals[0]["payload"]["key"], "value");
+    assert_eq!(signals[0]["payload"]["count"], 42);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_send_signal_no_payload(pool: PgPool) {
+    let task = create_test_task(&pool, "q", "t").await;
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(post_json(
+            &format!("/api/v1/tasks/{}/signal", task.id),
+            serde_json::json!({ "signal_name": "ping" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_send_signal_task_not_found(pool: PgPool) {
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(post_json(
+            "/api/v1/tasks/nonexistent-id/signal",
+            serde_json::json!({ "signal_name": "test" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_send_signal_completed_task(pool: PgPool) {
+    let task = create_test_task(&pool, "q", "t").await;
+    valka_db::queries::tasks::complete_task(&pool, &task.id, None)
+        .await
+        .unwrap();
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(post_json(
+            &format!("/api/v1/tasks/{}/signal", task.id),
+            serde_json::json!({ "signal_name": "test" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_send_signal_failed_task(pool: PgPool) {
+    let task = create_test_task(&pool, "q", "t").await;
+    valka_db::queries::tasks::fail_task(&pool, &task.id, "error")
+        .await
+        .unwrap();
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(post_json(
+            &format!("/api/v1/tasks/{}/signal", task.id),
+            serde_json::json!({ "signal_name": "test" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_send_signal_cancelled_task(pool: PgPool) {
+    let task = create_test_task(&pool, "q", "t").await;
+    valka_db::queries::tasks::cancel_task_any(&pool, &task.id)
+        .await
+        .unwrap();
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(post_json(
+            &format!("/api/v1/tasks/{}/signal", task.id),
+            serde_json::json!({ "signal_name": "test" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_send_signal_running_task(pool: PgPool) {
+    let (task, _run) = create_running_task(&pool, "q").await;
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(post_json(
+            &format!("/api/v1/tasks/{}/signal", task.id),
+            serde_json::json!({ "signal_name": "pause" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_send_signal_retry_task(pool: PgPool) {
+    let task = create_test_task(&pool, "q", "t").await;
+    valka_db::queries::tasks::update_task_status(&pool, &task.id, "RETRY")
+        .await
+        .unwrap();
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(post_json(
+            &format!("/api/v1/tasks/{}/signal", task.id),
+            serde_json::json!({ "signal_name": "nudge" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+// ─── GET /api/v1/tasks/{id}/signals ─────────────────────────────────
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_list_signals(pool: PgPool) {
+    let task = create_test_task(&pool, "q", "t").await;
+    for i in 0..3 {
+        valka_db::queries::signals::create_signal(
+            &pool,
+            &format!("sig-{i}"),
+            &task.id,
+            &format!("signal-{i}"),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(get_req(&format!("/api/v1/tasks/{}/signals", task.id)))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = parse_response_json(resp).await;
+    assert_eq!(body.as_array().unwrap().len(), 3);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_list_signals_filter_status(pool: PgPool) {
+    let task = create_test_task(&pool, "q", "t").await;
+    valka_db::queries::signals::create_signal(&pool, "s1", &task.id, "a", None)
+        .await
+        .unwrap();
+    valka_db::queries::signals::create_signal(&pool, "s2", &task.id, "b", None)
+        .await
+        .unwrap();
+    valka_db::queries::signals::mark_delivered(&pool, "s2")
+        .await
+        .unwrap();
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(get_req(&format!(
+            "/api/v1/tasks/{}/signals?status=PENDING",
+            task.id
+        )))
+        .await
+        .unwrap();
+
+    let body = parse_response_json(resp).await;
+    let signals = body.as_array().unwrap();
+    assert_eq!(signals.len(), 1);
+    assert_eq!(signals[0]["status"], "PENDING");
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_list_signals_empty(pool: PgPool) {
+    let task = create_test_task(&pool, "q", "t").await;
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(get_req(&format!("/api/v1/tasks/{}/signals", task.id)))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = parse_response_json(resp).await;
+    assert_eq!(body.as_array().unwrap().len(), 0);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_send_multiple_signals_same_name(pool: PgPool) {
+    let task = create_test_task(&pool, "q", "t").await;
+    let app = build_test_router(pool.clone());
+
+    for _ in 0..3 {
+        let app_inner = build_test_router(pool.clone());
+        let resp = app_inner
+            .oneshot(post_json(
+                &format!("/api/v1/tasks/{}/signal", task.id),
+                serde_json::json!({ "signal_name": "approve" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // Verify all 3 persisted
+    let resp = app
+        .oneshot(get_req(&format!("/api/v1/tasks/{}/signals", task.id)))
+        .await
+        .unwrap();
+    let body = parse_response_json(resp).await;
+    let signals = body.as_array().unwrap();
+    assert_eq!(signals.len(), 3);
+    assert!(signals.iter().all(|s| s["signal_name"] == "approve"));
+}

@@ -10,8 +10,8 @@ use valka_db::DbPool;
 use valka_matching::MatchingService;
 use valka_matching::partition::TaskEnvelope;
 use valka_proto::{
-    Heartbeat, LogBatch, TaskAssignment, TaskCancellation, TaskEvent, TaskResult, WorkerResponse,
-    worker_response,
+    Heartbeat, LogBatch, SignalAck, TaskAssignment, TaskCancellation, TaskEvent, TaskResult,
+    TaskSignal, WorkerResponse, worker_response,
 };
 
 /// The dispatcher manages all connected workers and their gRPC streams.
@@ -53,6 +53,16 @@ impl DispatcherService {
         if let Some((_, handle)) = self.workers.remove(worker_id.as_ref()) {
             // Deregister from matching service
             self.matching.deregister_worker(worker_id);
+
+            // Reset delivered (unacknowledged) signals for all active tasks
+            for task_id in &handle.active_tasks {
+                if let Err(e) =
+                    valka_db::queries::signals::reset_delivered_signals(&self.pool, task_id).await
+                {
+                    warn!(task_id = %task_id, error = %e, "Failed to reset signals on deregister");
+                }
+            }
+
             info!(
                 worker_id = %worker_id,
                 active_tasks = handle.active_tasks.len(),
@@ -206,6 +216,40 @@ impl DispatcherService {
             };
             if handle.response_tx.send(response).await.is_err() {
                 warn!(worker_id = %worker_id, "Failed to send task assignment - worker disconnected");
+                return;
+            }
+
+            // Deliver any pending signals for this task
+            let tx = handle.response_tx.clone();
+            drop(handle); // Release DashMap guard before DB call
+            match valka_db::queries::signals::get_pending_signals(&self.pool, &envelope.task_id)
+                .await
+            {
+                Ok(signals) => {
+                    for sig in signals {
+                        let signal_response = WorkerResponse {
+                            response: Some(worker_response::Response::TaskSignal(TaskSignal {
+                                signal_id: sig.id.clone(),
+                                task_id: sig.task_id,
+                                signal_name: sig.signal_name,
+                                payload: sig
+                                    .payload
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_default(),
+                                timestamp_ms: sig.created_at.timestamp_millis(),
+                            })),
+                        };
+                        if tx.send(signal_response).await.is_ok() {
+                            let _ = valka_db::queries::signals::mark_delivered(
+                                &self.pool, &sig.id,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(task_id = %envelope.task_id, error = %e, "Failed to load pending signals");
+                }
             }
         }
     }
@@ -362,6 +406,30 @@ impl DispatcherService {
             }
         }
         false
+    }
+
+    /// Send a signal to the worker currently running a task. Returns true if delivered.
+    pub async fn send_signal_to_worker(&self, task_id: &str, signal: TaskSignal) -> bool {
+        for entry in self.workers.iter() {
+            let handle = entry.value();
+            if handle.active_tasks.contains(task_id) {
+                let response = WorkerResponse {
+                    response: Some(worker_response::Response::TaskSignal(signal)),
+                };
+                let _ = handle.response_tx.send(response).await;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Handle a signal acknowledgement from a worker
+    pub async fn handle_signal_ack(&self, ack: &SignalAck) {
+        if let Err(e) =
+            valka_db::queries::signals::mark_acknowledged(&self.pool, &ack.signal_id).await
+        {
+            warn!(signal_id = %ack.signal_id, error = %e, "Failed to acknowledge signal");
+        }
     }
 
     pub fn workers(&self) -> &Arc<DashMap<String, WorkerHandle>> {

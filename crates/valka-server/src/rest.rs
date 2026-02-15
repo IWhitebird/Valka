@@ -64,6 +64,8 @@ pub fn build_api_router(
         .route("/api/v1/tasks", post(create_task).get(list_tasks).delete(clear_all_tasks))
         .route("/api/v1/tasks/{task_id}", get(get_task).delete(delete_task))
         .route("/api/v1/tasks/{task_id}/cancel", post(cancel_task))
+        .route("/api/v1/tasks/{task_id}/signal", post(send_signal))
+        .route("/api/v1/tasks/{task_id}/signals", get(list_signals))
         .route("/api/v1/tasks/{task_id}/runs", get(get_task_runs))
         .route(
             "/api/v1/tasks/{task_id}/runs/{run_id}/logs",
@@ -313,6 +315,114 @@ async fn cancel_task(
     let _ = state.event_tx.send(event);
 
     Ok(Json(task_row_to_json(task)))
+}
+
+#[derive(Deserialize)]
+struct SendSignalBody {
+    signal_name: String,
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
+}
+
+async fn send_signal(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    Json(body): Json<SendSignalBody>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Validate task exists
+    let task = valka_db::queries::tasks::get_task(&state.pool, &task_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Task not found".to_string()))?;
+
+    // Reject if terminal status
+    match task.status.as_str() {
+        "COMPLETED" | "FAILED" | "DEAD_LETTER" | "CANCELLED" => {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("Cannot send signal to task in {} state", task.status),
+            ));
+        }
+        _ => {}
+    }
+
+    // Insert signal
+    let signal_id = uuid::Uuid::now_v7().to_string();
+    let signal = valka_db::queries::signals::create_signal(
+        &state.pool,
+        &signal_id,
+        &task_id,
+        &body.signal_name,
+        body.payload,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Try immediate delivery
+    let task_signal = valka_proto::TaskSignal {
+        signal_id: signal.id.clone(),
+        task_id: signal.task_id,
+        signal_name: signal.signal_name,
+        payload: signal
+            .payload
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        timestamp_ms: signal.created_at.timestamp_millis(),
+    };
+
+    let delivered = state
+        .dispatcher
+        .send_signal_to_worker(&task_id, task_signal)
+        .await;
+
+    if delivered {
+        let _ = valka_db::queries::signals::mark_delivered(&state.pool, &signal.id).await;
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "signal_id": signal.id,
+            "delivered": delivered,
+        })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct ListSignalsQuery {
+    #[serde(default)]
+    status: Option<String>,
+}
+
+async fn list_signals(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    Query(query): Query<ListSignalsQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let signals = valka_db::queries::signals::list_signals(
+        &state.pool,
+        &task_id,
+        query.status.as_deref(),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let result: Vec<serde_json::Value> = signals
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "task_id": s.task_id,
+                "signal_name": s.signal_name,
+                "payload": s.payload,
+                "status": s.status,
+                "created_at": s.created_at.to_rfc3339(),
+                "delivered_at": s.delivered_at.map(|t| t.to_rfc3339()),
+                "acknowledged_at": s.acknowledged_at.map(|t| t.to_rfc3339()),
+            })
+        })
+        .collect();
+    Ok(Json(result))
 }
 
 async fn delete_task(

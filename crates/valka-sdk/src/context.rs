@@ -1,8 +1,23 @@
-use tokio::sync::mpsc;
-use valka_proto::{LogEntry, WorkerRequest, worker_request};
+use std::collections::VecDeque;
 
-/// Context passed to task handlers, providing logging and metadata access.
-#[derive(Clone)]
+use tokio::sync::mpsc;
+use valka_proto::{LogEntry, SignalAck, TaskSignal, WorkerRequest, worker_request};
+
+/// Data from a received signal.
+pub struct SignalData {
+    pub signal_id: String,
+    pub name: String,
+    pub payload: String,
+}
+
+impl SignalData {
+    /// Parse the signal payload JSON into a typed value.
+    pub fn parse_payload<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+        serde_json::from_str(&self.payload)
+    }
+}
+
+/// Context passed to task handlers, providing logging, metadata, and signal access.
 pub struct TaskContext {
     pub task_id: String,
     pub task_run_id: String,
@@ -12,6 +27,8 @@ pub struct TaskContext {
     pub input: String,
     pub metadata: String,
     request_tx: mpsc::Sender<WorkerRequest>,
+    signal_rx: mpsc::Receiver<TaskSignal>,
+    signal_buffer: VecDeque<TaskSignal>,
 }
 
 impl TaskContext {
@@ -24,6 +41,7 @@ impl TaskContext {
         input: String,
         metadata: String,
         request_tx: mpsc::Sender<WorkerRequest>,
+        signal_rx: mpsc::Receiver<TaskSignal>,
     ) -> Self {
         Self {
             task_id,
@@ -34,12 +52,82 @@ impl TaskContext {
             input,
             metadata,
             request_tx,
+            signal_rx,
+            signal_buffer: VecDeque::new(),
         }
     }
 
     /// Parse the input JSON
     pub fn input<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_str(&self.input)
+    }
+
+    /// Wait for a signal with a specific name. Non-matching signals are buffered.
+    pub async fn wait_for_signal(&mut self, name: &str) -> Option<SignalData> {
+        // Check buffer first
+        if let Some(idx) = self
+            .signal_buffer
+            .iter()
+            .position(|s| s.signal_name == name)
+        {
+            let signal = self.signal_buffer.remove(idx).unwrap();
+            self.send_signal_ack(&signal.signal_id).await;
+            return Some(SignalData {
+                signal_id: signal.signal_id,
+                name: signal.signal_name,
+                payload: signal.payload,
+            });
+        }
+
+        // Wait for matching signal from channel
+        while let Some(signal) = self.signal_rx.recv().await {
+            if signal.signal_name == name {
+                self.send_signal_ack(&signal.signal_id).await;
+                return Some(SignalData {
+                    signal_id: signal.signal_id,
+                    name: signal.signal_name,
+                    payload: signal.payload,
+                });
+            }
+            // Buffer non-matching signals
+            self.signal_buffer.push_back(signal);
+        }
+
+        None
+    }
+
+    /// Receive the next signal (any name). Checks buffer first.
+    pub async fn receive_signal(&mut self) -> Option<SignalData> {
+        // Check buffer first
+        if let Some(signal) = self.signal_buffer.pop_front() {
+            self.send_signal_ack(&signal.signal_id).await;
+            return Some(SignalData {
+                signal_id: signal.signal_id,
+                name: signal.signal_name,
+                payload: signal.payload,
+            });
+        }
+
+        // Wait for next signal from channel
+        if let Some(signal) = self.signal_rx.recv().await {
+            self.send_signal_ack(&signal.signal_id).await;
+            return Some(SignalData {
+                signal_id: signal.signal_id,
+                name: signal.signal_name,
+                payload: signal.payload,
+            });
+        }
+
+        None
+    }
+
+    async fn send_signal_ack(&self, signal_id: &str) {
+        let request = WorkerRequest {
+            request: Some(worker_request::Request::SignalAck(SignalAck {
+                signal_id: signal_id.to_string(),
+            })),
+        };
+        let _ = self.request_tx.send(request).await;
     }
 
     /// Log a message at INFO level

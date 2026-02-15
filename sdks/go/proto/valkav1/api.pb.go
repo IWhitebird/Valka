@@ -465,6 +465,119 @@ func (x *CancelTaskResponse) GetTask() *TaskMeta {
 	return nil
 }
 
+// --- SendSignal ---
+type SendSignalRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TaskId        string                 `protobuf:"bytes,1,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
+	SignalName    string                 `protobuf:"bytes,2,opt,name=signal_name,json=signalName,proto3" json:"signal_name,omitempty"`
+	Payload       string                 `protobuf:"bytes,3,opt,name=payload,proto3" json:"payload,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SendSignalRequest) Reset() {
+	*x = SendSignalRequest{}
+	mi := &file_valka_v1_api_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SendSignalRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SendSignalRequest) ProtoMessage() {}
+
+func (x *SendSignalRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_valka_v1_api_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SendSignalRequest.ProtoReflect.Descriptor instead.
+func (*SendSignalRequest) Descriptor() ([]byte, []int) {
+	return file_valka_v1_api_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *SendSignalRequest) GetTaskId() string {
+	if x != nil {
+		return x.TaskId
+	}
+	return ""
+}
+
+func (x *SendSignalRequest) GetSignalName() string {
+	if x != nil {
+		return x.SignalName
+	}
+	return ""
+}
+
+func (x *SendSignalRequest) GetPayload() string {
+	if x != nil {
+		return x.Payload
+	}
+	return ""
+}
+
+type SendSignalResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SignalId      string                 `protobuf:"bytes,1,opt,name=signal_id,json=signalId,proto3" json:"signal_id,omitempty"`
+	Delivered     bool                   `protobuf:"varint,2,opt,name=delivered,proto3" json:"delivered,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SendSignalResponse) Reset() {
+	*x = SendSignalResponse{}
+	mi := &file_valka_v1_api_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SendSignalResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SendSignalResponse) ProtoMessage() {}
+
+func (x *SendSignalResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_valka_v1_api_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SendSignalResponse.ProtoReflect.Descriptor instead.
+func (*SendSignalResponse) Descriptor() ([]byte, []int) {
+	return file_valka_v1_api_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *SendSignalResponse) GetSignalId() string {
+	if x != nil {
+		return x.SignalId
+	}
+	return ""
+}
+
+func (x *SendSignalResponse) GetDelivered() bool {
+	if x != nil {
+		return x.Delivered
+	}
+	return false
+}
+
 // --- SubscribeLogs ---
 type SubscribeLogsRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
@@ -476,7 +589,7 @@ type SubscribeLogsRequest struct {
 
 func (x *SubscribeLogsRequest) Reset() {
 	*x = SubscribeLogsRequest{}
-	mi := &file_valka_v1_api_proto_msgTypes[8]
+	mi := &file_valka_v1_api_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -488,7 +601,7 @@ func (x *SubscribeLogsRequest) String() string {
 func (*SubscribeLogsRequest) ProtoMessage() {}
 
 func (x *SubscribeLogsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_valka_v1_api_proto_msgTypes[8]
+	mi := &file_valka_v1_api_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -501,7 +614,7 @@ func (x *SubscribeLogsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubscribeLogsRequest.ProtoReflect.Descriptor instead.
 func (*SubscribeLogsRequest) Descriptor() ([]byte, []int) {
-	return file_valka_v1_api_proto_rawDescGZIP(), []int{8}
+	return file_valka_v1_api_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *SubscribeLogsRequest) GetTaskRunId() string {
@@ -528,7 +641,7 @@ type SubscribeEventsRequest struct {
 
 func (x *SubscribeEventsRequest) Reset() {
 	*x = SubscribeEventsRequest{}
-	mi := &file_valka_v1_api_proto_msgTypes[9]
+	mi := &file_valka_v1_api_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -540,7 +653,7 @@ func (x *SubscribeEventsRequest) String() string {
 func (*SubscribeEventsRequest) ProtoMessage() {}
 
 func (x *SubscribeEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_valka_v1_api_proto_msgTypes[9]
+	mi := &file_valka_v1_api_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -553,7 +666,7 @@ func (x *SubscribeEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubscribeEventsRequest.ProtoReflect.Descriptor instead.
 func (*SubscribeEventsRequest) Descriptor() ([]byte, []int) {
-	return file_valka_v1_api_proto_rawDescGZIP(), []int{9}
+	return file_valka_v1_api_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *SubscribeEventsRequest) GetQueueName() string {
@@ -599,13 +712,21 @@ const file_valka_v1_api_proto_rawDesc = "" +
 	"\x11CancelTaskRequest\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\"<\n" +
 	"\x12CancelTaskResponse\x12&\n" +
-	"\x04task\x18\x01 \x01(\v2\x12.valka.v1.TaskMetaR\x04task\"_\n" +
+	"\x04task\x18\x01 \x01(\v2\x12.valka.v1.TaskMetaR\x04task\"g\n" +
+	"\x11SendSignalRequest\x12\x17\n" +
+	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x1f\n" +
+	"\vsignal_name\x18\x02 \x01(\tR\n" +
+	"signalName\x12\x18\n" +
+	"\apayload\x18\x03 \x01(\tR\apayload\"O\n" +
+	"\x12SendSignalResponse\x12\x1b\n" +
+	"\tsignal_id\x18\x01 \x01(\tR\bsignalId\x12\x1c\n" +
+	"\tdelivered\x18\x02 \x01(\bR\tdelivered\"_\n" +
 	"\x14SubscribeLogsRequest\x12\x1e\n" +
 	"\vtask_run_id\x18\x01 \x01(\tR\ttaskRunId\x12'\n" +
 	"\x0finclude_history\x18\x02 \x01(\bR\x0eincludeHistory\"7\n" +
 	"\x16SubscribeEventsRequest\x12\x1d\n" +
 	"\n" +
-	"queue_name\x18\x01 \x01(\tR\tqueueName2\xb7\x03\n" +
+	"queue_name\x18\x01 \x01(\tR\tqueueName2\x80\x04\n" +
 	"\n" +
 	"ApiService\x12G\n" +
 	"\n" +
@@ -613,7 +734,9 @@ const file_valka_v1_api_proto_rawDesc = "" +
 	"\aGetTask\x12\x18.valka.v1.GetTaskRequest\x1a\x19.valka.v1.GetTaskResponse\x12D\n" +
 	"\tListTasks\x12\x1a.valka.v1.ListTasksRequest\x1a\x1b.valka.v1.ListTasksResponse\x12G\n" +
 	"\n" +
-	"CancelTask\x12\x1b.valka.v1.CancelTaskRequest\x1a\x1c.valka.v1.CancelTaskResponse\x12J\n" +
+	"CancelTask\x12\x1b.valka.v1.CancelTaskRequest\x1a\x1c.valka.v1.CancelTaskResponse\x12G\n" +
+	"\n" +
+	"SendSignal\x12\x1b.valka.v1.SendSignalRequest\x1a\x1c.valka.v1.SendSignalResponse\x12J\n" +
 	"\x0fSubscribeEvents\x12 .valka.v1.SubscribeEventsRequest\x1a\x13.valka.v1.TaskEvent0\x01\x12E\n" +
 	"\rSubscribeLogs\x12\x1e.valka.v1.SubscribeLogsRequest\x1a\x12.valka.v1.LogEntry0\x01b\x06proto3"
 
@@ -629,7 +752,7 @@ func file_valka_v1_api_proto_rawDescGZIP() []byte {
 	return file_valka_v1_api_proto_rawDescData
 }
 
-var file_valka_v1_api_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_valka_v1_api_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_valka_v1_api_proto_goTypes = []any{
 	(*CreateTaskRequest)(nil),      // 0: valka.v1.CreateTaskRequest
 	(*CreateTaskResponse)(nil),     // 1: valka.v1.CreateTaskResponse
@@ -639,35 +762,39 @@ var file_valka_v1_api_proto_goTypes = []any{
 	(*ListTasksResponse)(nil),      // 5: valka.v1.ListTasksResponse
 	(*CancelTaskRequest)(nil),      // 6: valka.v1.CancelTaskRequest
 	(*CancelTaskResponse)(nil),     // 7: valka.v1.CancelTaskResponse
-	(*SubscribeLogsRequest)(nil),   // 8: valka.v1.SubscribeLogsRequest
-	(*SubscribeEventsRequest)(nil), // 9: valka.v1.SubscribeEventsRequest
-	(*TaskMeta)(nil),               // 10: valka.v1.TaskMeta
-	(TaskStatus)(0),                // 11: valka.v1.TaskStatus
-	(*Pagination)(nil),             // 12: valka.v1.Pagination
-	(*TaskEvent)(nil),              // 13: valka.v1.TaskEvent
-	(*LogEntry)(nil),               // 14: valka.v1.LogEntry
+	(*SendSignalRequest)(nil),      // 8: valka.v1.SendSignalRequest
+	(*SendSignalResponse)(nil),     // 9: valka.v1.SendSignalResponse
+	(*SubscribeLogsRequest)(nil),   // 10: valka.v1.SubscribeLogsRequest
+	(*SubscribeEventsRequest)(nil), // 11: valka.v1.SubscribeEventsRequest
+	(*TaskMeta)(nil),               // 12: valka.v1.TaskMeta
+	(TaskStatus)(0),                // 13: valka.v1.TaskStatus
+	(*Pagination)(nil),             // 14: valka.v1.Pagination
+	(*TaskEvent)(nil),              // 15: valka.v1.TaskEvent
+	(*LogEntry)(nil),               // 16: valka.v1.LogEntry
 }
 var file_valka_v1_api_proto_depIdxs = []int32{
-	10, // 0: valka.v1.CreateTaskResponse.task:type_name -> valka.v1.TaskMeta
-	10, // 1: valka.v1.GetTaskResponse.task:type_name -> valka.v1.TaskMeta
-	11, // 2: valka.v1.ListTasksRequest.status:type_name -> valka.v1.TaskStatus
-	12, // 3: valka.v1.ListTasksRequest.pagination:type_name -> valka.v1.Pagination
-	10, // 4: valka.v1.ListTasksResponse.tasks:type_name -> valka.v1.TaskMeta
-	10, // 5: valka.v1.CancelTaskResponse.task:type_name -> valka.v1.TaskMeta
+	12, // 0: valka.v1.CreateTaskResponse.task:type_name -> valka.v1.TaskMeta
+	12, // 1: valka.v1.GetTaskResponse.task:type_name -> valka.v1.TaskMeta
+	13, // 2: valka.v1.ListTasksRequest.status:type_name -> valka.v1.TaskStatus
+	14, // 3: valka.v1.ListTasksRequest.pagination:type_name -> valka.v1.Pagination
+	12, // 4: valka.v1.ListTasksResponse.tasks:type_name -> valka.v1.TaskMeta
+	12, // 5: valka.v1.CancelTaskResponse.task:type_name -> valka.v1.TaskMeta
 	0,  // 6: valka.v1.ApiService.CreateTask:input_type -> valka.v1.CreateTaskRequest
 	2,  // 7: valka.v1.ApiService.GetTask:input_type -> valka.v1.GetTaskRequest
 	4,  // 8: valka.v1.ApiService.ListTasks:input_type -> valka.v1.ListTasksRequest
 	6,  // 9: valka.v1.ApiService.CancelTask:input_type -> valka.v1.CancelTaskRequest
-	9,  // 10: valka.v1.ApiService.SubscribeEvents:input_type -> valka.v1.SubscribeEventsRequest
-	8,  // 11: valka.v1.ApiService.SubscribeLogs:input_type -> valka.v1.SubscribeLogsRequest
-	1,  // 12: valka.v1.ApiService.CreateTask:output_type -> valka.v1.CreateTaskResponse
-	3,  // 13: valka.v1.ApiService.GetTask:output_type -> valka.v1.GetTaskResponse
-	5,  // 14: valka.v1.ApiService.ListTasks:output_type -> valka.v1.ListTasksResponse
-	7,  // 15: valka.v1.ApiService.CancelTask:output_type -> valka.v1.CancelTaskResponse
-	13, // 16: valka.v1.ApiService.SubscribeEvents:output_type -> valka.v1.TaskEvent
-	14, // 17: valka.v1.ApiService.SubscribeLogs:output_type -> valka.v1.LogEntry
-	12, // [12:18] is the sub-list for method output_type
-	6,  // [6:12] is the sub-list for method input_type
+	8,  // 10: valka.v1.ApiService.SendSignal:input_type -> valka.v1.SendSignalRequest
+	11, // 11: valka.v1.ApiService.SubscribeEvents:input_type -> valka.v1.SubscribeEventsRequest
+	10, // 12: valka.v1.ApiService.SubscribeLogs:input_type -> valka.v1.SubscribeLogsRequest
+	1,  // 13: valka.v1.ApiService.CreateTask:output_type -> valka.v1.CreateTaskResponse
+	3,  // 14: valka.v1.ApiService.GetTask:output_type -> valka.v1.GetTaskResponse
+	5,  // 15: valka.v1.ApiService.ListTasks:output_type -> valka.v1.ListTasksResponse
+	7,  // 16: valka.v1.ApiService.CancelTask:output_type -> valka.v1.CancelTaskResponse
+	9,  // 17: valka.v1.ApiService.SendSignal:output_type -> valka.v1.SendSignalResponse
+	15, // 18: valka.v1.ApiService.SubscribeEvents:output_type -> valka.v1.TaskEvent
+	16, // 19: valka.v1.ApiService.SubscribeLogs:output_type -> valka.v1.LogEntry
+	13, // [13:20] is the sub-list for method output_type
+	6,  // [6:13] is the sub-list for method input_type
 	6,  // [6:6] is the sub-list for extension type_name
 	6,  // [6:6] is the sub-list for extension extendee
 	0,  // [0:6] is the sub-list for field type_name
@@ -687,7 +814,7 @@ func file_valka_v1_api_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_valka_v1_api_proto_rawDesc), len(file_valka_v1_api_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   10,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

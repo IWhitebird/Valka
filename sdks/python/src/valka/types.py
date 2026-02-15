@@ -115,6 +115,19 @@ class TaskEvent(TypedDict, total=False):
     timestamp_ms: int
 
 
+class Signal(TypedDict, total=False):
+    """Task signal from the REST API."""
+
+    id: str
+    task_id: str
+    signal_name: str
+    payload: Any
+    status: str
+    created_at: str
+    delivered_at: str | None
+    acknowledged_at: str | None
+
+
 class CreateTaskOptions(TypedDict, total=False):
     """Options for creating a task."""
 

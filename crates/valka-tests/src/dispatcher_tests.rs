@@ -213,3 +213,72 @@ async fn test_dispatcher_cancel_active_task() {
         other => panic!("Expected TaskCancellation, got {other:?}"),
     }
 }
+
+// ─── Signal routing tests ───────────────────────────────────────────
+
+#[tokio::test]
+async fn test_dispatcher_send_signal_to_active_task() {
+    let dispatcher = make_dispatcher();
+    let worker_id = WorkerId::new();
+    let (mut handle, mut rx) = make_handle_with_id(worker_id.clone(), 2);
+    handle.assign_task("task-signaled".to_string());
+    dispatcher.register_worker(handle).await;
+
+    let signal = valka_proto::TaskSignal {
+        signal_id: "sig-1".to_string(),
+        task_id: "task-signaled".to_string(),
+        signal_name: "approve".to_string(),
+        payload: r#"{"ok": true}"#.to_string(),
+        timestamp_ms: 1700000000000,
+    };
+
+    let delivered = dispatcher.send_signal_to_worker("task-signaled", signal).await;
+    assert!(delivered, "Should find and deliver signal to worker with active task");
+
+    let msg = rx.recv().await.expect("Should receive signal");
+    match msg.response {
+        Some(valka_proto::worker_response::Response::TaskSignal(s)) => {
+            assert_eq!(s.signal_id, "sig-1");
+            assert_eq!(s.task_id, "task-signaled");
+            assert_eq!(s.signal_name, "approve");
+            assert_eq!(s.payload, r#"{"ok": true}"#);
+        }
+        other => panic!("Expected TaskSignal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_dispatcher_send_signal_no_worker() {
+    let dispatcher = make_dispatcher();
+
+    let signal = valka_proto::TaskSignal {
+        signal_id: "sig-orphan".to_string(),
+        task_id: "no-such-task".to_string(),
+        signal_name: "ping".to_string(),
+        payload: String::new(),
+        timestamp_ms: 0,
+    };
+
+    let delivered = dispatcher.send_signal_to_worker("no-such-task", signal).await;
+    assert!(!delivered, "Should return false when no worker registered");
+}
+
+#[tokio::test]
+async fn test_dispatcher_send_signal_wrong_task() {
+    let dispatcher = make_dispatcher();
+    let worker_id = WorkerId::new();
+    let (mut handle, _rx) = make_handle_with_id(worker_id.clone(), 2);
+    handle.assign_task("task-A".to_string());
+    dispatcher.register_worker(handle).await;
+
+    let signal = valka_proto::TaskSignal {
+        signal_id: "sig-wrong".to_string(),
+        task_id: "task-B".to_string(),
+        signal_name: "notify".to_string(),
+        payload: String::new(),
+        timestamp_ms: 0,
+    };
+
+    let delivered = dispatcher.send_signal_to_worker("task-B", signal).await;
+    assert!(!delivered, "Should return false when worker has different task");
+}

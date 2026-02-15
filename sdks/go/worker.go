@@ -31,13 +31,14 @@ type ValkaWorker struct {
 	metadata    map[string]interface{}
 	handler     TaskHandler
 
-	semaphore    chan struct{}
-	activeTasks  sync.Map
-	wg           sync.WaitGroup
-	shuttingDown bool
-	shutdownMu   sync.Mutex
-	shutdownCh   chan struct{}
-	sendCh       chan *pb.WorkerRequest
+	semaphore      chan struct{}
+	activeTasks    sync.Map
+	signalChannels sync.Map // task_id -> chan *pb.TaskSignal
+	wg             sync.WaitGroup
+	shuttingDown   bool
+	shutdownMu     sync.Mutex
+	shutdownCh     chan struct{}
+	sendCh         chan *pb.WorkerRequest
 }
 
 // NewWorker creates a new ValkaWorker with functional options.
@@ -277,11 +278,28 @@ func (w *ValkaWorker) handleResponse(ctx context.Context, resp *pb.WorkerRespons
 		w.handleTaskAssignment(ctx, msg.TaskAssignment)
 	case *pb.WorkerResponse_TaskCancellation:
 		w.handleTaskCancellation(msg.TaskCancellation)
+	case *pb.WorkerResponse_TaskSignal:
+		w.handleTaskSignal(msg.TaskSignal)
 	case *pb.WorkerResponse_ServerShutdown:
 		log.Printf("[valka] Server shutdown: %s", msg.ServerShutdown.Reason)
 		go w.Shutdown()
 	case *pb.WorkerResponse_HeartbeatAck:
 		// no-op
+	}
+}
+
+func (w *ValkaWorker) handleTaskSignal(signal *pb.TaskSignal) {
+	if ch, ok := w.activeTasks.Load(signal.TaskId); ok {
+		// activeTasks stores cancel funcs for cancellation, and signalChannels for signals
+		_ = ch // cancel func stored here
+	}
+	if sigCh, ok := w.signalChannels.Load(signal.TaskId); ok {
+		select {
+		case sigCh.(chan *pb.TaskSignal) <- signal:
+		default:
+			log.Printf("[valka] Signal channel full for task %s, dropping signal %s",
+				signal.TaskId, signal.SignalId)
+		}
 	}
 }
 
@@ -293,14 +311,19 @@ func (w *ValkaWorker) handleTaskAssignment(ctx context.Context, assignment *pb.T
 	taskCtx, taskCancel := context.WithCancel(ctx)
 	w.activeTasks.Store(assignment.TaskId, taskCancel)
 
+	// Create signal channel for this task
+	sigCh := make(chan *pb.TaskSignal, 64)
+	w.signalChannels.Store(assignment.TaskId, sigCh)
+
 	go func() {
 		defer func() {
 			<-w.semaphore
 			w.activeTasks.Delete(assignment.TaskId)
+			w.signalChannels.Delete(assignment.TaskId)
 			w.wg.Done()
 		}()
 
-		w.executeTask(taskCtx, taskCancel, assignment)
+		w.executeTask(taskCtx, taskCancel, assignment, sigCh)
 	}()
 }
 
@@ -311,7 +334,7 @@ func (w *ValkaWorker) handleTaskCancellation(cancellation *pb.TaskCancellation) 
 	}
 }
 
-func (w *ValkaWorker) executeTask(ctx context.Context, cancel context.CancelFunc, assignment *pb.TaskAssignment) {
+func (w *ValkaWorker) executeTask(ctx context.Context, cancel context.CancelFunc, assignment *pb.TaskAssignment, sigCh chan *pb.TaskSignal) {
 	defer cancel()
 
 	tctx := &TaskContext{
@@ -330,7 +353,8 @@ func (w *ValkaWorker) executeTask(ctx context.Context, cancel context.CancelFunc
 				// Drop if channel is full to avoid blocking
 			}
 		},
-		cancel: cancel,
+		cancel:   cancel,
+		signalCh: sigCh,
 	}
 
 	success := false

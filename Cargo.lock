@@ -3234,6 +3234,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "metrics-exporter-prometheus",
+ "serde",
  "serde_json",
  "sqlx",
  "tokio",

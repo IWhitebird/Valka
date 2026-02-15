@@ -158,3 +158,94 @@ fn test_log_batch_and_entries() {
     assert_eq!(batch.entries[0].level, 1);
     assert_eq!(batch.entries[1].level, 3);
 }
+
+// ─── Signal proto messages ──────────────────────────────────────────
+
+#[test]
+fn test_task_signal_construction() {
+    let signal = TaskSignal {
+        signal_id: "sig-1".to_string(),
+        task_id: "task-1".to_string(),
+        signal_name: "approve".to_string(),
+        payload: r#"{"approved": true}"#.to_string(),
+        timestamp_ms: 1700000000000,
+    };
+    assert_eq!(signal.signal_id, "sig-1");
+    assert_eq!(signal.task_id, "task-1");
+    assert_eq!(signal.signal_name, "approve");
+    assert_eq!(signal.payload, r#"{"approved": true}"#);
+    assert_eq!(signal.timestamp_ms, 1700000000000);
+}
+
+#[test]
+fn test_signal_ack_construction() {
+    let ack = SignalAck {
+        signal_id: "sig-42".to_string(),
+    };
+    assert_eq!(ack.signal_id, "sig-42");
+}
+
+#[test]
+fn test_worker_response_task_signal_variant() {
+    let response = WorkerResponse {
+        response: Some(worker_response::Response::TaskSignal(TaskSignal {
+            signal_id: "s1".to_string(),
+            task_id: "t1".to_string(),
+            signal_name: "pause".to_string(),
+            payload: String::new(),
+            timestamp_ms: 0,
+        })),
+    };
+
+    match response.response {
+        Some(worker_response::Response::TaskSignal(s)) => {
+            assert_eq!(s.signal_id, "s1");
+            assert_eq!(s.signal_name, "pause");
+        }
+        _ => panic!("Expected TaskSignal variant"),
+    }
+}
+
+#[test]
+fn test_worker_request_signal_ack_variant() {
+    let request = WorkerRequest {
+        request: Some(worker_request::Request::SignalAck(SignalAck {
+            signal_id: "sig-99".to_string(),
+        })),
+    };
+
+    match request.request {
+        Some(worker_request::Request::SignalAck(ack)) => {
+            assert_eq!(ack.signal_id, "sig-99");
+        }
+        _ => panic!("Expected SignalAck variant"),
+    }
+}
+
+#[test]
+fn test_send_signal_request_construction() {
+    let req = SendSignalRequest {
+        task_id: "task-abc".to_string(),
+        signal_name: "notify".to_string(),
+        payload: r#"{"msg": "hello"}"#.to_string(),
+    };
+    assert_eq!(req.task_id, "task-abc");
+    assert_eq!(req.signal_name, "notify");
+    assert_eq!(req.payload, r#"{"msg": "hello"}"#);
+}
+
+#[test]
+fn test_send_signal_response_construction() {
+    let resp = SendSignalResponse {
+        signal_id: "sig-new".to_string(),
+        delivered: true,
+    };
+    assert_eq!(resp.signal_id, "sig-new");
+    assert!(resp.delivered);
+
+    let resp_undelivered = SendSignalResponse {
+        signal_id: "sig-queued".to_string(),
+        delivered: false,
+    };
+    assert!(!resp_undelivered.delivered);
+}

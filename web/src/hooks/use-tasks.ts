@@ -3,6 +3,7 @@ import { tasksApi } from "@/api/tasks";
 import type {
   ListTasksParams,
   CreateTaskRequest,
+  SendSignalRequest,
   ListDeadLettersParams,
 } from "@/api/types";
 
@@ -77,6 +78,26 @@ export function useTaskRunLogs(taskId: string, runId: string) {
     queryFn: () => tasksApi.getRunLogs(taskId, runId),
     enabled: !!taskId && !!runId,
     refetchInterval: 5_000,
+  });
+}
+
+export function useTaskSignals(taskId: string) {
+  return useQuery({
+    queryKey: ["tasks", taskId, "signals"],
+    queryFn: () => tasksApi.listSignals(taskId),
+    enabled: !!taskId,
+    refetchInterval: 5_000,
+  });
+}
+
+export function useSendSignal() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ taskId, request }: { taskId: string; request: SendSignalRequest }) =>
+      tasksApi.sendSignal(taskId, request),
+    onSuccess: (_data, { taskId }) => {
+      queryClient.invalidateQueries({ queryKey: ["tasks", taskId, "signals"] });
+    },
   });
 }
 

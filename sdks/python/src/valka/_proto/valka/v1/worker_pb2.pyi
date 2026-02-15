@@ -8,30 +8,34 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class WorkerRequest(_message.Message):
-    __slots__ = ("hello", "task_result", "heartbeat", "log_batch", "shutdown")
+    __slots__ = ("hello", "task_result", "heartbeat", "log_batch", "shutdown", "signal_ack")
     HELLO_FIELD_NUMBER: _ClassVar[int]
     TASK_RESULT_FIELD_NUMBER: _ClassVar[int]
     HEARTBEAT_FIELD_NUMBER: _ClassVar[int]
     LOG_BATCH_FIELD_NUMBER: _ClassVar[int]
     SHUTDOWN_FIELD_NUMBER: _ClassVar[int]
+    SIGNAL_ACK_FIELD_NUMBER: _ClassVar[int]
     hello: WorkerHello
     task_result: TaskResult
     heartbeat: Heartbeat
     log_batch: LogBatch
     shutdown: GracefulShutdown
-    def __init__(self, hello: _Optional[_Union[WorkerHello, _Mapping]] = ..., task_result: _Optional[_Union[TaskResult, _Mapping]] = ..., heartbeat: _Optional[_Union[Heartbeat, _Mapping]] = ..., log_batch: _Optional[_Union[LogBatch, _Mapping]] = ..., shutdown: _Optional[_Union[GracefulShutdown, _Mapping]] = ...) -> None: ...
+    signal_ack: SignalAck
+    def __init__(self, hello: _Optional[_Union[WorkerHello, _Mapping]] = ..., task_result: _Optional[_Union[TaskResult, _Mapping]] = ..., heartbeat: _Optional[_Union[Heartbeat, _Mapping]] = ..., log_batch: _Optional[_Union[LogBatch, _Mapping]] = ..., shutdown: _Optional[_Union[GracefulShutdown, _Mapping]] = ..., signal_ack: _Optional[_Union[SignalAck, _Mapping]] = ...) -> None: ...
 
 class WorkerResponse(_message.Message):
-    __slots__ = ("task_assignment", "task_cancellation", "heartbeat_ack", "server_shutdown")
+    __slots__ = ("task_assignment", "task_cancellation", "heartbeat_ack", "server_shutdown", "task_signal")
     TASK_ASSIGNMENT_FIELD_NUMBER: _ClassVar[int]
     TASK_CANCELLATION_FIELD_NUMBER: _ClassVar[int]
     HEARTBEAT_ACK_FIELD_NUMBER: _ClassVar[int]
     SERVER_SHUTDOWN_FIELD_NUMBER: _ClassVar[int]
+    TASK_SIGNAL_FIELD_NUMBER: _ClassVar[int]
     task_assignment: TaskAssignment
     task_cancellation: TaskCancellation
     heartbeat_ack: HeartbeatAck
     server_shutdown: ServerShutdown
-    def __init__(self, task_assignment: _Optional[_Union[TaskAssignment, _Mapping]] = ..., task_cancellation: _Optional[_Union[TaskCancellation, _Mapping]] = ..., heartbeat_ack: _Optional[_Union[HeartbeatAck, _Mapping]] = ..., server_shutdown: _Optional[_Union[ServerShutdown, _Mapping]] = ...) -> None: ...
+    task_signal: TaskSignal
+    def __init__(self, task_assignment: _Optional[_Union[TaskAssignment, _Mapping]] = ..., task_cancellation: _Optional[_Union[TaskCancellation, _Mapping]] = ..., heartbeat_ack: _Optional[_Union[HeartbeatAck, _Mapping]] = ..., server_shutdown: _Optional[_Union[ServerShutdown, _Mapping]] = ..., task_signal: _Optional[_Union[TaskSignal, _Mapping]] = ...) -> None: ...
 
 class WorkerHello(_message.Message):
     __slots__ = ("worker_id", "worker_name", "queues", "concurrency", "metadata")
@@ -138,3 +142,23 @@ class ServerShutdown(_message.Message):
     reason: str
     drain_seconds: int
     def __init__(self, reason: _Optional[str] = ..., drain_seconds: _Optional[int] = ...) -> None: ...
+
+class TaskSignal(_message.Message):
+    __slots__ = ("signal_id", "task_id", "signal_name", "payload", "timestamp_ms")
+    SIGNAL_ID_FIELD_NUMBER: _ClassVar[int]
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    SIGNAL_NAME_FIELD_NUMBER: _ClassVar[int]
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    TIMESTAMP_MS_FIELD_NUMBER: _ClassVar[int]
+    signal_id: str
+    task_id: str
+    signal_name: str
+    payload: str
+    timestamp_ms: int
+    def __init__(self, signal_id: _Optional[str] = ..., task_id: _Optional[str] = ..., signal_name: _Optional[str] = ..., payload: _Optional[str] = ..., timestamp_ms: _Optional[int] = ...) -> None: ...
+
+class SignalAck(_message.Message):
+    __slots__ = ("signal_id",)
+    SIGNAL_ID_FIELD_NUMBER: _ClassVar[int]
+    signal_id: str
+    def __init__(self, signal_id: _Optional[str] = ...) -> None: ...

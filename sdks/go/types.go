@@ -107,6 +107,18 @@ type TaskEvent struct {
 	TimestampMs int64  `json:"timestamp_ms"`
 }
 
+// Signal represents a task signal from the REST API.
+type Signal struct {
+	ID             string          `json:"id"`
+	TaskID         string          `json:"task_id"`
+	SignalName     string          `json:"signal_name"`
+	Payload        json.RawMessage `json:"payload,omitempty"`
+	Status         string          `json:"status"`
+	CreatedAt      string          `json:"created_at"`
+	DeliveredAt    *string         `json:"delivered_at,omitempty"`
+	AcknowledgedAt *string         `json:"acknowledged_at,omitempty"`
+}
+
 // CreateTaskRequest is the body for creating a task.
 type CreateTaskRequest struct {
 	QueueName      string      `json:"queue_name"`

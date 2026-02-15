@@ -145,6 +145,31 @@ class ValkaClient:
             params["queue_name"] = queue_name
         return await self._get("/dead-letters", params=params)
 
+    # -- Signals --
+
+    async def send_signal(
+        self,
+        task_id: str,
+        signal_name: str,
+        payload: Any = None,
+    ) -> dict[str, Any]:
+        """Send a named signal to a task. Returns {signal_id, delivered}."""
+        body: dict[str, Any] = {"signal_name": signal_name}
+        if payload is not None:
+            body["payload"] = payload
+        return await self._post(f"/tasks/{task_id}/signal", body)
+
+    async def list_signals(
+        self,
+        task_id: str,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List signals for a task, optionally filtered by status."""
+        params: dict[str, Any] = {}
+        if status is not None:
+            params["status"] = status
+        return await self._get(f"/tasks/{task_id}/signals", params=params or None)
+
     # -- Health --
 
     async def health_check(self) -> str:

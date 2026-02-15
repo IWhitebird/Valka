@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -198,6 +198,9 @@ impl ValkaWorker {
 
         // Shared active task tracking
         let active_tasks: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        // Signal senders for routing signals to task contexts
+        let signal_senders: Arc<Mutex<HashMap<String, mpsc::Sender<TaskSignal>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         // Start heartbeat loop
         let hb_tx = request_tx.clone();
@@ -238,11 +241,19 @@ impl ValkaWorker {
                                         guard.insert(assignment.task_id.clone());
                                     }
 
+                                    // Create signal channel for this task
+                                    let (sig_tx, sig_rx) = mpsc::channel::<TaskSignal>(64);
+                                    {
+                                        let mut sigs = signal_senders.lock().await;
+                                        sigs.insert(assignment.task_id.clone(), sig_tx);
+                                    }
+
                                     let permit = semaphore.clone().acquire_owned().await
                                         .map_err(|_| SdkError::ShuttingDown)?;
                                     let handler = self.handler.clone();
                                     let tx = request_tx.clone();
                                     let active = active_tasks.clone();
+                                    let sigs = signal_senders.clone();
                                     tokio::spawn(async move {
                                         let task_id = assignment.task_id.clone();
                                         let task_run_id = assignment.task_run_id.clone();
@@ -256,6 +267,7 @@ impl ValkaWorker {
                                             assignment.input,
                                             assignment.metadata,
                                             tx.clone(),
+                                            sig_rx,
                                         );
 
                                         let result = handler(ctx).await;
@@ -284,9 +296,13 @@ impl ValkaWorker {
                                         };
                                         let _ = tx.send(request).await;
 
-                                        // Remove from active tasks
+                                        // Remove from active tasks and signal senders
                                         {
                                             let mut guard = active.lock().await;
+                                            guard.remove(&task_id);
+                                        }
+                                        {
+                                            let mut guard = sigs.lock().await;
                                             guard.remove(&task_id);
                                         }
 
@@ -295,9 +311,23 @@ impl ValkaWorker {
                                 }
                                 Some(worker_response::Response::TaskCancellation(cancel)) => {
                                     info!(task_id = %cancel.task_id, "Task cancelled by server");
-                                    // Remove from active tasks
-                                    let mut guard = active_tasks.lock().await;
-                                    guard.remove(&cancel.task_id);
+                                    // Remove from active tasks and signal senders
+                                    {
+                                        let mut guard = active_tasks.lock().await;
+                                        guard.remove(&cancel.task_id);
+                                    }
+                                    {
+                                        let mut guard = signal_senders.lock().await;
+                                        guard.remove(&cancel.task_id);
+                                    }
+                                }
+                                Some(worker_response::Response::TaskSignal(signal)) => {
+                                    let sigs = signal_senders.lock().await;
+                                    if let Some(tx) = sigs.get(&signal.task_id)
+                                        && tx.send(signal).await.is_err()
+                                    {
+                                        warn!("Signal channel closed for task");
+                                    }
                                 }
                                 Some(worker_response::Response::HeartbeatAck(_)) => {}
                                 Some(worker_response::Response::ServerShutdown(shutdown)) => {

@@ -97,4 +97,23 @@ impl ValkaClient {
             .task
             .ok_or_else(|| SdkError::Handler("No task in response".to_string()))
     }
+
+    pub async fn send_signal(
+        &mut self,
+        task_id: &str,
+        signal_name: &str,
+        payload: Option<serde_json::Value>,
+    ) -> Result<(String, bool), SdkError> {
+        let response = self
+            .inner
+            .send_signal(SendSignalRequest {
+                task_id: task_id.to_string(),
+                signal_name: signal_name.to_string(),
+                payload: payload.map(|v| v.to_string()).unwrap_or_default(),
+            })
+            .await?;
+
+        let resp = response.into_inner();
+        Ok((resp.signal_id, resp.delivered))
+    }
 }

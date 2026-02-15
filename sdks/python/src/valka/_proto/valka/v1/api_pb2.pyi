@@ -79,6 +79,24 @@ class CancelTaskResponse(_message.Message):
     task: _common_pb2.TaskMeta
     def __init__(self, task: _Optional[_Union[_common_pb2.TaskMeta, _Mapping]] = ...) -> None: ...
 
+class SendSignalRequest(_message.Message):
+    __slots__ = ("task_id", "signal_name", "payload")
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    SIGNAL_NAME_FIELD_NUMBER: _ClassVar[int]
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    task_id: str
+    signal_name: str
+    payload: str
+    def __init__(self, task_id: _Optional[str] = ..., signal_name: _Optional[str] = ..., payload: _Optional[str] = ...) -> None: ...
+
+class SendSignalResponse(_message.Message):
+    __slots__ = ("signal_id", "delivered")
+    SIGNAL_ID_FIELD_NUMBER: _ClassVar[int]
+    DELIVERED_FIELD_NUMBER: _ClassVar[int]
+    signal_id: str
+    delivered: bool
+    def __init__(self, signal_id: _Optional[str] = ..., delivered: bool = ...) -> None: ...
+
 class SubscribeLogsRequest(_message.Message):
     __slots__ = ("task_run_id", "include_history")
     TASK_RUN_ID_FIELD_NUMBER: _ClassVar[int]

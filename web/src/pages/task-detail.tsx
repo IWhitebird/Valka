@@ -3,6 +3,7 @@ import { useParams, Link, useNavigate } from "react-router-dom";
 import { ArrowLeft, Trash2 } from "lucide-react";
 import { useTask, useTaskRuns, useDeleteTask } from "@/hooks/use-tasks";
 import { TaskDetailPanel } from "@/components/task-detail/task-detail-panel";
+import { TaskSignalsPanel } from "@/components/task-detail/task-signals-panel";
 import { TaskRunsTable } from "@/components/task-detail/task-runs-table";
 import { TaskLogsViewer } from "@/components/task-detail/task-logs-viewer";
 import { Button } from "@/components/ui/button";
@@ -76,6 +77,10 @@ export function TaskDetailPage() {
       </div>
 
       <TaskDetailPanel task={task} />
+
+      <Separator />
+
+      <TaskSignalsPanel taskId={taskId!} taskStatus={task.status} />
 
       <Separator />
 

@@ -3,7 +3,10 @@ import type {
   Task,
   TaskRun,
   TaskLog,
+  TaskSignal,
   CreateTaskRequest,
+  SendSignalRequest,
+  SendSignalResponse,
   ListTasksParams,
   DeadLetter,
   ListDeadLettersParams,
@@ -60,6 +63,18 @@ export const tasksApi = {
     return fetchAPI<TaskLog[]>(
       `/api/v1/tasks/${taskId}/runs/${runId}/logs`,
     );
+  },
+
+  sendSignal(taskId: string, request: SendSignalRequest): Promise<SendSignalResponse> {
+    return fetchAPI<SendSignalResponse>(`/api/v1/tasks/${taskId}/signal`, {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+  },
+
+  listSignals(taskId: string, status?: string): Promise<TaskSignal[]> {
+    const params = status ? `?status=${status}` : "";
+    return fetchAPI<TaskSignal[]>(`/api/v1/tasks/${taskId}/signals${params}`);
   },
 
   listDeadLetters(params: ListDeadLettersParams = {}): Promise<DeadLetter[]> {

@@ -13,6 +13,9 @@ service ApiService {
     rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
     rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
 
+    // Signals
+    rpc SendSignal(SendSignalRequest) returns (SendSignalResponse);
+
     // Event streaming
     rpc SubscribeEvents(SubscribeEventsRequest) returns (stream TaskEvent);
 
@@ -65,6 +68,18 @@ message CancelTaskRequest {
 
 message CancelTaskResponse {
     TaskMeta task = 1;
+}
+
+// --- SendSignal ---
+message SendSignalRequest {
+    string task_id = 1;
+    string signal_name = 2;
+    string payload = 3;
+}
+
+message SendSignalResponse {
+    string signal_id = 1;
+    bool delivered = 2;
 }
 
 // --- SubscribeLogs ---
