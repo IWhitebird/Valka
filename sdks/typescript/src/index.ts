@@ -1,7 +1,7 @@
 // Core classes
 export { ValkaClient } from "./client.js";
 export { ValkaWorker, ValkaWorkerBuilder } from "./worker.js";
-export { TaskContext } from "./context.js";
+export { TaskContext, type SignalData } from "./context.js";
 
 // Errors
 export {

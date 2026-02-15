@@ -23,7 +23,7 @@ import (
 )
 
 func main() {
-    client := valka.NewClient("http://localhost:8080")
+    client := valka.NewClient("http://localhost:8989")
 
     // Create a task
     task, err := client.CreateTask(valka.CreateTaskRequest{

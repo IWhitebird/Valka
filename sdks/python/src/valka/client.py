@@ -25,7 +25,7 @@ class ValkaClient:
 
     Usage::
 
-        async with ValkaClient("http://localhost:8080") as client:
+        async with ValkaClient("http://localhost:8989") as client:
             task = await client.create_task(
                 queue_name="emails",
                 task_name="send-welcome",
@@ -35,7 +35,7 @@ class ValkaClient:
 
     def __init__(
         self,
-        base_url: str = "http://localhost:8080",
+        base_url: str = "http://localhost:8989",
         *,
         headers: dict[str, str] | None = None,
     ) -> None:
