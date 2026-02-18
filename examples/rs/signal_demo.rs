@@ -11,9 +11,7 @@ use valka_sdk::{TaskContext, ValkaClient, ValkaWorker};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let mut client = ValkaClient::connect("http://127.0.0.1:50051").await?;
 
@@ -103,6 +101,7 @@ async fn handle_task(mut ctx: TaskContext) -> Result<serde_json::Value, String> 
         }
     }
 
-    ctx.log(&format!("Final: a={a}  b={b}  sum={}", a + b)).await;
+    ctx.log(&format!("Final: a={a}  b={b}  sum={}", a + b))
+        .await;
     Ok(serde_json::json!({"status": "stopped gracefully"}))
 }

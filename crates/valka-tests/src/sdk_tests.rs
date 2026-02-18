@@ -190,8 +190,14 @@ async fn test_context_receive_signal() {
 async fn test_context_wait_for_signal_by_name() {
     let (mut ctx, signal_tx, _request_rx) = make_test_context();
 
-    signal_tx.send(make_signal("s-foo", "foo", "1")).await.unwrap();
-    signal_tx.send(make_signal("s-bar", "bar", "2")).await.unwrap();
+    signal_tx
+        .send(make_signal("s-foo", "foo", "1"))
+        .await
+        .unwrap();
+    signal_tx
+        .send(make_signal("s-bar", "bar", "2"))
+        .await
+        .unwrap();
 
     // Wait for "bar" — should skip "foo" and buffer it
     let bar = ctx.wait_for_signal("bar").await.expect("Should find bar");
@@ -208,12 +214,24 @@ async fn test_context_wait_for_signal_by_name() {
 async fn test_context_wait_for_signal_buffers_non_matching() {
     let (mut ctx, signal_tx, _request_rx) = make_test_context();
 
-    signal_tx.send(make_signal("s1", "alpha", "a")).await.unwrap();
-    signal_tx.send(make_signal("s2", "beta", "b")).await.unwrap();
-    signal_tx.send(make_signal("s3", "gamma", "c")).await.unwrap();
+    signal_tx
+        .send(make_signal("s1", "alpha", "a"))
+        .await
+        .unwrap();
+    signal_tx
+        .send(make_signal("s2", "beta", "b"))
+        .await
+        .unwrap();
+    signal_tx
+        .send(make_signal("s3", "gamma", "c"))
+        .await
+        .unwrap();
 
     // Wait for "gamma" — first two get buffered
-    let gamma = ctx.wait_for_signal("gamma").await.expect("Should find gamma");
+    let gamma = ctx
+        .wait_for_signal("gamma")
+        .await
+        .expect("Should find gamma");
     assert_eq!(gamma.name, "gamma");
 
     // Buffered signals should come out in order

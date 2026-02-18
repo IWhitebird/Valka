@@ -9,9 +9,7 @@ use valka_sdk::{TaskContext, ValkaClient, ValkaWorker};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let server_addr = "http://127.0.0.1:50051";
 
@@ -24,9 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .handler(|ctx: TaskContext| async move {
             ctx.log(&format!("Handling: {}", ctx.task_name)).await;
 
-            let input: serde_json::Value = ctx
-                .input()
-                .map_err(|e| format!("bad input: {e}"))?;
+            let input: serde_json::Value = ctx.input().map_err(|e| format!("bad input: {e}"))?;
 
             let n = input.get("n").and_then(|v| v.as_u64()).unwrap_or(0);
             let result = n * 2;
@@ -88,7 +84,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nFinal task statuses:");
     for id in &task_ids {
         let task = client.get_task(id).await?;
-        println!("  {} - status={} output={}", task.id, task.status, task.output);
+        println!(
+            "  {} - status={} output={}",
+            task.id, task.status, task.output
+        );
     }
 
     println!("\nShutting down worker...");

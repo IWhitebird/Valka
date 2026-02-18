@@ -28,8 +28,9 @@ pub async fn reap_expired_leases(pool: &PgPool) -> Result<usize, sqlx::Error> {
             } else {
                 // Move to dead letter — insert DLQ entry first, then update status
                 let dlq_id = uuid::Uuid::now_v7().to_string();
-                let runs =
-                    task_runs::get_runs_for_task(pool, &task.id).await.unwrap_or_default();
+                let runs = task_runs::get_runs_for_task(pool, &task.id)
+                    .await
+                    .unwrap_or_default();
                 let error_message = runs.first().and_then(|r| r.error_message.as_deref());
 
                 if let Err(e) = dead_letter::insert_dead_letter(

@@ -15,7 +15,7 @@ use valka_dispatcher::DispatcherService;
 use valka_matching::MatchingService;
 use valka_matching::partition::TaskEnvelope;
 use valka_proto::*;
-use valka_server::internal_grpc::InternalServiceImpl;
+use crate::internal_grpc::InternalServiceImpl;
 
 pub struct ApiServiceImpl {
     pool: DbPool,
@@ -131,7 +131,10 @@ impl api_service_server::ApiService for ApiServiceImpl {
         let _ = self.event_tx.send(event);
 
         // Check if we own this partition; if not, forward to owner
-        if !self.cluster.owns_partition(&req.queue_name, partition.0).await
+        if !self
+            .cluster
+            .owns_partition(&req.queue_name, partition.0)
+            .await
             && let Some(owner_addr) = self
                 .cluster
                 .get_partition_owner_addr(&req.queue_name, partition.0)
@@ -322,10 +325,7 @@ impl api_service_server::ApiService for ApiServiceImpl {
             signal_id: signal.id.clone(),
             task_id: signal.task_id,
             signal_name: signal.signal_name,
-            payload: signal
-                .payload
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
+            payload: signal.payload.map(|v| v.to_string()).unwrap_or_default(),
             timestamp_ms: signal.created_at.timestamp_millis(),
         };
 
@@ -335,8 +335,7 @@ impl api_service_server::ApiService for ApiServiceImpl {
             .await;
 
         if delivered {
-            let _ =
-                valka_db::queries::signals::mark_delivered(&self.pool, &signal.id).await;
+            let _ = valka_db::queries::signals::mark_delivered(&self.pool, &signal.id).await;
         }
 
         Ok(Response::new(SendSignalResponse {

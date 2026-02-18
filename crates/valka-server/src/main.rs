@@ -8,9 +8,9 @@ use anyhow::Result;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::info;
 
-mod grpc;
 mod shutdown;
 
+use valka_server::grpc;
 use valka_server::rest;
 use valka_server::server;
 
@@ -41,7 +41,8 @@ async fn main() -> Result<()> {
     info!(node_id = %node_id, "Node ID assigned");
 
     // Create database pool
-    let pool = valka_db::pool::create_pool(&config.database_url).await?;
+    let pool =
+        valka_db::pool::create_pool(&config.database_url, config.database.max_connections).await?;
 
     // Run migrations
     valka_db::migrations::run_migrations(&pool).await?;

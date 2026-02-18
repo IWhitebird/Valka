@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::http::StatusCode;
 use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use tokio::sync::{broadcast, mpsc};
@@ -100,7 +101,13 @@ pub fn build_test_router(pool: PgPool) -> Router {
     let forwarder = NodeForwarder::new();
 
     valka_server::rest::build_api_router(
-        pool, event_tx, matching, dispatcher, metrics_handle, cluster, forwarder,
+        pool,
+        event_tx,
+        matching,
+        dispatcher,
+        metrics_handle,
+        cluster,
+        forwarder,
     )
 }
 
@@ -117,6 +124,32 @@ pub async fn parse_response_json(
         .await
         .unwrap();
     serde_json::from_slice(&body).unwrap()
+}
+
+/// Assert that a response is a JSON error with the expected status, code, and substring.
+pub async fn assert_error_response(
+    response: axum::http::Response<axum::body::Body>,
+    expected_status: StatusCode,
+    expected_code: &str,
+    message_contains: &str,
+) {
+    assert_eq!(response.status(), expected_status);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_slice(&body).expect("Error response should be valid JSON");
+    assert_eq!(
+        json["code"].as_str().unwrap(),
+        expected_code,
+        "Expected error code {expected_code}, got {:?}",
+        json["code"]
+    );
+    let error_msg = json["error"].as_str().unwrap();
+    assert!(
+        error_msg.contains(message_contains),
+        "Expected error message to contain '{message_contains}', got '{error_msg}'"
+    );
 }
 
 /// Helper to create a CreateTaskParams with defaults.

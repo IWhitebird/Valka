@@ -6,6 +6,14 @@ use tower::ServiceExt;
 
 use super::helpers::*;
 
+fn delete_req(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap()
+}
+
 fn post_json(uri: &str, body: serde_json::Value) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -166,7 +174,7 @@ async fn test_rest_get_task_not_found(pool: PgPool) {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_error_response(resp, StatusCode::NOT_FOUND, "NOT_FOUND", "Task not found").await;
 }
 
 // ─── GET /api/v1/tasks ──────────────────────────────────────────────
@@ -280,7 +288,13 @@ async fn test_rest_cancel_task_not_found(pool: PgPool) {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_error_response(
+        resp,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "INVALID_STATE",
+        "not in cancellable state",
+    )
+    .await;
 }
 
 #[sqlx::test(migrations = "../../crates/valka-db/migrations")]
@@ -299,7 +313,13 @@ async fn test_rest_cancel_task_already_completed(pool: PgPool) {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_error_response(
+        resp,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "INVALID_STATE",
+        "not in cancellable state",
+    )
+    .await;
 }
 
 // ─── GET /api/v1/tasks/{id}/runs ────────────────────────────────────
@@ -599,7 +619,7 @@ async fn test_rest_send_signal_task_not_found(pool: PgPool) {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_error_response(resp, StatusCode::NOT_FOUND, "NOT_FOUND", "Task not found").await;
 }
 
 #[sqlx::test(migrations = "../../crates/valka-db/migrations")]
@@ -618,7 +638,13 @@ async fn test_rest_send_signal_completed_task(pool: PgPool) {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_error_response(
+        resp,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "INVALID_STATE",
+        "Cannot send signal to task in COMPLETED state",
+    )
+    .await;
 }
 
 #[sqlx::test(migrations = "../../crates/valka-db/migrations")]
@@ -637,7 +663,13 @@ async fn test_rest_send_signal_failed_task(pool: PgPool) {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_error_response(
+        resp,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "INVALID_STATE",
+        "Cannot send signal to task in FAILED state",
+    )
+    .await;
 }
 
 #[sqlx::test(migrations = "../../crates/valka-db/migrations")]
@@ -656,7 +688,13 @@ async fn test_rest_send_signal_cancelled_task(pool: PgPool) {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_error_response(
+        resp,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "INVALID_STATE",
+        "Cannot send signal to task in CANCELLED state",
+    )
+    .await;
 }
 
 #[sqlx::test(migrations = "../../crates/valka-db/migrations")]
@@ -791,4 +829,33 @@ async fn test_rest_send_multiple_signals_same_name(pool: PgPool) {
     let signals = body.as_array().unwrap();
     assert_eq!(signals.len(), 3);
     assert!(signals.iter().all(|s| s["signal_name"] == "approve"));
+}
+
+// ─── DELETE /api/v1/tasks/{id} error ─────────────────────────────────
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_delete_task_not_found(pool: PgPool) {
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(delete_req("/api/v1/tasks/nonexistent-id"))
+        .await
+        .unwrap();
+
+    assert_error_response(resp, StatusCode::NOT_FOUND, "NOT_FOUND", "Task not found").await;
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_delete_task_success(pool: PgPool) {
+    let task = create_test_task(&pool, "q", "t").await;
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(delete_req(&format!("/api/v1/tasks/{}", task.id)))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = parse_response_json(resp).await;
+    assert_eq!(body["deleted"], true);
 }

@@ -48,9 +48,15 @@ async fn test_get_pending_signals_ordered(pool: PgPool) {
     let task = create_test_task(&pool, "q", "t").await;
 
     // Insert 3 signals — created_at is set by DB, so order = insertion order
-    create_signal(&pool, "s1", &task.id, "first", None).await.unwrap();
-    create_signal(&pool, "s2", &task.id, "second", None).await.unwrap();
-    create_signal(&pool, "s3", &task.id, "third", None).await.unwrap();
+    create_signal(&pool, "s1", &task.id, "first", None)
+        .await
+        .unwrap();
+    create_signal(&pool, "s2", &task.id, "second", None)
+        .await
+        .unwrap();
+    create_signal(&pool, "s3", &task.id, "third", None)
+        .await
+        .unwrap();
 
     let signals = get_pending_signals(&pool, &task.id).await.unwrap();
     assert_eq!(signals.len(), 3);
@@ -63,8 +69,12 @@ async fn test_get_pending_signals_ordered(pool: PgPool) {
 async fn test_get_pending_signals_excludes_delivered(pool: PgPool) {
     let task = create_test_task(&pool, "q", "t").await;
 
-    create_signal(&pool, "s-pending", &task.id, "a", None).await.unwrap();
-    create_signal(&pool, "s-delivered", &task.id, "b", None).await.unwrap();
+    create_signal(&pool, "s-pending", &task.id, "a", None)
+        .await
+        .unwrap();
+    create_signal(&pool, "s-delivered", &task.id, "b", None)
+        .await
+        .unwrap();
 
     mark_delivered(&pool, "s-delivered").await.unwrap();
 
@@ -84,13 +94,17 @@ async fn test_get_pending_signals_empty(pool: PgPool) {
 #[sqlx::test(migrations = "../../crates/valka-db/migrations")]
 async fn test_mark_delivered(pool: PgPool) {
     let task = create_test_task(&pool, "q", "t").await;
-    create_signal(&pool, "sig-d", &task.id, "test", None).await.unwrap();
+    create_signal(&pool, "sig-d", &task.id, "test", None)
+        .await
+        .unwrap();
 
     let affected = mark_delivered(&pool, "sig-d").await.unwrap();
     assert!(affected, "Should mark PENDING signal as DELIVERED");
 
     // Verify status changed
-    let signals = list_signals(&pool, &task.id, Some("DELIVERED")).await.unwrap();
+    let signals = list_signals(&pool, &task.id, Some("DELIVERED"))
+        .await
+        .unwrap();
     assert_eq!(signals.len(), 1);
     assert_eq!(signals[0].status, "DELIVERED");
     assert!(signals[0].delivered_at.is_some());
@@ -99,25 +113,34 @@ async fn test_mark_delivered(pool: PgPool) {
 #[sqlx::test(migrations = "../../crates/valka-db/migrations")]
 async fn test_mark_delivered_idempotent(pool: PgPool) {
     let task = create_test_task(&pool, "q", "t").await;
-    create_signal(&pool, "sig-idem", &task.id, "test", None).await.unwrap();
+    create_signal(&pool, "sig-idem", &task.id, "test", None)
+        .await
+        .unwrap();
 
     mark_delivered(&pool, "sig-idem").await.unwrap();
 
     // Second mark should return false (already DELIVERED)
     let affected = mark_delivered(&pool, "sig-idem").await.unwrap();
-    assert!(!affected, "Should return false for already-delivered signal");
+    assert!(
+        !affected,
+        "Should return false for already-delivered signal"
+    );
 }
 
 #[sqlx::test(migrations = "../../crates/valka-db/migrations")]
 async fn test_mark_acknowledged(pool: PgPool) {
     let task = create_test_task(&pool, "q", "t").await;
-    create_signal(&pool, "sig-ack", &task.id, "test", None).await.unwrap();
+    create_signal(&pool, "sig-ack", &task.id, "test", None)
+        .await
+        .unwrap();
 
     mark_delivered(&pool, "sig-ack").await.unwrap();
     let affected = mark_acknowledged(&pool, "sig-ack").await.unwrap();
     assert!(affected, "Should mark DELIVERED signal as ACKNOWLEDGED");
 
-    let signals = list_signals(&pool, &task.id, Some("ACKNOWLEDGED")).await.unwrap();
+    let signals = list_signals(&pool, &task.id, Some("ACKNOWLEDGED"))
+        .await
+        .unwrap();
     assert_eq!(signals.len(), 1);
     assert!(signals[0].acknowledged_at.is_some());
 }
@@ -141,9 +164,15 @@ async fn test_mark_acknowledged_requires_delivered(pool: PgPool) {
 async fn test_reset_delivered_signals(pool: PgPool) {
     let task = create_test_task(&pool, "q", "t").await;
 
-    create_signal(&pool, "s-pending", &task.id, "a", None).await.unwrap();
-    create_signal(&pool, "s-delivered", &task.id, "b", None).await.unwrap();
-    create_signal(&pool, "s-acked", &task.id, "c", None).await.unwrap();
+    create_signal(&pool, "s-pending", &task.id, "a", None)
+        .await
+        .unwrap();
+    create_signal(&pool, "s-delivered", &task.id, "b", None)
+        .await
+        .unwrap();
+    create_signal(&pool, "s-acked", &task.id, "c", None)
+        .await
+        .unwrap();
 
     mark_delivered(&pool, "s-delivered").await.unwrap();
     mark_delivered(&pool, "s-acked").await.unwrap();
@@ -161,8 +190,12 @@ async fn test_reset_delivered_signals(pool: PgPool) {
 async fn test_reset_delivered_signals_none_to_reset(pool: PgPool) {
     let task = create_test_task(&pool, "q", "t").await;
 
-    create_signal(&pool, "s1", &task.id, "a", None).await.unwrap();
-    create_signal(&pool, "s2", &task.id, "b", None).await.unwrap();
+    create_signal(&pool, "s1", &task.id, "a", None)
+        .await
+        .unwrap();
+    create_signal(&pool, "s2", &task.id, "b", None)
+        .await
+        .unwrap();
 
     let reset_count = reset_delivered_signals(&pool, &task.id).await.unwrap();
     assert_eq!(reset_count, 0, "No DELIVERED signals to reset");
@@ -172,9 +205,15 @@ async fn test_reset_delivered_signals_none_to_reset(pool: PgPool) {
 async fn test_list_signals_all(pool: PgPool) {
     let task = create_test_task(&pool, "q", "t").await;
 
-    create_signal(&pool, "s1", &task.id, "a", None).await.unwrap();
-    create_signal(&pool, "s2", &task.id, "b", None).await.unwrap();
-    create_signal(&pool, "s3", &task.id, "c", None).await.unwrap();
+    create_signal(&pool, "s1", &task.id, "a", None)
+        .await
+        .unwrap();
+    create_signal(&pool, "s2", &task.id, "b", None)
+        .await
+        .unwrap();
+    create_signal(&pool, "s3", &task.id, "c", None)
+        .await
+        .unwrap();
     mark_delivered(&pool, "s2").await.unwrap();
     mark_delivered(&pool, "s3").await.unwrap();
     mark_acknowledged(&pool, "s3").await.unwrap();
@@ -187,15 +226,25 @@ async fn test_list_signals_all(pool: PgPool) {
 async fn test_list_signals_filter_status(pool: PgPool) {
     let task = create_test_task(&pool, "q", "t").await;
 
-    create_signal(&pool, "s1", &task.id, "a", None).await.unwrap();
-    create_signal(&pool, "s2", &task.id, "b", None).await.unwrap();
-    create_signal(&pool, "s3", &task.id, "c", None).await.unwrap();
+    create_signal(&pool, "s1", &task.id, "a", None)
+        .await
+        .unwrap();
+    create_signal(&pool, "s2", &task.id, "b", None)
+        .await
+        .unwrap();
+    create_signal(&pool, "s3", &task.id, "c", None)
+        .await
+        .unwrap();
     mark_delivered(&pool, "s2").await.unwrap();
 
-    let pending = list_signals(&pool, &task.id, Some("PENDING")).await.unwrap();
+    let pending = list_signals(&pool, &task.id, Some("PENDING"))
+        .await
+        .unwrap();
     assert_eq!(pending.len(), 2);
 
-    let delivered = list_signals(&pool, &task.id, Some("DELIVERED")).await.unwrap();
+    let delivered = list_signals(&pool, &task.id, Some("DELIVERED"))
+        .await
+        .unwrap();
     assert_eq!(delivered.len(), 1);
     assert_eq!(delivered[0].id, "s2");
 }
@@ -212,8 +261,12 @@ async fn test_list_signals_empty(pool: PgPool) {
 async fn test_signal_cascade_on_task_delete(pool: PgPool) {
     let task = create_test_task(&pool, "q", "t").await;
 
-    create_signal(&pool, "s1", &task.id, "a", None).await.unwrap();
-    create_signal(&pool, "s2", &task.id, "b", None).await.unwrap();
+    create_signal(&pool, "s1", &task.id, "a", None)
+        .await
+        .unwrap();
+    create_signal(&pool, "s2", &task.id, "b", None)
+        .await
+        .unwrap();
 
     // Delete the task — signals should cascade delete
     valka_db::queries::tasks::delete_task(&pool, &task.id)
@@ -221,5 +274,8 @@ async fn test_signal_cascade_on_task_delete(pool: PgPool) {
         .unwrap();
 
     let signals = list_signals(&pool, &task.id, None).await.unwrap();
-    assert!(signals.is_empty(), "Signals should be cascade-deleted with task");
+    assert!(
+        signals.is_empty(),
+        "Signals should be cascade-deleted with task"
+    );
 }

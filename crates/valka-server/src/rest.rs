@@ -5,7 +5,7 @@ use axum::{
     response::{IntoResponse, Sse, sse::Event},
     routing::{get, post},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -20,6 +20,38 @@ use valka_db::DbPool;
 use valka_dispatcher::DispatcherService;
 use valka_matching::MatchingService;
 use valka_matching::partition::TaskEnvelope;
+
+// ─── Structured Error Response ──────────────────────────────────────
+
+#[derive(Serialize)]
+struct ErrorBody {
+    error: String,
+    code: String,
+}
+
+enum ApiError {
+    NotFound(String),
+    InvalidState(String),
+    Internal(String),
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        let (status, code, message) = match self {
+            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, "NOT_FOUND", msg),
+            ApiError::InvalidState(msg) => (StatusCode::UNPROCESSABLE_ENTITY, "INVALID_STATE", msg),
+            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", msg),
+        };
+        (
+            status,
+            Json(ErrorBody {
+                error: message,
+                code: code.to_string(),
+            }),
+        )
+            .into_response()
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -61,7 +93,10 @@ pub fn build_api_router(
         .allow_headers(Any);
 
     Router::new()
-        .route("/api/v1/tasks", post(create_task).get(list_tasks).delete(clear_all_tasks))
+        .route(
+            "/api/v1/tasks",
+            post(create_task).get(list_tasks).delete(clear_all_tasks),
+        )
         .route("/api/v1/tasks/{task_id}", get(get_task).delete(delete_task))
         .route("/api/v1/tasks/{task_id}/cancel", post(cancel_task))
         .route("/api/v1/tasks/{task_id}/signal", post(send_signal))
@@ -93,7 +128,13 @@ pub async fn serve_rest(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
     let api_routes = build_api_router(
-        pool, event_tx, matching, dispatcher, metrics_handle, cluster, forwarder,
+        pool,
+        event_tx,
+        matching,
+        dispatcher,
+        metrics_handle,
+        cluster,
+        forwarder,
     );
 
     // Serve static files with SPA fallback
@@ -160,7 +201,7 @@ fn default_limit() -> i64 {
 async fn create_task(
     State(state): State<AppState>,
     Json(body): Json<CreateTaskBody>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     let task_id = TaskId::new();
     let partition = partition_for_task(
         &body.queue_name,
@@ -192,7 +233,7 @@ async fn create_task(
         },
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     valka_core::metrics::record_task_created(&body.queue_name);
 
@@ -254,11 +295,11 @@ async fn create_task(
 async fn get_task(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     let task = valka_db::queries::tasks::get_task(&state.pool, &task_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "Task not found".to_string()))?;
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound("Task not found".to_string()))?;
 
     Ok(Json(task_row_to_json(task)))
 }
@@ -266,7 +307,7 @@ async fn get_task(
 async fn list_tasks(
     State(state): State<AppState>,
     Query(query): Query<ListTasksQuery>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     let tasks = valka_db::queries::tasks::list_tasks(
         &state.pool,
         query.queue_name.as_deref(),
@@ -275,7 +316,7 @@ async fn list_tasks(
         query.offset,
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let result: Vec<serde_json::Value> = tasks.into_iter().map(task_row_to_json).collect();
     Ok(Json(result))
@@ -284,16 +325,13 @@ async fn list_tasks(
 async fn cancel_task(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     // Try cancelling (PENDING, RETRY, RUNNING, DISPATCHING)
     let task = valka_db::queries::tasks::cancel_task_any(&state.pool, &task_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or_else(|| {
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "Task not found or not in cancellable state".to_string(),
-            )
+            ApiError::InvalidState("Task not found or not in cancellable state".to_string())
         })?;
 
     // If task was RUNNING, forward cancellation to the worker
@@ -328,20 +366,20 @@ async fn send_signal(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
     Json(body): Json<SendSignalBody>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     // Validate task exists
     let task = valka_db::queries::tasks::get_task(&state.pool, &task_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "Task not found".to_string()))?;
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound("Task not found".to_string()))?;
 
     // Reject if terminal status
     match task.status.as_str() {
         "COMPLETED" | "FAILED" | "DEAD_LETTER" | "CANCELLED" => {
-            return Err((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("Cannot send signal to task in {} state", task.status),
-            ));
+            return Err(ApiError::InvalidState(format!(
+                "Cannot send signal to task in {} state",
+                task.status
+            )));
         }
         _ => {}
     }
@@ -356,17 +394,14 @@ async fn send_signal(
         body.payload,
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Try immediate delivery
     let task_signal = valka_proto::TaskSignal {
         signal_id: signal.id.clone(),
         task_id: signal.task_id,
         signal_name: signal.signal_name,
-        payload: signal
-            .payload
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
+        payload: signal.payload.map(|v| v.to_string()).unwrap_or_default(),
         timestamp_ms: signal.created_at.timestamp_millis(),
     };
 
@@ -398,14 +433,11 @@ async fn list_signals(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
     Query(query): Query<ListSignalsQuery>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let signals = valka_db::queries::signals::list_signals(
-        &state.pool,
-        &task_id,
-        query.status.as_deref(),
-    )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+) -> Result<impl IntoResponse, ApiError> {
+    let signals =
+        valka_db::queries::signals::list_signals(&state.pool, &task_id, query.status.as_deref())
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let result: Vec<serde_json::Value> = signals
         .into_iter()
@@ -428,24 +460,22 @@ async fn list_signals(
 async fn delete_task(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     let deleted = valka_db::queries::tasks::delete_task(&state.pool, &task_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     if !deleted {
-        return Err((StatusCode::NOT_FOUND, "Task not found".to_string()));
+        return Err(ApiError::NotFound("Task not found".to_string()));
     }
 
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
-async fn clear_all_tasks(
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+async fn clear_all_tasks(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     let count = valka_db::queries::tasks::clear_all_tasks(&state.pool)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(Json(serde_json::json!({ "deleted_count": count })))
 }
@@ -453,10 +483,10 @@ async fn clear_all_tasks(
 async fn get_task_runs(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     let runs = valka_db::queries::task_runs::get_runs_for_task(&state.pool, &task_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let result: Vec<serde_json::Value> = runs.into_iter().map(task_run_to_json).collect();
     Ok(Json(result))
@@ -478,7 +508,7 @@ async fn get_run_logs(
     State(state): State<AppState>,
     Path((task_id, run_id)): Path<(String, String)>,
     Query(query): Query<LogsQuery>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     // Verify the run belongs to the task
     let _ = task_id; // Used for API consistency; logs are queried by run_id
 
@@ -489,15 +519,13 @@ async fn get_run_logs(
         query.after_id,
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let result: Vec<serde_json::Value> = logs.into_iter().map(task_log_to_json).collect();
     Ok(Json(result))
 }
 
-async fn list_workers(
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+async fn list_workers(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     // Return in-memory connected workers from dispatcher
     let workers: Vec<serde_json::Value> = state
         .dispatcher
@@ -533,7 +561,7 @@ struct DeadLetterQuery {
 async fn list_dead_letters(
     State(state): State<AppState>,
     Query(query): Query<DeadLetterQuery>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     let dls = valka_db::queries::dead_letter::list_dead_letters(
         &state.pool,
         query.queue_name.as_deref(),
@@ -541,7 +569,7 @@ async fn list_dead_letters(
         query.offset,
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let result: Vec<serde_json::Value> = dls
         .into_iter()

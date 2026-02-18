@@ -79,8 +79,7 @@ impl internal_service_server::InternalService for InternalServiceImpl {
         Ok(Response::new(ForwardEventResponse {}))
     }
 
-    type RelayLogsStream =
-        Pin<Box<dyn Stream<Item = Result<LogEntry, Status>> + Send + 'static>>;
+    type RelayLogsStream = Pin<Box<dyn Stream<Item = Result<LogEntry, Status>> + Send + 'static>>;
 
     async fn relay_logs(
         &self,
@@ -125,10 +124,7 @@ impl internal_service_server::InternalService for InternalServiceImpl {
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
-    async fn ping(
-        &self,
-        _request: Request<PingRequest>,
-    ) -> Result<Response<PingResponse>, Status> {
+    async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         Ok(Response::new(PingResponse {
             node_id: self.node_id.0.clone(),
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
