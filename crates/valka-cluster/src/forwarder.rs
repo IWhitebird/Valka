@@ -51,10 +51,7 @@ impl NodeForwarder {
         }
     }
 
-    async fn get_client(
-        &self,
-        addr: &str,
-    ) -> anyhow::Result<InternalServiceClient<Channel>> {
+    async fn get_client(&self, addr: &str) -> anyhow::Result<InternalServiceClient<Channel>> {
         // Check cache first
         {
             let cache = self.channels.read().await;
@@ -154,13 +151,14 @@ impl NodeForwarder {
     ) -> anyhow::Result<bool> {
         // Check circuit breaker
         if !self.check_circuit(addr).await {
-            return Err(anyhow::anyhow!(
-                "Circuit breaker open for node {addr}"
-            ));
+            return Err(anyhow::anyhow!("Circuit breaker open for node {addr}"));
         }
 
         // First attempt
-        let first_err = match self.do_forward_task(addr, task_id, queue_name, partition_id).await {
+        let first_err = match self
+            .do_forward_task(addr, task_id, queue_name, partition_id)
+            .await
+        {
             Ok(accepted) => {
                 self.record_success(addr).await;
                 return Ok(accepted);
@@ -175,7 +173,10 @@ impl NodeForwarder {
         if self.check_circuit(addr).await {
             tokio::time::sleep(FORWARD_RETRY_DELAY).await;
 
-            match self.do_forward_task(addr, task_id, queue_name, partition_id).await {
+            match self
+                .do_forward_task(addr, task_id, queue_name, partition_id)
+                .await
+            {
                 Ok(accepted) => {
                     self.record_success(addr).await;
                     return Ok(accepted);
@@ -221,16 +222,10 @@ impl NodeForwarder {
     }
 
     /// Forward a task event to a peer node (best-effort, no retry).
-    pub async fn forward_event(
-        &self,
-        addr: &str,
-        event: TaskEvent,
-    ) -> anyhow::Result<()> {
+    pub async fn forward_event(&self, addr: &str, event: TaskEvent) -> anyhow::Result<()> {
         let mut client = self.get_client(addr).await?;
         client
-            .forward_event(ForwardEventRequest {
-                event: Some(event),
-            })
+            .forward_event(ForwardEventRequest { event: Some(event) })
             .await?;
         Ok(())
     }

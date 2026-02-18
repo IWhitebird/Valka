@@ -232,8 +232,13 @@ async fn test_dispatcher_send_signal_to_active_task() {
         timestamp_ms: 1700000000000,
     };
 
-    let delivered = dispatcher.send_signal_to_worker("task-signaled", signal).await;
-    assert!(delivered, "Should find and deliver signal to worker with active task");
+    let delivered = dispatcher
+        .send_signal_to_worker("task-signaled", signal)
+        .await;
+    assert!(
+        delivered,
+        "Should find and deliver signal to worker with active task"
+    );
 
     let msg = rx.recv().await.expect("Should receive signal");
     match msg.response {
@@ -259,7 +264,9 @@ async fn test_dispatcher_send_signal_no_worker() {
         timestamp_ms: 0,
     };
 
-    let delivered = dispatcher.send_signal_to_worker("no-such-task", signal).await;
+    let delivered = dispatcher
+        .send_signal_to_worker("no-such-task", signal)
+        .await;
     assert!(!delivered, "Should return false when no worker registered");
 }
 
@@ -280,5 +287,8 @@ async fn test_dispatcher_send_signal_wrong_task() {
     };
 
     let delivered = dispatcher.send_signal_to_worker("task-B", signal).await;
-    assert!(!delivered, "Should return false when worker has different task");
+    assert!(
+        !delivered,
+        "Should return false when worker has different task"
+    );
 }

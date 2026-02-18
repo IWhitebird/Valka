@@ -1,5 +1,5 @@
-pub mod events;
 pub mod event_relay;
+pub mod events;
 pub mod forwarder;
 pub mod gossip;
 pub mod partition;

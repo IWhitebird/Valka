@@ -1,3 +1,4 @@
+# Local development. For production variants, see deploy/docker/
 services:
   postgres:
     image: postgres:17

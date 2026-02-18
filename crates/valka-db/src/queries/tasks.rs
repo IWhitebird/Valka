@@ -294,11 +294,9 @@ pub async fn count_pending_by_queue(pool: &PgPool) -> Result<Vec<(String, i64)>,
 
 /// List workers from the workers table
 pub async fn list_workers_db(pool: &PgPool) -> Result<Vec<WorkerRow>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, WorkerRow>(
-        "SELECT * FROM workers ORDER BY connected_at DESC",
-    )
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query_as::<_, WorkerRow>("SELECT * FROM workers ORDER BY connected_at DESC")
+        .fetch_all(pool)
+        .await?;
     Ok(rows)
 }
 
@@ -320,10 +318,12 @@ pub struct WorkerRow {
 pub async fn delete_task(pool: &PgPool, task_id: &str) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
-    sqlx::query("DELETE FROM task_logs WHERE task_run_id IN (SELECT id FROM task_runs WHERE task_id = $1)")
-        .bind(task_id)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "DELETE FROM task_logs WHERE task_run_id IN (SELECT id FROM task_runs WHERE task_id = $1)",
+    )
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await?;
 
     sqlx::query("DELETE FROM task_runs WHERE task_id = $1")
         .bind(task_id)
@@ -360,9 +360,7 @@ pub async fn clear_all_tasks(pool: &PgPool) -> Result<u64, sqlx::Error> {
         .execute(&mut *tx)
         .await?;
 
-    let result = sqlx::query("DELETE FROM tasks")
-        .execute(&mut *tx)
-        .await?;
+    let result = sqlx::query("DELETE FROM tasks").execute(&mut *tx).await?;
 
     tx.commit().await?;
     Ok(result.rows_affected())

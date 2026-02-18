@@ -11,10 +11,17 @@ pub struct ServerConfig {
     pub http_addr: String,
     pub database_url: String,
     pub web_dir: String,
+    pub database: DatabaseConfig,
     pub gossip: GossipConfig,
     pub matching: MatchingConfig,
     pub scheduler: SchedulerConfig,
     pub log_ingester: LogIngesterConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseConfig {
+    pub max_connections: u32,
+    pub acquire_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,10 +66,20 @@ impl Default for ServerConfig {
             http_addr: "0.0.0.0:8989".to_string(),
             database_url: "postgresql://valka:valka@localhost:5432/valka".to_string(),
             web_dir: "web/dist".to_string(),
+            database: DatabaseConfig::default(),
             gossip: GossipConfig::default(),
             matching: MatchingConfig::default(),
             scheduler: SchedulerConfig::default(),
             log_ingester: LogIngesterConfig::default(),
+        }
+    }
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 20,
+            acquire_timeout_secs: 5,
         }
     }
 }

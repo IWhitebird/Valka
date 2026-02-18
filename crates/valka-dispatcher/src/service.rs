@@ -94,9 +94,9 @@ impl DispatcherService {
             let mut receivers = Vec::new();
             for queue in &queues {
                 for pid in 0..num_partitions {
-                    let rx = self
-                        .matching
-                        .register_worker(queue, PartitionId(pid), worker_id.clone());
+                    let rx =
+                        self.matching
+                            .register_worker(queue, PartitionId(pid), worker_id.clone());
                     receivers.push(Box::pin(rx));
                 }
             }
@@ -107,8 +107,7 @@ impl DispatcherService {
             }
 
             // Wait for the FIRST match from any partition (non-blocking across all)
-            let (result, _index, _remaining) =
-                futures::future::select_all(receivers).await;
+            let (result, _index, _remaining) = futures::future::select_all(receivers).await;
             // Remaining receivers are dropped — their senders become stale and will
             // be cleaned up on the next offer_task (try_match_task pops + retries).
 
@@ -154,12 +153,11 @@ impl DispatcherService {
         }
 
         // Update task status to RUNNING
-        if let Err(e) = sqlx::query(
-            "UPDATE tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1",
-        )
-        .bind(&envelope.task_id)
-        .execute(&mut *tx)
-        .await
+        if let Err(e) =
+            sqlx::query("UPDATE tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1")
+                .bind(&envelope.task_id)
+                .execute(&mut *tx)
+                .await
         {
             error!(task_id = %envelope.task_id, error = %e, "Failed to update task status");
             let _ = tx.rollback().await;
@@ -232,18 +230,13 @@ impl DispatcherService {
                                 signal_id: sig.id.clone(),
                                 task_id: sig.task_id,
                                 signal_name: sig.signal_name,
-                                payload: sig
-                                    .payload
-                                    .map(|v| v.to_string())
-                                    .unwrap_or_default(),
+                                payload: sig.payload.map(|v| v.to_string()).unwrap_or_default(),
                                 timestamp_ms: sig.created_at.timestamp_millis(),
                             })),
                         };
                         if tx.send(signal_response).await.is_ok() {
-                            let _ = valka_db::queries::signals::mark_delivered(
-                                &self.pool, &sig.id,
-                            )
-                            .await;
+                            let _ = valka_db::queries::signals::mark_delivered(&self.pool, &sig.id)
+                                .await;
                         }
                     }
                 }
@@ -372,9 +365,10 @@ impl DispatcherService {
                 let lease_extension = Duration::seconds(60); // Extend by 60 seconds
                 let new_lease = Utc::now() + lease_extension;
                 // Update heartbeat for all running runs of this task
-                if let Err(e) =
-                    valka_db::queries::task_runs::update_heartbeat_by_task(&self.pool, task_id, new_lease)
-                        .await
+                if let Err(e) = valka_db::queries::task_runs::update_heartbeat_by_task(
+                    &self.pool, task_id, new_lease,
+                )
+                .await
                 {
                     error!(task_id = %task_id, error = %e, "Failed to extend task run lease");
                 }

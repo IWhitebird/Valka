@@ -9,3 +9,5 @@ mod dispatcher_tests;
 mod lifecycle_tests;
 mod rest_api_tests;
 mod scheduler_tests;
+
+mod cluster_tests;

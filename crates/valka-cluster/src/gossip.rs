@@ -57,15 +57,9 @@ impl ClusterManager {
             .unwrap_or(&gossip_config.listen_addr)
             .parse()?;
 
-        let generation_id = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_millis() as u64;
+        let generation_id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
 
-        let chitchat_id = ChitchatId::new(
-            node_id.0.clone(),
-            generation_id,
-            advertise_addr,
-        );
+        let chitchat_id = ChitchatId::new(node_id.0.clone(), generation_id, advertise_addr);
 
         let config = ChitchatConfig {
             chitchat_id,
@@ -165,14 +159,8 @@ impl ClusterManager {
                 // Diff with current members
                 let old_members = members.read().await.clone();
 
-                let joined: Vec<String> = new_members
-                    .difference(&old_members)
-                    .cloned()
-                    .collect();
-                let left: Vec<String> = old_members
-                    .difference(&new_members)
-                    .cloned()
-                    .collect();
+                let joined: Vec<String> = new_members.difference(&old_members).cloned().collect();
+                let left: Vec<String> = old_members.difference(&new_members).cloned().collect();
 
                 if joined.is_empty() && left.is_empty() {
                     continue;
