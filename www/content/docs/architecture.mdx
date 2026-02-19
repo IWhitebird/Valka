@@ -1,0 +1,225 @@
+---
+title: Architecture
+description: How Valka works under the hood.
+---
+
+## Overview
+
+Valka is designed around a simple principle: **PostgreSQL is the source of truth, but the hot path is in-memory**.
+
+<Mermaid chart={`graph TD
+    RC[REST Clients] --> RA[REST API]
+    GC[gRPC Clients] --> GA[gRPC API]
+    RA --> MS[MatchingService<br/>Partition Tree]
+    GA --> MS
+
+    MS --> HP[Hot Path<br/>In-Memory Oneshot]
+    MS --> CP[Cold Path<br/>PG SKIP LOCKED]
+
+    HP --> D[Dispatcher<br/>gRPC Bidi Stream]
+    CP --> D
+
+    D --> WA[Worker A<br/>Rust SDK]
+    D --> WB[Worker B<br/>Go SDK]
+    D --> WC[Worker C<br/>Python SDK]
+
+    subgraph Scheduler
+        LR[Lease Reaper]
+        RE[Retry Engine]
+        DLQ[DLQ Mover]
+        DP[Delayed Promoter]
+    end
+
+    D -.-> Scheduler
+    EB[Event Broadcast<br/>tokio broadcast] -.-> D
+
+    style MS fill:#4f46e5,stroke:#6366f1,color:#fff
+    style HP fill:#059669,stroke:#10b981,color:#fff
+    style CP fill:#0284c7,stroke:#38bdf8,color:#fff
+    style D fill:#7c3aed,stroke:#8b5cf6,color:#fff
+    style WA fill:#ea580c,stroke:#f97316,color:#fff
+    style WB fill:#0891b2,stroke:#22d3ee,color:#fff
+    style WC fill:#ca8a04,stroke:#eab308,color:#fff
+`} />
+
+## Crate Architecture
+
+Valka is a Cargo workspace with 12 crates, each with a clear responsibility:
+
+| Crate | Purpose |
+|-------|---------|
+| `valka-proto` | Generated gRPC stubs from proto files |
+| `valka-core` | Shared types, configuration, error types, metrics |
+| `valka-db` | PostgreSQL pool, migrations, query modules |
+| `valka-matching` | In-memory matching service + partition tree + TaskReader |
+| `valka-dispatcher` | Worker gRPC stream management, heartbeat, task dispatch |
+| `valka-scheduler` | Lease reaper, retry engine, DLQ, delayed task promotion |
+| `valka-cluster` | chitchat gossip + consistent hash ring + node forwarder |
+| `valka-server` | Binary: assembles all services |
+| `valka-sdk` | Rust worker SDK |
+| `valka-cli` | Command-line interface |
+| `valka-tests` | Unit + integration test suite |
+
+<Mermaid chart={`graph LR
+    subgraph Server Binary
+        S[valka-server]
+    end
+
+    subgraph Core Libraries
+        P[valka-proto]
+        C[valka-core]
+        DB[valka-db]
+    end
+
+    subgraph Services
+        M[valka-matching]
+        DI[valka-dispatcher]
+        SC[valka-scheduler]
+        CL[valka-cluster]
+    end
+
+    subgraph Client Tools
+        SDK[valka-sdk]
+        CLI[valka-cli]
+        T[valka-tests]
+    end
+
+    S --> M
+    S --> DI
+    S --> SC
+    S --> CL
+    M --> DB
+    M --> C
+    DI --> DB
+    DI --> P
+    SC --> DB
+    CL --> C
+    SDK --> P
+    CLI --> P
+    T --> S
+
+    style S fill:#4f46e5,stroke:#6366f1,color:#fff
+    style DB fill:#0284c7,stroke:#38bdf8,color:#fff
+    style M fill:#059669,stroke:#10b981,color:#fff
+    style DI fill:#7c3aed,stroke:#8b5cf6,color:#fff
+`} />
+
+## The Hot Path
+
+When a task is created:
+
+1. Task is inserted into PostgreSQL with status `PENDING`
+2. The `MatchingService` checks if any worker is waiting for this queue
+3. If yes: the task is sent via an in-memory oneshot channel directly to the `Dispatcher`, which pushes it over the gRPC stream to the worker — **zero database polling**
+4. If no: the task stays `PENDING` in PostgreSQL for the cold path
+
+<Mermaid chart={`sequenceDiagram
+    participant C as Client
+    participant API as REST/gRPC API
+    participant PG as PostgreSQL
+    participant MS as MatchingService
+    participant D as Dispatcher
+    participant W as Worker
+
+    C->>API: CreateTask
+    API->>PG: INSERT task (PENDING)
+    API->>MS: offer_task()
+    alt Worker waiting
+        MS-->>D: oneshot channel
+        D->>W: TaskAssignment (gRPC stream)
+        D->>PG: UPDATE → RUNNING
+        W->>D: TaskResult
+        D->>PG: UPDATE → COMPLETED
+    else No worker waiting
+        Note over MS: Task stays PENDING in PG
+        W->>PG: SELECT FOR UPDATE SKIP LOCKED
+        PG-->>W: Claim task batch
+    end
+`} />
+
+## The Cold Path
+
+Workers that have no tasks periodically call the `TaskReader`, which:
+
+1. Queries PostgreSQL using `SELECT ... FOR UPDATE SKIP LOCKED`
+2. Claims a batch of `PENDING` tasks atomically
+3. Updates them to `DISPATCHING` and sends them to the worker
+
+`SKIP LOCKED` means multiple workers can poll concurrently without contention.
+
+## gRPC Bidirectional Streaming
+
+Each worker maintains a **single gRPC bidirectional stream** with the server. Over this stream:
+
+- **Server → Worker**: Task assignments, heartbeat pings, signal delivery
+- **Worker → Server**: Task results (success/failure), heartbeat pongs, log entries, signal acknowledgments
+
+<Mermaid chart={`sequenceDiagram
+    participant W as Worker
+    participant S as Server
+
+    W->>S: Session (open stream)
+    S->>W: Heartbeat Ping
+    W->>S: Heartbeat Pong
+
+    S->>W: TaskAssignment
+    W->>S: LogEntry
+    W->>S: LogEntry
+    W->>S: TaskResult (success)
+
+    S->>W: TaskSignal
+    W->>S: SignalAck
+
+    S->>W: Heartbeat Ping
+    W->>S: Heartbeat Pong
+`} />
+
+This eliminates per-task connection overhead and enables real-time communication.
+
+## Scheduler
+
+The scheduler runs as a set of background loops on the server (with PG advisory lock leader election in multi-node deployments):
+
+- **Lease Reaper**: Detects tasks stuck in `RUNNING` past their lease deadline and moves them to `RETRY` or `DEAD_LETTER`
+- **Retry Engine**: Picks up `RETRY` tasks and re-enqueues them as `PENDING` after the backoff delay
+- **DLQ Mover**: Moves tasks that have exhausted their max retries to `DEAD_LETTER`
+- **Delayed Promoter**: Promotes scheduled tasks to `PENDING` when their `run_at` time arrives
+
+## Clustering
+
+Valka supports multi-node deployments via:
+
+- **chitchat gossip**: Nodes discover each other and share state over UDP
+- **Consistent hash ring**: Queues are assigned to partitions, partitions to nodes
+- **Node forwarder**: Tasks routed to the wrong node are forwarded to the correct one with circuit breaker protection
+
+<Mermaid chart={`graph TD
+    subgraph Cluster
+        N1[Node 1<br/>Partitions 0-3]
+        N2[Node 2<br/>Partitions 4-7]
+        N3[Node 3<br/>Partitions 8-11]
+    end
+
+    N1 <-->|chitchat gossip<br/>UDP| N2
+    N2 <-->|chitchat gossip<br/>UDP| N3
+    N3 <-->|chitchat gossip<br/>UDP| N1
+
+    C[Client] -->|CreateTask<br/>queue: emails| N1
+    N1 -->|Forward<br/>wrong partition| N2
+
+    W1[Workers] --> N1
+    W2[Workers] --> N2
+    W3[Workers] --> N3
+
+    style N1 fill:#4f46e5,stroke:#6366f1,color:#fff
+    style N2 fill:#7c3aed,stroke:#8b5cf6,color:#fff
+    style N3 fill:#0284c7,stroke:#38bdf8,color:#fff
+`} />
+
+## Event Broadcasting
+
+All state changes emit events via `tokio::sync::broadcast`. Consumers include:
+
+- **gRPC event streams**: Clients can subscribe to real-time events
+- **SSE endpoint**: Browser-compatible event stream
+- **Web dashboard**: Uses SSE for live updates

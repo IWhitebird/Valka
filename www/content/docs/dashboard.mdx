@@ -1,0 +1,65 @@
+---
+title: Web Dashboard
+description: Real-time monitoring dashboard for tasks, workers, and events.
+---
+
+Valka includes a built-in web dashboard that is served directly by the Valka server. No additional setup is required — the dashboard is available as soon as the server starts.
+
+## Accessing the Dashboard
+
+Open your browser and navigate to the Valka server's HTTP address:
+
+```
+http://<your-server>:8989
+```
+
+The dashboard is a single-page application served alongside the REST API. There is no separate process or deployment step.
+
+## Pages
+
+### Dashboard
+
+The main overview page showing:
+- Active task counts by status
+- Recent task throughput
+- Connected worker count
+- Queue activity
+
+### Tasks
+
+Browse and filter all tasks:
+- Filter by queue, status, and date range
+- Search by task name or ID
+- View task details inline
+
+### Task Detail
+
+Deep dive into a specific task:
+- **Overview** — Status, input/output, metadata, timing
+- **Runs** — All execution attempts with worker info and duration
+- **Logs** — Real-time structured log viewer per run
+- **Signals** — Signal history with delivery status
+
+### Workers
+
+Monitor connected workers:
+- Worker name, queues, and concurrency
+- Active task count
+- Connection uptime
+- Last heartbeat timestamp
+
+### Events
+
+Real-time event stream showing:
+- Task state transitions
+- Worker connections and disconnections
+- Signal deliveries
+
+Uses Server-Sent Events (SSE) for live updates without polling.
+
+### Dead Letters
+
+Browse tasks that exhausted all retries:
+- Original task details and input
+- Error messages from failed attempts
+- Attempt count and timing

@@ -1,0 +1,139 @@
+---
+title: Clustering
+description: Multi-node deployment with gossip discovery and consistent hashing.
+---
+
+Valka supports horizontal scaling through a multi-node clustering architecture.
+
+## How It Works
+
+<Mermaid chart={`graph TD
+    subgraph Cluster
+        N1[Node 1<br/>Partitions 0-3]
+        N2[Node 2<br/>Partitions 4-7]
+        N3[Node 3<br/>Partitions 8-11]
+    end
+
+    N1 <-->|chitchat gossip<br/>UDP| N2
+    N2 <-->|chitchat gossip<br/>UDP| N3
+    N3 <-->|chitchat gossip<br/>UDP| N1
+
+    W1[Workers] --> N1
+    W2[Workers] --> N2
+    W3[Workers] --> N3
+
+    C[Client] -->|CreateTask| N1
+    N1 -.->|Forward if<br/>wrong partition| N2
+
+    style N1 fill:#4f46e5,stroke:#6366f1,color:#fff
+    style N2 fill:#7c3aed,stroke:#8b5cf6,color:#fff
+    style N3 fill:#0284c7,stroke:#38bdf8,color:#fff
+`} />
+
+### Components
+
+1. **chitchat gossip**: Nodes discover each other and exchange state over UDP (port 7280). Based on the [chitchat](https://crates.io/crates/chitchat) crate.
+
+2. **Consistent hash ring**: Queues are hashed to partitions (default 12), and partitions are assigned to nodes. When a node joins or leaves, only partitions that change ownership need to rebalance.
+
+3. **Node forwarder**: When a task arrives at the wrong node (the queue's partition belongs to another node), it is forwarded via gRPC with circuit breaker protection.
+
+## Configuration
+
+```toml
+[cluster]
+enabled = true
+node_id = "node-1"
+gossip_addr = "0.0.0.0:7280"
+advertise_addr = "10.0.0.1:7280"
+seeds = ["10.0.0.2:7280", "10.0.0.3:7280"]
+num_partitions = 12
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VALKA_CLUSTER__ENABLED` | `false` | Enable clustering |
+| `VALKA_CLUSTER__NODE_ID` | hostname | Unique node identifier |
+| `VALKA_CLUSTER__GOSSIP_ADDR` | `0.0.0.0:7280` | Gossip listen address |
+| `VALKA_CLUSTER__ADVERTISE_ADDR` | — | Address other nodes use to reach this node |
+| `VALKA_CLUSTER__SEEDS` | `[]` | Comma-separated seed node addresses |
+| `VALKA_CLUSTER__NUM_PARTITIONS` | `12` | Number of partitions in the hash ring |
+
+## Scheduler Leader Election
+
+In a cluster, only one node runs the scheduler (lease reaper, retry engine, DLQ mover, delayed promoter). Leader election uses **PostgreSQL advisory locks**:
+
+<Mermaid chart={`sequenceDiagram
+    participant N1 as Node 1
+    participant N2 as Node 2
+    participant PG as PostgreSQL
+
+    N1->>PG: pg_try_advisory_lock(1337)
+    PG-->>N1: true (leader)
+    N1->>N1: Start scheduler loops
+
+    N2->>PG: pg_try_advisory_lock(1337)
+    PG-->>N2: false (standby)
+
+    Note over N1: Node 1 crashes
+    N1--xPG: Connection lost
+    PG->>PG: Release advisory lock
+
+    N2->>PG: pg_try_advisory_lock(1337)
+    PG-->>N2: true (new leader)
+    N2->>N2: Start scheduler loops
+`} />
+
+## Docker Compose (Multi-Node)
+
+```yaml
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: valka
+      POSTGRES_PASSWORD: valka
+      POSTGRES_DB: valka
+
+  valka-1:
+    image: valka-server
+    environment:
+      VALKA_DATABASE__URL: postgresql://valka:valka@postgres:5432/valka
+      VALKA_CLUSTER__ENABLED: "true"
+      VALKA_CLUSTER__NODE_ID: "node-1"
+      VALKA_CLUSTER__GOSSIP_ADDR: "0.0.0.0:7280"
+      VALKA_CLUSTER__ADVERTISE_ADDR: "valka-1:7280"
+      VALKA_CLUSTER__SEEDS: "valka-2:7280,valka-3:7280"
+
+  valka-2:
+    image: valka-server
+    environment:
+      VALKA_DATABASE__URL: postgresql://valka:valka@postgres:5432/valka
+      VALKA_CLUSTER__ENABLED: "true"
+      VALKA_CLUSTER__NODE_ID: "node-2"
+      VALKA_CLUSTER__GOSSIP_ADDR: "0.0.0.0:7280"
+      VALKA_CLUSTER__ADVERTISE_ADDR: "valka-2:7280"
+      VALKA_CLUSTER__SEEDS: "valka-1:7280,valka-3:7280"
+
+  valka-3:
+    image: valka-server
+    environment:
+      VALKA_DATABASE__URL: postgresql://valka:valka@postgres:5432/valka
+      VALKA_CLUSTER__ENABLED: "true"
+      VALKA_CLUSTER__NODE_ID: "node-3"
+      VALKA_CLUSTER__GOSSIP_ADDR: "0.0.0.0:7280"
+      VALKA_CLUSTER__ADVERTISE_ADDR: "valka-3:7280"
+      VALKA_CLUSTER__SEEDS: "valka-1:7280,valka-2:7280"
+```
+
+## Circuit Breaker
+
+The node forwarder includes a circuit breaker to handle node failures:
+
+- **Closed** (normal): Requests forwarded normally
+- **Open** (tripped): After 3 consecutive failures, stops forwarding for 30s
+- **Half-open**: After cooldown, allows one probe request to test recovery
+
+If forwarding fails, the task is still persisted in PostgreSQL and will be picked up by the cold path on the correct node once it recovers.

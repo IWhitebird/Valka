@@ -1,0 +1,182 @@
+---
+title: Deployment
+description: Production deployment with Docker Compose, Kubernetes, and best practices.
+---
+
+## Docker Compose (Single Node)
+
+The simplest production deployment uses the provided compose file:
+
+```bash
+cd deploy/docker
+cp .env.example .env    # set a strong POSTGRES_PASSWORD
+docker compose up -d
+```
+
+This starts PostgreSQL 17 and the Valka server with the web dashboard, REST API on `:8989`, and gRPC on `:50051`.
+
+## Docker Image
+
+Run the Valka server image directly against an existing PostgreSQL instance:
+
+```bash
+docker run -d \
+  -e VALKA_DATABASE_URL=postgresql://user:pass@host:5432/valka \
+  -p 8989:8989 \
+  -p 50051:50051 \
+  ghcr.io/iwhitebird/valka:latest
+```
+
+The Docker image:
+- Runs as a non-root user (UID 1001)
+- Includes `curl` for health checks
+- Bundles the web dashboard and CLI tool
+- Exposes ports 8989 (HTTP), 50051 (gRPC), 7280/udp (gossip)
+
+## Kubernetes (Helm)
+
+A production-ready Helm chart is available at `deploy/helm/valka/`:
+
+```bash
+helm install valka deploy/helm/valka/ \
+  --set database.url=postgresql://valka:valka@postgres:5432/valka \
+  --set replicas=3
+```
+
+The chart uses a **StatefulSet** (not Deployment) for stable pod DNS names required by the gossip protocol.
+
+Key features:
+- PgBouncer sidecar for connection pooling (enabled by default)
+- Horizontal Pod Autoscaler support
+- Prometheus ServiceMonitor
+- Pod anti-affinity for high availability
+- Configurable partition count (default 12, should be a multiple of replica count)
+
+## PostgreSQL Recommendations
+
+### Connection Pooling
+
+For production, use **PgBouncer** between Valka and PostgreSQL:
+
+```yaml
+pgbouncer:
+  image: edoburu/pgbouncer
+  environment:
+    DATABASE_URL: postgresql://valka:valka@postgres:5432/valka
+    AUTH_TYPE: scram-sha-256
+    MAX_PREPARED_STATEMENTS: 100  # Required for sqlx
+    POOL_MODE: transaction
+    MAX_CLIENT_CONN: 200
+    DEFAULT_POOL_SIZE: 20
+```
+
+Key settings:
+- Use `edoburu/pgbouncer` image (not `pgbouncer/pgbouncer` which is stale)
+- `AUTH_TYPE=scram-sha-256` for PostgreSQL 17 compatibility
+- `MAX_PREPARED_STATEMENTS=100` is required for sqlx compatibility
+- PgBouncer listens on port 5432 with the edoburu image
+
+A pre-configured cluster compose file with PgBouncer is available at `deploy/docker/docker-compose.cluster.yml`.
+
+### Database Sizing
+
+| Workload | PostgreSQL | Valka Nodes | Max Connections |
+|----------|-----------|-------------|-----------------|
+| Small (< 100 tasks/min) | 1 vCPU, 1GB RAM | 1 | 20 |
+| Medium (< 1K tasks/min) | 2 vCPU, 4GB RAM | 2-3 | 50 |
+| Large (< 10K tasks/min) | 4 vCPU, 16GB RAM | 3-5 | 100 |
+
+### Maintenance
+
+- Enable `pg_stat_statements` for query monitoring
+- Set up regular `VACUUM` for the `tasks` and `task_runs` tables
+- Archive completed tasks older than your retention period
+- Monitor WAL size if using replication
+
+## Configuration Reference
+
+### Full Configuration File
+
+Mount a `valka.toml` into the container for file-based configuration. See `deploy/valka.example.toml` for a complete example.
+
+```toml
+[database]
+url = "postgresql://valka:valka@localhost:5432/valka"
+max_connections = 20
+
+[server]
+grpc_addr = "0.0.0.0:50051"
+http_addr = "0.0.0.0:8989"
+
+[scheduler]
+enabled = true
+lease_duration_secs = 300
+reaper_interval_secs = 30
+retry_interval_secs = 10
+delayed_promoter_interval_secs = 5
+
+[cluster]
+enabled = false
+node_id = "node-1"
+gossip_addr = "0.0.0.0:7280"
+advertise_addr = "10.0.0.1:7280"
+seeds = []
+num_partitions = 12
+
+[matching]
+task_reader_interval_ms = 500
+task_reader_batch_size = 50
+```
+
+### Environment Variables
+
+All configuration values can be set via environment variables with the `VALKA_` prefix and `__` for nesting:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VALKA_DATABASE_URL` | — | PostgreSQL connection string |
+| `VALKA_DATABASE__MAX_CONNECTIONS` | `20` | Connection pool size |
+| `VALKA_SERVER__GRPC_ADDR` | `0.0.0.0:50051` | gRPC listen address |
+| `VALKA_SERVER__HTTP_ADDR` | `0.0.0.0:8989` | HTTP listen address |
+| `VALKA_SCHEDULER__ENABLED` | `true` | Enable scheduler loops |
+| `VALKA_SCHEDULER__LEASE_DURATION_SECS` | `300` | Default lease timeout |
+| `VALKA_SCHEDULER__REAPER_INTERVAL_SECS` | `30` | Reaper check interval |
+| `RUST_LOG` | `valka=info` | Log level filter |
+
+## Health Checks
+
+```bash
+# HTTP health check
+curl http://localhost:8989/healthz
+
+# Prometheus metrics
+curl http://localhost:8989/metrics
+```
+
+For Docker/Kubernetes health checks:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 8989
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: 8989
+  initialDelaySeconds: 3
+  periodSeconds: 5
+```
+
+## Graceful Shutdown
+
+Valka supports graceful shutdown for both the server and workers:
+
+1. Server receives `SIGTERM`
+2. Server sends `ServerShutdown` message to all connected workers
+3. Workers stop accepting new tasks and drain in-progress work
+4. Server waits for all workers to disconnect (or timeout after 30s)
+5. Server shuts down cleanly

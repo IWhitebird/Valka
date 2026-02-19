@@ -1,0 +1,227 @@
+---
+title: REST API
+description: Complete REST API reference for task management, signals, and monitoring.
+---
+
+The Valka REST API runs on port `8989` by default. All endpoints return JSON.
+
+## Tasks
+
+### Create a Task
+
+```bash
+POST /api/v1/tasks
+```
+
+```json
+{
+  "queue_name": "emails",
+  "task_name": "send-welcome-email",
+  "input": { "to": "user@example.com", "subject": "Welcome!" },
+  "priority": 0,
+  "max_retries": 3,
+  "timeout_seconds": 300,
+  "idempotency_key": "welcome-user-123",
+  "metadata": { "source": "signup-flow" },
+  "scheduled_at": "2025-06-01T10:00:00Z"
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `queue_name` | string | Yes | — | Queue to place the task in |
+| `task_name` | string | Yes | — | Human-readable task identifier |
+| `input` | JSON | No | `null` | Task payload (any valid JSON) |
+| `priority` | integer | No | `0` | Higher = higher priority |
+| `max_retries` | integer | No | `3` | Max retry attempts |
+| `timeout_seconds` | integer | No | `300` | Lease timeout per attempt |
+| `idempotency_key` | string | No | `null` | Prevents duplicate tasks |
+| `metadata` | JSON | No | `null` | Arbitrary metadata |
+| `scheduled_at` | RFC 3339 | No | `null` | Delayed execution time |
+
+**Response** `201 Created`:
+
+```json
+{
+  "id": "01912345-6789-7abc-def0-123456789abc",
+  "queue_name": "emails",
+  "task_name": "send-welcome-email",
+  "status": "PENDING",
+  "priority": 0,
+  "max_retries": 3,
+  "attempt_count": 0,
+  "input": { "to": "user@example.com", "subject": "Welcome!" },
+  "created_at": "2025-01-15T10:00:00Z",
+  "updated_at": "2025-01-15T10:00:00Z"
+}
+```
+
+### Get a Task
+
+```bash
+GET /api/v1/tasks/{task_id}
+```
+
+Returns the full task object including `output`, `error_message`, and timing fields.
+
+### List Tasks
+
+```bash
+GET /api/v1/tasks?queue_name=emails&status=RUNNING&limit=50&offset=0
+```
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `queue_name` | string | — | Filter by queue |
+| `status` | string | — | Filter by status |
+| `limit` | integer | `50` | Max results |
+| `offset` | integer | `0` | Pagination offset |
+
+### Cancel a Task
+
+```bash
+POST /api/v1/tasks/{task_id}/cancel
+```
+
+Cancels a task in `PENDING`, `DISPATCHING`, or `RUNNING` state.
+
+### Delete a Task
+
+```bash
+DELETE /api/v1/tasks/{task_id}
+```
+
+### Clear All Tasks
+
+```bash
+DELETE /api/v1/tasks
+```
+
+Returns `{ "deleted_count": 42 }`.
+
+## Signals
+
+### Send a Signal
+
+```bash
+POST /api/v1/tasks/{task_id}/signal
+```
+
+```json
+{
+  "signal_name": "progress_request",
+  "payload": { "include_stats": true }
+}
+```
+
+**Response** `201 Created`:
+
+```json
+{
+  "signal_id": "01912345-...",
+  "delivered": true
+}
+```
+
+### List Signals
+
+```bash
+GET /api/v1/tasks/{task_id}/signals?status=PENDING
+```
+
+## Task Runs
+
+### Get Runs
+
+```bash
+GET /api/v1/tasks/{task_id}/runs
+```
+
+Returns all execution attempts with worker info, timing, and output.
+
+### Get Run Logs
+
+```bash
+GET /api/v1/tasks/{task_id}/runs/{run_id}/logs?limit=1000&after_id=...
+```
+
+## Workers
+
+### List Workers
+
+```bash
+GET /api/v1/workers
+```
+
+```json
+[
+  {
+    "id": "01912345-...",
+    "name": "email-worker",
+    "queues": ["emails"],
+    "concurrency": 8,
+    "active_tasks": 3,
+    "status": "CONNECTED",
+    "last_heartbeat": "2025-01-15T10:00:30Z",
+    "connected_at": "2025-01-15T09:00:00Z"
+  }
+]
+```
+
+## Dead Letter Queue
+
+### List Dead Letters
+
+```bash
+GET /api/v1/dead-letters?queue_name=emails&limit=50&offset=0
+```
+
+## Events (SSE)
+
+### Subscribe to Events
+
+```bash
+GET /api/v1/events
+```
+
+Server-Sent Events stream. Each event:
+
+```
+event: task_event
+data: {"event_id":"...","task_id":"...","queue_name":"emails","new_status":"COMPLETED","timestamp_ms":1705312800000}
+```
+
+## Monitoring
+
+### Health Check
+
+```bash
+GET /healthz
+```
+
+Returns `"ok"` with status `200`.
+
+### Prometheus Metrics
+
+```bash
+GET /metrics
+```
+
+Returns metrics in Prometheus text format.
+
+## Error Responses
+
+All errors follow this format:
+
+```json
+{
+  "error": "NOT_FOUND",
+  "message": "Task not found: 01912345-..."
+}
+```
+
+| Status | Code | Description |
+|--------|------|-------------|
+| 404 | `NOT_FOUND` | Resource not found |
+| 422 | `INVALID_STATE` | Task in invalid state for the operation |
+| 500 | `INTERNAL_ERROR` | Server error |

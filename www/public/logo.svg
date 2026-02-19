@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <defs>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#818cf8"/>
+    </linearGradient>
+    <linearGradient id="accent2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#818cf8"/>
+      <stop offset="100%" stop-color="#c084fc"/>
+    </linearGradient>
+  </defs>
+  <!-- V shape (matches banner.svg) -->
+  <path d="M3 3 L16 26 L14 26 L1 3Z" fill="url(#accent)" opacity="0.95"/>
+  <path d="M29 3 L16 26 L18 26 L31 3Z" fill="url(#accent2)" opacity="0.95"/>
+  <!-- Center diamond -->
+  <rect x="13.5" y="23.5" width="5" height="5" rx="0.8" transform="rotate(45 16 26)" fill="url(#accent)" opacity="0.85"/>
+</svg>

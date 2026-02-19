@@ -1,0 +1,125 @@
+---
+title: CLI Reference
+description: Command-line interface for managing tasks, workers, and logs.
+---
+
+The Valka CLI provides direct access to the gRPC API from the terminal.
+
+## Installation
+
+The CLI is bundled in the Valka Docker image at `/usr/local/bin/valka`. You can run it directly:
+
+```bash
+docker exec -it <valka-container> valka --help
+```
+
+Or install it as a standalone binary:
+
+```bash
+cargo install valka-cli
+```
+
+## Global Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--server` | `http://localhost:50051` | gRPC server address |
+
+## Task Commands
+
+### Create a Task
+
+```bash
+valka task create --queue emails --name send-welcome \
+  --input '{"to": "user@example.com"}' \
+  --max-retries 3 \
+  --timeout 300
+```
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--queue` | Yes | — | Target queue |
+| `--name` | Yes | — | Task name |
+| `--input` | No | `null` | JSON payload |
+| `--priority` | No | `0` | Task priority |
+| `--max-retries` | No | `3` | Max retries |
+| `--timeout` | No | `300` | Timeout in seconds |
+
+### Get a Task
+
+```bash
+valka task get 01912345-6789-7abc-def0-123456789abc
+```
+
+Displays the full task details including status, input, output, and timing.
+
+### List Tasks
+
+```bash
+valka task list --queue emails --status RUNNING --limit 20
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--queue` | — | Filter by queue name |
+| `--status` | — | Filter by status |
+| `--limit` | `20` | Max results |
+
+**Status values**: `PENDING`, `DISPATCHING`, `RUNNING`, `COMPLETED`, `FAILED`, `RETRY`, `DEAD_LETTER`, `CANCELLED`
+
+### Cancel a Task
+
+```bash
+valka task cancel 01912345-6789-7abc-def0-123456789abc
+```
+
+## Log Commands
+
+### Tail Logs
+
+Stream logs for a task run in real-time:
+
+```bash
+valka logs tail <TASK_RUN_ID>
+```
+
+Output format:
+```
+2025-01-15T10:00:01Z [INFO]  Processing email task: send-welcome
+2025-01-15T10:00:02Z [DEBUG] Attempt #1
+2025-01-15T10:00:03Z [INFO]  Email sent to user@example.com
+```
+
+## Examples
+
+### Full Workflow
+
+```bash
+# Create a task
+TASK_ID=$(valka task create --queue emails --name send-email \
+  --input '{"to": "hello@example.com"}' | jq -r '.id')
+
+echo "Created task: $TASK_ID"
+
+# Watch the task
+valka task get $TASK_ID
+
+# List all running tasks
+valka task list --status RUNNING
+
+# Cancel if needed
+valka task cancel $TASK_ID
+```
+
+### Monitoring
+
+```bash
+# Check all pending tasks across queues
+valka task list --status PENDING --limit 100
+
+# List failed tasks
+valka task list --status FAILED
+
+# Check dead letter queue
+valka task list --status DEAD_LETTER
+```

@@ -1,0 +1,120 @@
+---
+title: Python SDK
+description: Build workers and manage tasks with the Python SDK.
+---
+
+## Installation
+
+```bash
+pip install valka
+```
+
+The Python SDK provides:
+- **ValkaWorker** — Process tasks from queues
+- **ValkaClient** — Create, get, list, and cancel tasks
+- Full async/await support
+
+## Worker
+
+```python
+import asyncio
+from valka import ValkaWorker, TaskContext
+
+async def handle_task(ctx: TaskContext) -> dict:
+    data = ctx.input()
+    to = data.get("to", "unknown") if data else "unknown"
+
+    await ctx.log(f"Processing email task: {ctx.task_name}")
+    await ctx.debug(f"Attempt #{ctx.attempt_number}")
+
+    # Simulate work
+    await asyncio.sleep(1)
+
+    await ctx.log(f"Email sent to {to}")
+    return {"delivered_to": to, "status": "sent"}
+
+async def main():
+    worker = (
+        ValkaWorker.builder()
+        .name("email-worker")
+        .server_addr("localhost:50051")
+        .queues(["emails", "notifications"])
+        .concurrency(4)
+        .handler(handle_task)
+        .build()
+    )
+    await worker.run()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Builder Options
+
+| Method | Description |
+|--------|-------------|
+| `.name(name)` | Worker name |
+| `.server_addr(addr)` | Valka server gRPC address |
+| `.queues([...])` | Queues to listen on |
+| `.concurrency(n)` | Max concurrent tasks |
+| `.handler(fn)` | Async function to process tasks |
+
+## Task Context
+
+```python
+async def handle_task(ctx: TaskContext) -> dict:
+    # Access metadata
+    name = ctx.task_name
+    attempt = ctx.attempt_number
+    task_id = ctx.task_id
+
+    # Parse input (returns dict)
+    data = ctx.input()
+
+    # Logging
+    await ctx.log("Processing...")
+    await ctx.debug("Debug info")
+
+    # Return output (any JSON-serializable dict)
+    return {"result": "done"}
+```
+
+## Client
+
+```python
+from valka import ValkaClient
+
+async def main():
+    client = ValkaClient("localhost:50051")
+
+    # Create a task
+    task = await client.create_task(
+        task_name="send-email",
+        queue="emails",
+        input={"to": "user@example.com", "subject": "Welcome!"},
+        max_retries=3,
+    )
+    print(f"Created task: {task.id}")
+
+    # Get task status
+    task = await client.get_task(task.id)
+    print(f"Status: {task.status}")
+```
+
+## Signal Handling
+
+```python
+worker = (
+    ValkaWorker.builder()
+    .name("worker")
+    .server_addr("localhost:50051")
+    .queues(["emails"])
+    .concurrency(4)
+    .handler(handle_task)
+    .on_signal(handle_signal)
+    .build()
+)
+
+async def handle_signal(signal):
+    print(f"Signal received: {signal.signal_type}")
+```

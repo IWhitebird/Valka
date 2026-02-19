@@ -1,0 +1,160 @@
+---
+title: Go SDK
+description: Build workers and manage tasks with the Go SDK.
+---
+
+## Installation
+
+```bash
+go get github.com/IWhitebird/Valka/sdks/go
+```
+
+The Go SDK provides:
+- **Worker** — Process tasks from queues with functional options
+- **Client** — Create, get, list, and cancel tasks
+
+## Worker
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "time"
+
+    valka "github.com/IWhitebird/Valka/sdks/go"
+)
+
+func main() {
+    worker, err := valka.NewWorker(
+        valka.WithName("email-worker"),
+        valka.WithServerAddr("localhost:50051"),
+        valka.WithQueues("emails", "notifications"),
+        valka.WithConcurrency(4),
+        valka.WithHandler(handleTask),
+    )
+    if err != nil {
+        log.Fatalf("Failed to create worker: %v", err)
+    }
+
+    log.Println("Starting worker...")
+    if err := worker.Run(context.Background()); err != nil {
+        log.Fatalf("Worker error: %v", err)
+    }
+}
+
+func handleTask(ctx *valka.TaskContext) (interface{}, error) {
+    var input map[string]interface{}
+    if err := ctx.Input(&input); err != nil {
+        return nil, err
+    }
+
+    to := "unknown"
+    if v, ok := input["to"].(string); ok {
+        to = v
+    }
+
+    ctx.Log(fmt.Sprintf("Processing email task: %s", ctx.TaskName))
+    ctx.Debug(fmt.Sprintf("Attempt #%d", ctx.AttemptNumber))
+
+    time.Sleep(1 * time.Second)
+
+    ctx.Log(fmt.Sprintf("Email sent to %s", to))
+    return map[string]interface{}{
+        "delivered_to": to,
+        "status":       "sent",
+    }, nil
+}
+```
+
+### Functional Options
+
+| Option | Description |
+|--------|-------------|
+| `WithName(name)` | Worker name |
+| `WithServerAddr(addr)` | Valka server gRPC address |
+| `WithQueues(queues...)` | Queues to listen on |
+| `WithConcurrency(n)` | Max concurrent tasks |
+| `WithHandler(fn)` | Function to process tasks |
+
+## Task Context
+
+```go
+func handleTask(ctx *valka.TaskContext) (interface{}, error) {
+    // Access metadata
+    name := ctx.TaskName
+    attempt := ctx.AttemptNumber
+    taskID := ctx.TaskID
+
+    // Parse input into struct
+    var input MyInput
+    if err := ctx.Input(&input); err != nil {
+        return nil, err
+    }
+
+    // Logging
+    ctx.Log("Processing...")
+    ctx.Debug("Debug info")
+
+    // Return output (any JSON-serializable value)
+    return map[string]interface{}{"result": "done"}, nil
+}
+```
+
+## Client
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+
+    valka "github.com/IWhitebird/Valka/sdks/go"
+)
+
+func main() {
+    client, err := valka.NewClient("localhost:50051")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer client.Close()
+
+    // Create a task
+    task, err := client.CreateTask(context.Background(), &valka.CreateTaskRequest{
+        TaskName:   "send-email",
+        Queue:      "emails",
+        Input:      map[string]interface{}{"to": "user@example.com"},
+        MaxRetries: 3,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("Created task: %s\n", task.ID)
+
+    // Get task status
+    task, err = client.GetTask(context.Background(), task.ID)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("Status: %s\n", task.Status)
+}
+```
+
+## Signal Handling
+
+```go
+worker, _ := valka.NewWorker(
+    valka.WithName("worker"),
+    valka.WithServerAddr("localhost:50051"),
+    valka.WithQueues("emails"),
+    valka.WithConcurrency(4),
+    valka.WithHandler(handleTask),
+    valka.WithSignalHandler(func(signal *valka.Signal) {
+        fmt.Printf("Signal received: %s\n", signal.Type)
+    }),
+)
+```
