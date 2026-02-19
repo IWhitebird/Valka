@@ -13,7 +13,7 @@
 #   Node 3: gRPC :50063, REST :8993
 
 x-valka-follower: &valka-follower
-  image: iwhitebird/valka
+  image: ghcr.io/iwhitebird/valka:latest
   build:
     context: ../../
     dockerfile: Dockerfile
@@ -59,7 +59,7 @@ services:
 
   # Migration leader: runs migrations on direct PG, then starts normally.
   valka-1:
-    image: iwhitebird/valka
+    image: ghcr.io/iwhitebird/valka:latest
     container_name: valka-1
     build:
       context: ../../
