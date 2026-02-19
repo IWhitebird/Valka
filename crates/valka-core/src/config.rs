@@ -10,6 +10,12 @@ pub struct ServerConfig {
     pub grpc_addr: String,
     pub http_addr: String,
     pub database_url: String,
+    /// Direct PG URL for migrations (bypasses PgBouncer). Falls back to database_url.
+    pub migration_database_url: Option<String>,
+    /// Run migrations then exit. Used by Helm pre-install Jobs.
+    pub migrate_only: bool,
+    /// Skip migrations on startup. Follower nodes set this when the leader handles migrations.
+    pub skip_migrations: bool,
     pub web_dir: String,
     pub database: DatabaseConfig,
     pub gossip: GossipConfig,
@@ -65,6 +71,9 @@ impl Default for ServerConfig {
             grpc_addr: "0.0.0.0:50051".to_string(),
             http_addr: "0.0.0.0:8989".to_string(),
             database_url: "postgresql://valka:valka@localhost:5432/valka".to_string(),
+            migration_database_url: None,
+            migrate_only: false,
+            skip_migrations: false,
             web_dir: "web/dist".to_string(),
             database: DatabaseConfig::default(),
             gossip: GossipConfig::default(),

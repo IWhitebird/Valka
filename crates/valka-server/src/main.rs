@@ -33,6 +33,20 @@ async fn main() -> Result<()> {
     let config_path = std::env::args().nth(1);
     let mut config = valka_core::ServerConfig::load(config_path.as_deref())?;
 
+    // Resolve migration URL: use direct PG connection if configured (bypasses PgBouncer).
+    let migration_url = config
+        .migration_database_url
+        .as_deref()
+        .unwrap_or(&config.database_url);
+
+    // Migrate-only mode: run migrations then exit. Used by Helm pre-install Jobs.
+    if config.migrate_only {
+        info!("Running in migrate-only mode");
+        valka_db::migrations::run_migrations(migration_url).await?;
+        info!("Migrations complete, exiting");
+        return Ok(());
+    }
+
     if config.node_id.is_empty() {
         config.node_id = uuid::Uuid::now_v7().to_string();
     }
@@ -40,12 +54,15 @@ async fn main() -> Result<()> {
 
     info!(node_id = %node_id, "Node ID assigned");
 
-    // Create database pool
+    // Create database pool (through PgBouncer in cluster mode)
     let pool =
         valka_db::pool::create_pool(&config.database_url, config.database.max_connections).await?;
 
-    // Run migrations
-    valka_db::migrations::run_migrations(&pool).await?;
+    // Run migrations. In cluster mode only the leader node runs this;
+    // follower nodes set skip_migrations=true.
+    if !config.skip_migrations {
+        valka_db::migrations::run_migrations(migration_url).await?;
+    }
 
     // Recover orphaned DISPATCHING tasks (crash recovery)
     let recovered = valka_db::queries::tasks::recover_orphaned_dispatching(&pool).await?;

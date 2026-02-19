@@ -1,0 +1,122 @@
+replicaCount: 3
+
+image:
+  repository: ghcr.io/valka-queue/valka
+  pullPolicy: IfNotPresent
+  tag: ""  # defaults to Chart.appVersion
+
+nameOverride: ""
+fullnameOverride: ""
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+service:
+  type: ClusterIP
+  grpcPort: 50051
+  httpPort: 8989
+
+# -- Valka configuration (rendered into ConfigMap as valka.toml)
+config:
+  numPartitions: 12  # should be a multiple of replicaCount
+
+  gossip:
+    clusterName: valka
+    port: 7280
+
+  database:
+    maxConnections: 5  # per-node, keep low with PgBouncer
+
+  matching:
+    maxBufferPerPartition: 1000
+    taskReaderBatchSize: 50
+
+  scheduler:
+    leaseTimeoutSecs: 60
+    reaperIntervalSecs: 10
+
+  logIngester:
+    batchSize: 100
+    flushIntervalMs: 500
+
+# -- Database connection
+database:
+  # Use an existing Secret instead of creating one
+  existingSecret: ""
+  secretKey: database-url
+  # Direct URL (stored in a new Secret if existingSecret is empty)
+  url: "postgresql://valka:valka@localhost:5432/valka"
+
+# -- PgBouncer sidecar
+pgbouncer:
+  enabled: true
+  poolMode: transaction
+  maxClientConn: 200
+  defaultPoolSize: 25
+  image:
+    repository: edoburu/pgbouncer
+    tag: "latest"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+# -- External PostgreSQL (used by PgBouncer)
+postgresql:
+  host: ""         # required when pgbouncer.enabled
+  port: 5432
+  database: valka
+  username: valka
+  password: ""
+  existingSecret: ""  # Secret with key "password"
+
+# -- Horizontal Pod Autoscaler
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+# -- Prometheus ServiceMonitor
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  fsGroup: 1001
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - valka
+          topologyKey: kubernetes.io/hostname

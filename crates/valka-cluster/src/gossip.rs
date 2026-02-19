@@ -51,11 +51,15 @@ impl ClusterManager {
         grpc_addr: &str,
     ) -> anyhow::Result<Self> {
         let listen_addr: std::net::SocketAddr = gossip_config.listen_addr.parse()?;
-        let advertise_addr: std::net::SocketAddr = gossip_config
+        let raw_advertise = gossip_config
             .advertise_addr
             .as_deref()
-            .unwrap_or(&gossip_config.listen_addr)
-            .parse()?;
+            .unwrap_or(&gossip_config.listen_addr);
+        // Resolve hostname to IP (supports both "1.2.3.4:7280" and "hostname:7280")
+        let advertise_addr: std::net::SocketAddr = tokio::net::lookup_host(raw_advertise)
+            .await?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("failed to resolve advertise_addr: {raw_advertise}"))?;
 
         let generation_id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
 
