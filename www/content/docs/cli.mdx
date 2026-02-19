@@ -38,8 +38,8 @@ valka task create --queue emails --name send-welcome \
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
-| `--queue` | Yes | — | Target queue |
-| `--name` | Yes | — | Task name |
+| `--queue` | Yes | - | Target queue |
+| `--name` | Yes | - | Task name |
 | `--input` | No | `null` | JSON payload |
 | `--priority` | No | `0` | Task priority |
 | `--max-retries` | No | `3` | Max retries |
@@ -61,8 +61,8 @@ valka task list --queue emails --status RUNNING --limit 20
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--queue` | — | Filter by queue name |
-| `--status` | — | Filter by status |
+| `--queue` | - | Filter by queue name |
+| `--status` | - | Filter by status |
 | `--limit` | `20` | Max results |
 
 **Status values**: `PENDING`, `DISPATCHING`, `RUNNING`, `COMPLETED`, `FAILED`, `RETRY`, `DEAD_LETTER`, `CANCELLED`

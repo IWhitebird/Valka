@@ -1,11 +1,6 @@
-import type { Route } from './+types/not-found';
 import { HomeLayout } from 'fumadocs-ui/layouts/home';
-import { Link } from 'react-router';
+import Link from 'next/link';
 import { baseOptions } from '@/lib/layout.shared';
-
-export function meta({}: Route.MetaArgs) {
-  return [{ title: 'Not Found — Valka' }];
-}
 
 export default function NotFound() {
   return (
@@ -17,7 +12,7 @@ export default function NotFound() {
         </p>
         <Link
           className="rounded-full bg-fd-primary px-4 py-2.5 text-sm font-medium text-fd-primary-foreground"
-          to="/docs"
+          href="/docs"
         >
           Back to Docs
         </Link>

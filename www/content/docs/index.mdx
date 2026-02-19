@@ -7,22 +7,22 @@ description: What is Valka and why does it exist?
 
 Valka is a **distributed task queue** built entirely in Rust with a single external dependency: **PostgreSQL**.
 
-Most task queues bolt together a message broker, a database, and a cache. Every moving part is another thing to deploy, monitor, and debug at 3 AM. Valka takes a different approach — PostgreSQL is the single source of truth, and an in-memory matching engine with gRPC bidirectional streaming replaces the message broker entirely.
+Most task queues bolt together a message broker, a database, and a cache. Every moving part is another thing to deploy, monitor, and debug at 3 AM. Valka takes a different approach: PostgreSQL is the single source of truth, and an in-memory matching engine with gRPC bidirectional streaming replaces the message broker entirely.
 
 The result: simple to operate, easy to reason about, and fast where it matters.
 
 ## Key Features
 
-- **One dependency** — If you have Postgres, you can run Valka
-- **Zero-latency hot path** — Tasks are matched to waiting workers in-memory, no polling
-- **Polyglot SDKs** — Rust, TypeScript, Go, and Python with the same builder pattern
-- **gRPC bidirectional streaming** — Single connection per worker, real-time task delivery
-- **Automatic retries** — Exponential backoff with dead letter queue
-- **Task signals** — Send real-time signals to running workers
-- **Observable** — Real-time log streaming, event feeds, Prometheus metrics, web dashboard
-- **Multi-node clustering** — chitchat gossip + consistent hash ring
-- **Idempotency keys** — Prevent duplicate task execution
-- **Scheduled tasks** — Delayed and deferred task execution
+- **One dependency**: if you have Postgres, you can run Valka
+- **Zero-latency hot path**: tasks are matched to waiting workers in-memory, no polling
+- **Polyglot SDKs**: Rust, TypeScript, Go, and Python with the same builder pattern
+- **gRPC bidirectional streaming**: single connection per worker, real-time task delivery
+- **Automatic retries**: exponential backoff with dead letter queue
+- **Task signals**: send real-time signals to running workers
+- **Observable**: real-time log streaming, event feeds, Prometheus metrics, web dashboard
+- **Multi-node clustering**: chitchat gossip + consistent hash ring
+- **Idempotency keys**: prevent duplicate task execution
+- **Scheduled tasks**: delayed and deferred task execution
 
 ## How It Works
 
@@ -62,6 +62,6 @@ Any language can also interact via the REST API on port `8989`.
 
 ## Next Steps
 
-- [Quick Start](/docs/quick-start) — Get Valka running in minutes
-- [Architecture](/docs/architecture) — Deep dive into how Valka works
-- [Task Lifecycle](/docs/task-lifecycle) — Understand task states and transitions
+- [Quick Start](/docs/quick-start): get Valka running in minutes
+- [Architecture](/docs/architecture): deep dive into how Valka works
+- [Task Lifecycle](/docs/task-lifecycle): understand task states and transitions

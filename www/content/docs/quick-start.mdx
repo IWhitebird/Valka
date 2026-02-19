@@ -9,12 +9,47 @@ description: Get Valka running in minutes with Docker Compose.
 
 ## 1. Start Valka
 
-Clone the repository and start the services with Docker Compose:
+Create a `docker-compose.yml` file:
+
+```yaml title="docker-compose.yml"
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: valka
+      POSTGRES_PASSWORD: valka
+      POSTGRES_DB: valka
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U valka"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  valka:
+    image: ghcr.io/iwhitebird/valka:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      VALKA_DATABASE_URL: postgresql://valka:valka@postgres:5432/valka
+      VALKA_GRPC_ADDR: "0.0.0.0:50051"
+      VALKA_HTTP_ADDR: "0.0.0.0:8989"
+      RUST_LOG: valka=info,tower_http=info
+    ports:
+      - "50051:50051"
+      - "8989:8989"
+
+volumes:
+  pgdata:
+```
+
+Start the services:
 
 ```bash
-git clone https://github.com/IWhitebird/Valka.git
-cd Valka/deploy/docker
-cp .env.example .env    # edit credentials if needed
 docker compose up -d
 ```
 
@@ -72,10 +107,10 @@ See the [SDK documentation](/docs/sdks/rust) for Rust, Python, and Go examples.
 
 ## 5. Monitor
 
-Head back to the dashboard at [http://localhost:8989](http://localhost:8989) to watch tasks flow through the system in real time — from `PENDING` to `RUNNING` to `COMPLETED`.
+Head back to the dashboard at [http://localhost:8989](http://localhost:8989) to watch tasks flow through the system in real time, from `PENDING` to `RUNNING` to `COMPLETED`.
 
 ## Next Steps
 
-- [Installation & Configuration](/docs/installation) — Configuration options and environment variables
-- [Deployment](/docs/deployment) — Production deployment with clustering, PgBouncer, and Kubernetes
-- [SDK Documentation](/docs/sdks/rust) — Choose your language and start building
+- [Installation & Configuration](/docs/installation): configuration options and environment variables
+- [Deployment](/docs/deployment): production deployment with clustering, PgBouncer, and Kubernetes
+- [SDK Documentation](/docs/sdks/rust): choose your language and start building

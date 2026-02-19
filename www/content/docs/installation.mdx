@@ -5,11 +5,48 @@ description: Deploy Valka with Docker and configure it for your environment.
 
 ## Docker Compose (Recommended)
 
-The recommended way to run Valka is with the provided Docker Compose file:
+Create a `docker-compose.yml` file and start the services:
+
+```yaml title="docker-compose.yml"
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: valka
+      POSTGRES_PASSWORD: valka
+      POSTGRES_DB: valka
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U valka"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    shm_size: 128mb
+
+  valka:
+    image: ghcr.io/iwhitebird/valka:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      VALKA_DATABASE_URL: postgresql://valka:valka@postgres:5432/valka
+      VALKA_GRPC_ADDR: "0.0.0.0:50051"
+      VALKA_HTTP_ADDR: "0.0.0.0:8989"
+      RUST_LOG: valka=info,tower_http=info
+    ports:
+      - "50051:50051"
+      - "8989:8989"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+```
 
 ```bash
-cd deploy/docker
-cp .env.example .env    # edit credentials before deploying
 docker compose up -d
 ```
 
@@ -34,14 +71,6 @@ docker run -d \
 
 The image includes the Valka server, CLI tool, and the web dashboard. It runs as a non-root user (UID 1001) and includes `curl` for health checks.
 
-To build the image from source instead:
-
-```bash
-git clone https://github.com/IWhitebird/Valka.git
-cd Valka
-docker build -t valka .
-```
-
 ## Configuration
 
 Valka uses layered configuration via [Figment](https://github.com/SergioBenitez/Figment):
@@ -52,7 +81,7 @@ Valka uses layered configuration via [Figment](https://github.com/SergioBenitez/
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VALKA_DATABASE_URL` | — | PostgreSQL connection string (required) |
+| `VALKA_DATABASE_URL` | - | PostgreSQL connection string (required) |
 | `VALKA_DATABASE__MAX_CONNECTIONS` | `20` | Connection pool size |
 | `VALKA_GRPC_ADDR` | `0.0.0.0:50051` | gRPC listen address |
 | `VALKA_HTTP_ADDR` | `0.0.0.0:8989` | REST/HTTP listen address |
@@ -62,9 +91,18 @@ All configuration values can be set via environment variables with the `VALKA_` 
 
 ### Configuration File
 
-Mount a `valka.toml` into the container at the working directory for file-based configuration:
+Mount a `valka.toml` into the container at `/etc/valka/` and pass its path as the first argument:
 
-```toml
+```bash
+docker run -d \
+  -v ./valka.toml:/etc/valka/valka.toml:ro \
+  -p 8989:8989 \
+  -p 50051:50051 \
+  ghcr.io/iwhitebird/valka:latest \
+  /etc/valka/valka.toml
+```
+
+```toml title="valka.toml"
 [database]
 url = "postgresql://valka:valka@postgres:5432/valka"
 max_connections = 20
@@ -81,7 +119,7 @@ retry_interval_secs = 10
 
 ## Database
 
-Valka requires **PostgreSQL 14+** (17 recommended). Migrations run automatically on server startup — no manual setup required.
+Valka requires **PostgreSQL 14+** (17 recommended). Migrations run automatically on server startup, no manual setup required.
 
 ### Tables
 
