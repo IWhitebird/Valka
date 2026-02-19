@@ -1,0 +1,133 @@
+---
+title: Rust SDK
+description: Build workers and manage tasks with the Rust SDK.
+---
+
+## Installation
+
+```bash
+cargo add valka-sdk
+```
+
+The Rust SDK provides two main components:
+- **ValkaClient** — Create, get, list, and cancel tasks
+- **ValkaWorker** — Process tasks from queues
+
+## Worker
+
+Build a worker with the builder pattern:
+
+```rust
+use valka_sdk::{TaskContext, ValkaWorker};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let worker = ValkaWorker::builder()
+        .name("email-worker")
+        .server_addr("http://127.0.0.1:50051")
+        .queues(&["emails"])
+        .concurrency(4)
+        .handler(handle_task)
+        .build()
+        .await?;
+
+    worker.run().await?;
+    Ok(())
+}
+
+async fn handle_task(ctx: TaskContext) -> Result<serde_json::Value, String> {
+    let input: serde_json::Value = ctx
+        .input()
+        .map_err(|e| format!("Failed to parse input: {e}"))?;
+
+    let to = input
+        .get("to")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    ctx.log(&format!("Sending email to {to}...")).await;
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    ctx.log("Email sent successfully").await;
+
+    Ok(serde_json::json!({
+        "delivered_to": to,
+        "status": "sent"
+    }))
+}
+```
+
+### Builder Options
+
+| Method | Description |
+|--------|-------------|
+| `.name(name)` | Worker name (used for identification) |
+| `.server_addr(addr)` | Valka server gRPC address |
+| `.queues(&[...])` | List of queues to listen on |
+| `.concurrency(n)` | Max concurrent tasks |
+| `.handler(fn)` | Async function to process tasks |
+
+## Task Context
+
+The `TaskContext` provides access to task metadata and utilities:
+
+```rust
+async fn handle_task(ctx: TaskContext) -> Result<serde_json::Value, String> {
+    // Access task metadata
+    let name = &ctx.task_name;
+    let attempt = ctx.attempt_number;
+    let task_id = &ctx.task_id;
+
+    // Parse input
+    let input: MyInput = ctx.input().map_err(|e| e.to_string())?;
+
+    // Send logs
+    ctx.log("Processing...").await;
+    ctx.debug("Debug info").await;
+
+    // Return output
+    Ok(serde_json::json!({"result": "done"}))
+}
+```
+
+## Client
+
+Use `ValkaClient` to manage tasks programmatically:
+
+```rust
+use valka_sdk::ValkaClient;
+
+let client = ValkaClient::connect("http://127.0.0.1:50051").await?;
+
+// Create a task
+let task = client
+    .create_task("send-email", "emails")
+    .input(serde_json::json!({"to": "user@example.com"}))
+    .max_retries(3)
+    .send()
+    .await?;
+
+println!("Created task: {}", task.id);
+
+// Get task status
+let task = client.get_task(&task.id).await?;
+println!("Status: {:?}", task.status);
+```
+
+## Signal Handling
+
+Workers can receive and respond to signals:
+
+```rust
+let worker = ValkaWorker::builder()
+    .name("worker")
+    .server_addr("http://127.0.0.1:50051")
+    .queues(&["emails"])
+    .concurrency(4)
+    .handler(handle_task)
+    .on_signal(|signal| async move {
+        println!("Received signal: {:?}", signal.signal_type);
+        // Handle the signal
+    })
+    .build()
+    .await?;
+```

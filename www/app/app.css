@@ -1,0 +1,187 @@
+@import 'tailwindcss';
+@import 'fumadocs-ui/css/neutral.css';
+@import 'fumadocs-ui/css/preset.css';
+
+:root {
+  --fd-layout-width: 1200px;
+  --fd-sidebar-width: 260px;
+  --fd-toc-width: 220px;
+}
+
+/* True black dark theme */
+.dark,
+[data-theme='dark'] {
+  --color-fd-background: #000000;
+  --color-fd-foreground: #fafafa;
+  --color-fd-muted: #0a0a0a;
+  --color-fd-muted-foreground: #a1a1aa;
+  --color-fd-popover: #0a0a0a;
+  --color-fd-popover-foreground: #e4e4e7;
+  --color-fd-card: #0a0a0a;
+  --color-fd-card-foreground: #fafafa;
+  --color-fd-border: rgba(255, 255, 255, 0.08);
+  --color-fd-primary: #818cf8;
+  --color-fd-primary-foreground: #000000;
+  --color-fd-secondary: #111111;
+  --color-fd-secondary-foreground: #fafafa;
+  --color-fd-accent: rgba(255, 255, 255, 0.06);
+  --color-fd-accent-foreground: #e4e4e7;
+  --color-fd-ring: #818cf8;
+}
+
+/* Light theme with Valka brand */
+@theme {
+  --color-fd-primary: #6366f1;
+  --color-fd-primary-foreground: #ffffff;
+  --color-fd-ring: #6366f1;
+}
+
+/* Docs sidebar styling */
+#nd-sidebar {
+  border-right: 1px solid var(--color-fd-border);
+}
+
+/* Better code blocks */
+.dark pre,
+[data-theme='dark'] pre {
+  background: #0a0a0a !important;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+/* Mermaid diagrams */
+.mermaid-diagram {
+  display: flex;
+  justify-content: center;
+  padding: 1.5rem 0;
+}
+
+.mermaid-diagram svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* ====== Homepage Animations ====== */
+
+@keyframes hero-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(24px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes hero-fade-in-scale {
+  from {
+    opacity: 0;
+    transform: translateY(16px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes gradient-shift {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+
+@keyframes float-slow {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33% { transform: translate(30px, -20px) scale(1.05); }
+  66% { transform: translate(-20px, 15px) scale(0.95); }
+}
+
+@keyframes float-slow-reverse {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33% { transform: translate(-25px, 20px) scale(0.95); }
+  66% { transform: translate(15px, -25px) scale(1.05); }
+}
+
+@keyframes pulse-glow {
+  0%, 100% { opacity: 0.15; }
+  50% { opacity: 0.25; }
+}
+
+.hero-animate {
+  animation: hero-fade-in 0.8s cubic-bezier(0.16, 1, 0.3, 1) both;
+  opacity: 0;
+}
+
+.hero-animate-d1 { animation-delay: 0.1s; }
+.hero-animate-d2 { animation-delay: 0.2s; }
+.hero-animate-d3 { animation-delay: 0.3s; }
+.hero-animate-d4 { animation-delay: 0.4s; }
+.hero-animate-d5 { animation-delay: 0.5s; }
+
+.hero-animate-scale {
+  animation: hero-fade-in-scale 0.9s cubic-bezier(0.16, 1, 0.3, 1) both;
+  opacity: 0;
+}
+
+.gradient-text-animated {
+  background-size: 200% 200%;
+  animation: gradient-shift 6s ease infinite;
+}
+
+.float-orb {
+  animation: float-slow 20s ease-in-out infinite;
+}
+
+.float-orb-reverse {
+  animation: float-slow-reverse 25s ease-in-out infinite;
+}
+
+.pulse-glow {
+  animation: pulse-glow 4s ease-in-out infinite;
+}
+
+/* Hero dot grid */
+.hero-grid {
+  background-image: radial-gradient(circle, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+/* ====== Syntax Highlighting ====== */
+
+.syn-kw { color: #c084fc; }
+.syn-str { color: #4ade80; }
+.syn-cmt { color: #6b7280; font-style: italic; }
+.syn-num { color: #fb923c; }
+.syn-typ { color: #38bdf8; }
+.syn-fn { color: #fbbf24; }
+
+/* ====== Card hover gradient border ====== */
+
+.card-glow {
+  position: relative;
+}
+
+.card-glow::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(
+    135deg,
+    transparent 0%,
+    transparent 40%,
+    rgba(129, 140, 248, 0.3) 50%,
+    transparent 60%,
+    transparent 100%
+  );
+  background-size: 300% 300%;
+  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  mask-composite: exclude;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+  pointer-events: none;
+}
+
+.card-glow:hover::before {
+  opacity: 1;
+}

@@ -1,0 +1,20 @@
+{
+  "pages": [
+    "index",
+    "quick-start",
+    "installation",
+    "---Getting Started---",
+    "architecture",
+    "task-lifecycle",
+    "clustering",
+    "---Concepts---",
+    "rest-api",
+    "grpc-api",
+    "cli",
+    "---API Reference---",
+    "sdks",
+    "---",
+    "dashboard",
+    "deployment"
+  ]
+}

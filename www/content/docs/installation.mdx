@@ -1,0 +1,104 @@
+---
+title: Installation & Configuration
+description: Deploy Valka with Docker and configure it for your environment.
+---
+
+## Docker Compose (Recommended)
+
+The recommended way to run Valka is with the provided Docker Compose file:
+
+```bash
+cd deploy/docker
+cp .env.example .env    # edit credentials before deploying
+docker compose up -d
+```
+
+This starts PostgreSQL 17 and the Valka server. The REST API, web dashboard, and gRPC endpoint are ready immediately.
+
+| Service | Default Port | Description |
+|---------|-------------|-------------|
+| HTTP (REST + Dashboard) | `8989` | REST API, SSE events, Prometheus metrics, web dashboard |
+| gRPC | `50051` | Worker connections, client SDKs, event/log streams |
+
+## Docker Image
+
+You can also run the Valka server image directly with an external PostgreSQL instance:
+
+```bash
+docker run -d \
+  -e VALKA_DATABASE_URL=postgresql://user:pass@host:5432/valka \
+  -p 8989:8989 \
+  -p 50051:50051 \
+  ghcr.io/iwhitebird/valka:latest
+```
+
+The image includes the Valka server, CLI tool, and the web dashboard. It runs as a non-root user (UID 1001) and includes `curl` for health checks.
+
+To build the image from source instead:
+
+```bash
+git clone https://github.com/IWhitebird/Valka.git
+cd Valka
+docker build -t valka .
+```
+
+## Configuration
+
+Valka uses layered configuration via [Figment](https://github.com/SergioBenitez/Figment):
+
+**Priority** (highest wins): environment variables > `valka.toml` > defaults
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VALKA_DATABASE_URL` | — | PostgreSQL connection string (required) |
+| `VALKA_DATABASE__MAX_CONNECTIONS` | `20` | Connection pool size |
+| `VALKA_GRPC_ADDR` | `0.0.0.0:50051` | gRPC listen address |
+| `VALKA_HTTP_ADDR` | `0.0.0.0:8989` | REST/HTTP listen address |
+| `RUST_LOG` | `valka=info,tower_http=info` | Log level filter |
+
+All configuration values can be set via environment variables with the `VALKA_` prefix and `__` for nested keys. See the [full configuration reference](/docs/deployment#configuration-reference) for all options.
+
+### Configuration File
+
+Mount a `valka.toml` into the container at the working directory for file-based configuration:
+
+```toml
+[database]
+url = "postgresql://valka:valka@postgres:5432/valka"
+max_connections = 20
+
+[server]
+grpc_addr = "0.0.0.0:50051"
+http_addr = "0.0.0.0:8989"
+
+[scheduler]
+lease_duration_secs = 300
+reaper_interval_secs = 30
+retry_interval_secs = 10
+```
+
+## Database
+
+Valka requires **PostgreSQL 14+** (17 recommended). Migrations run automatically on server startup — no manual setup required.
+
+### Tables
+
+| Table | Purpose |
+|-------|---------|
+| `tasks` | Task metadata, state, and input/output |
+| `task_runs` | Individual execution attempts |
+| `task_logs` | Structured log entries per run |
+| `dead_letter_queue` | Tasks that exhausted retries |
+| `workers` | Registered worker connections |
+| `task_signals` | Signals sent to running tasks |
+
+## Health Check
+
+The server exposes a health endpoint for container orchestrators:
+
+```bash
+curl http://localhost:8989/healthz
+# Returns: "ok" (200)
+```

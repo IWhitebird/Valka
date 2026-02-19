@@ -1,0 +1,191 @@
+---
+title: Task Lifecycle
+description: Understanding task states, transitions, retries, and signals.
+---
+
+## Task States
+
+Every task in Valka moves through a well-defined state machine:
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> PENDING: Task Created
+    PENDING --> DISPATCHING: Worker matched
+    DISPATCHING --> RUNNING: Worker confirmed
+    RUNNING --> COMPLETED: Success
+    RUNNING --> FAILED: Unrecoverable error
+    RUNNING --> RETRY: Retryable error
+
+    RETRY --> PENDING: Backoff elapsed
+    RETRY --> DEAD_LETTER: Max retries exhausted
+
+    PENDING --> CANCELLED: Cancel API
+    DISPATCHING --> CANCELLED: Cancel API
+    RUNNING --> CANCELLED: Cancel API
+
+    COMPLETED --> [*]
+    FAILED --> [*]
+    DEAD_LETTER --> [*]
+    CANCELLED --> [*]
+`} />
+
+### State Descriptions
+
+| State | Description |
+|-------|-------------|
+| `PENDING` | Task is waiting to be picked up by a worker |
+| `DISPATCHING` | Task has been claimed and is being sent to a worker |
+| `RUNNING` | Worker is actively processing the task |
+| `COMPLETED` | Task finished successfully |
+| `FAILED` | Task failed with an unrecoverable error |
+| `RETRY` | Task failed but has retries remaining |
+| `DEAD_LETTER` | Task exhausted all retries |
+| `CANCELLED` | Task was cancelled via the API |
+
+## Retries
+
+When a task handler returns an error, Valka automatically retries with exponential backoff:
+
+- **Default max retries**: 3
+- **Backoff formula**: `base_delay * 2^attempt` (with jitter)
+- **Base delay**: 1 second
+
+<Mermaid chart={`sequenceDiagram
+    participant W as Worker
+    participant S as Server
+    participant PG as PostgreSQL
+
+    W->>S: TaskResult (error)
+    S->>PG: UPDATE status = RETRY, attempt + 1
+
+    Note over S: Backoff: 1s × 2^attempt
+
+    rect rgb(40, 40, 40)
+        Note over S,PG: Scheduler (retry engine)
+        S->>PG: Check RETRY tasks where backoff elapsed
+        PG-->>S: task_id
+        S->>PG: UPDATE status = PENDING
+    end
+
+    S->>W: TaskAssignment (retry)
+    W->>S: TaskResult (success)
+    S->>PG: UPDATE status = COMPLETED
+`} />
+
+Tasks in `RETRY` state are picked up by the scheduler's retry engine and re-enqueued as `PENDING` after the backoff delay has elapsed.
+
+### Dead Letter Queue
+
+When a task exhausts all retries, it moves to `DEAD_LETTER` status and is recorded in the `dead_letter_queue` table. Dead letter tasks can be:
+
+- Inspected via the REST API or dashboard
+- Replayed manually by creating a new task with the same input
+
+## Lease Management
+
+When a task moves to `RUNNING`, it is assigned a lease with a deadline. Workers must send periodic heartbeats to extend the lease.
+
+If a worker crashes or disconnects:
+1. The **lease reaper** detects the expired lease
+2. The task moves to `RETRY` (if retries remain) or `DEAD_LETTER`
+3. Another worker can pick up the retried task
+
+<Mermaid chart={`sequenceDiagram
+    participant W as Worker
+    participant S as Server
+    participant R as Lease Reaper
+
+    S->>W: TaskAssignment (lease: 5min)
+
+    loop Every 30s
+        W->>S: Heartbeat
+        S->>S: Extend lease +60s
+    end
+
+    Note over W: Worker crashes!
+
+    rect rgb(40, 40, 40)
+        Note over R: Reaper checks every 30s
+        R->>R: Find expired leases
+        R->>R: Move to RETRY or DEAD_LETTER
+    end
+
+    Note over S: Task available for another worker
+`} />
+
+## Task Signals
+
+Signals allow you to send real-time messages to running tasks. This is useful for:
+
+- Requesting progress updates
+- Sending configuration changes
+- Implementing graceful cancellation
+
+### Signal Flow
+
+<Mermaid chart={`sequenceDiagram
+    participant C as Client
+    participant API as REST API
+    participant PG as PostgreSQL
+    participant D as Dispatcher
+    participant W as Worker
+
+    C->>API: POST /tasks/:id/signal
+    API->>PG: INSERT signal (PENDING)
+    API->>D: Deliver signal
+    D->>W: TaskSignal (gRPC stream)
+    D->>PG: UPDATE signal → DELIVERED
+    W->>D: SignalAck
+    D->>PG: UPDATE signal → ACKNOWLEDGED
+`} />
+
+### Signal States
+
+| State | Description |
+|-------|-------------|
+| `PENDING` | Signal created, waiting for delivery |
+| `DELIVERED` | Signal sent to the worker over gRPC stream |
+| `ACKNOWLEDGED` | Worker confirmed receipt |
+
+If a worker disconnects before acknowledging, unacknowledged signals reset to `PENDING` for redelivery when the task is retried.
+
+### Sending a Signal
+
+```bash
+curl -X POST http://localhost:8989/api/v1/tasks/{task_id}/signal \
+  -H "Content-Type: application/json" \
+  -d '{"signal_type": "progress_request", "payload": {}}'
+```
+
+## Scheduled Tasks
+
+Tasks can be created with a `run_at` timestamp for delayed execution:
+
+```bash
+curl -X POST http://localhost:8989/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task_name": "send-reminder",
+    "queue": "emails",
+    "input": {"to": "user@example.com"},
+    "run_at": "2025-01-15T10:00:00Z"
+  }'
+```
+
+The task stays in `PENDING` state but is not eligible for dispatch until the scheduled time. The scheduler's **delayed promoter** handles the timing.
+
+## Idempotency
+
+Tasks support idempotency keys to prevent duplicate execution:
+
+```bash
+curl -X POST http://localhost:8989/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task_name": "charge-payment",
+    "queue": "payments",
+    "input": {"order_id": "abc-123", "amount": 99.99},
+    "idempotency_key": "payment-abc-123"
+  }'
+```
+
+If a task with the same idempotency key already exists, the existing task is returned instead of creating a duplicate.

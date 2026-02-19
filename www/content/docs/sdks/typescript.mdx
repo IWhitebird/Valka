@@ -1,0 +1,112 @@
+---
+title: TypeScript SDK
+description: Build workers and manage tasks with the TypeScript SDK.
+---
+
+## Installation
+
+```bash
+npm install @valka/sdk
+```
+
+The TypeScript SDK provides:
+- **ValkaWorker** — Process tasks from queues
+- **ValkaClient** — Create, get, list, and cancel tasks
+- Full TypeScript type definitions
+
+## Worker
+
+```typescript
+import { ValkaWorker, type TaskContext } from "@valka/sdk";
+
+async function handleTask(ctx: TaskContext): Promise<unknown> {
+  ctx.log(`Processing task '${ctx.taskName}' (attempt ${ctx.attemptNumber})`);
+
+  const input = ctx.input<{ to?: string; subject?: string }>();
+  const to = input.to ?? "unknown";
+
+  ctx.log(`Sending email to ${to}...`);
+  await sleep(1000);
+  ctx.log("Email sent successfully");
+
+  return { delivered_to: to, status: "sent" };
+}
+
+const worker = ValkaWorker.builder()
+  .name("email-worker")
+  .serverAddr("localhost:50051")
+  .queues(["emails"])
+  .concurrency(4)
+  .handler(handleTask)
+  .build();
+
+await worker.run();
+```
+
+### Builder Options
+
+| Method | Description |
+|--------|-------------|
+| `.name(name)` | Worker name |
+| `.serverAddr(addr)` | Valka server gRPC address |
+| `.queues([...])` | Queues to listen on |
+| `.concurrency(n)` | Max concurrent tasks |
+| `.handler(fn)` | Async function to process tasks |
+
+## Task Context
+
+```typescript
+async function handleTask(ctx: TaskContext): Promise<unknown> {
+  // Access metadata
+  const name = ctx.taskName;
+  const attempt = ctx.attemptNumber;
+  const taskId = ctx.taskId;
+
+  // Typed input parsing
+  const input = ctx.input<{ to: string; amount: number }>();
+
+  // Logging
+  ctx.log("Processing...");
+  ctx.debug("Debug info");
+
+  // Return output (any JSON-serializable value)
+  return { result: "done" };
+}
+```
+
+## Client
+
+```typescript
+import { ValkaClient } from "@valka/sdk";
+
+const client = new ValkaClient("localhost:50051");
+
+// Create a task
+const task = await client.createTask({
+  taskName: "send-email",
+  queue: "emails",
+  input: { to: "user@example.com", subject: "Welcome!" },
+  maxRetries: 3,
+});
+
+console.log(`Created task: ${task.id}`);
+
+// Get task status
+const status = await client.getTask(task.id);
+console.log(`Status: ${status.status}`);
+```
+
+## Signal Handling
+
+```typescript
+const worker = ValkaWorker.builder()
+  .name("worker")
+  .serverAddr("localhost:50051")
+  .queues(["emails"])
+  .concurrency(4)
+  .handler(handleTask)
+  .onSignal(async (signal) => {
+    console.log(`Signal received: ${signal.signalType}`);
+  })
+  .build();
+```

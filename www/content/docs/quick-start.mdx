@@ -1,0 +1,81 @@
+---
+title: Quick Start
+description: Get Valka running in minutes with Docker Compose.
+---
+
+## Prerequisites
+
+- [Docker](https://docs.docker.com/get-docker/) and Docker Compose
+
+## 1. Start Valka
+
+Clone the repository and start the services with Docker Compose:
+
+```bash
+git clone https://github.com/IWhitebird/Valka.git
+cd Valka/deploy/docker
+cp .env.example .env    # edit credentials if needed
+docker compose up -d
+```
+
+This starts PostgreSQL and the Valka server. Migrations run automatically on first boot.
+
+| Service | Port | Description |
+|---------|------|-------------|
+| REST API + Dashboard | `8989` | HTTP API and web UI |
+| gRPC API | `50051` | Worker connections and client SDK |
+
+## 2. Open the Dashboard
+
+Visit [http://localhost:8989](http://localhost:8989) to access the web dashboard. You'll see real-time monitoring of tasks, workers, and events.
+
+## 3. Create a Task
+
+Use the REST API to create your first task:
+
+```bash
+curl -X POST http://localhost:8989/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task_name": "send-welcome-email",
+    "queue_name": "emails",
+    "input": {"to": "user@example.com", "subject": "Welcome!"}
+  }'
+```
+
+The task will appear in the dashboard with status `PENDING`.
+
+## 4. Write a Worker
+
+Install the SDK for your language and connect a worker:
+
+```typescript
+import { ValkaWorker, type TaskContext } from "@valka/sdk";
+
+const worker = ValkaWorker.builder()
+  .name("email-worker")
+  .serverAddr("localhost:50051")
+  .queues(["emails"])
+  .concurrency(4)
+  .handler(async (ctx: TaskContext) => {
+    const input = ctx.input<{ to: string; subject: string }>();
+    ctx.log(`Sending email to ${input.to}...`);
+    // your logic here
+    return { status: "sent" };
+  })
+  .build();
+
+await worker.run();
+```
+
+See the [SDK documentation](/docs/sdks/rust) for Rust, Python, and Go examples.
+
+## 5. Monitor
+
+Head back to the dashboard at [http://localhost:8989](http://localhost:8989) to watch tasks flow through the system in real time — from `PENDING` to `RUNNING` to `COMPLETED`.
+
+## Next Steps
+
+- [Installation & Configuration](/docs/installation) — Configuration options and environment variables
+- [Deployment](/docs/deployment) — Production deployment with clustering, PgBouncer, and Kubernetes
+- [SDK Documentation](/docs/sdks/rust) — Choose your language and start building
