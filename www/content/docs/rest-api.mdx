@@ -29,8 +29,8 @@ POST /api/v1/tasks
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `queue_name` | string | Yes | — | Queue to place the task in |
-| `task_name` | string | Yes | — | Human-readable task identifier |
+| `queue_name` | string | Yes | - | Queue to place the task in |
+| `task_name` | string | Yes | - | Human-readable task identifier |
 | `input` | JSON | No | `null` | Task payload (any valid JSON) |
 | `priority` | integer | No | `0` | Higher = higher priority |
 | `max_retries` | integer | No | `3` | Max retry attempts |
@@ -72,8 +72,8 @@ GET /api/v1/tasks?queue_name=emails&status=RUNNING&limit=50&offset=0
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `queue_name` | string | — | Filter by queue |
-| `status` | string | — | Filter by status |
+| `queue_name` | string | - | Filter by queue |
+| `status` | string | - | Filter by status |
 | `limit` | integer | `50` | Max results |
 | `offset` | integer | `0` | Pagination offset |
 

@@ -3,25 +3,63 @@ title: Deployment
 description: Production deployment with Docker Compose, Kubernetes, and best practices.
 ---
 
-## Docker Compose (Single Node)
+## Single Node (Docker Compose)
 
-The simplest production deployment uses the provided compose file:
+Create a `docker-compose.yml` and start the services:
+
+```yaml title="docker-compose.yml"
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: valka
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-valka}
+      POSTGRES_DB: valka
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U valka"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    shm_size: 128mb
+
+  valka:
+    image: ghcr.io/iwhitebird/valka:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      VALKA_DATABASE_URL: postgresql://valka:${POSTGRES_PASSWORD:-valka}@postgres:5432/valka
+      VALKA_GRPC_ADDR: "0.0.0.0:50051"
+      VALKA_HTTP_ADDR: "0.0.0.0:8989"
+      RUST_LOG: valka=info,tower_http=info
+    ports:
+      - "50051:50051"
+      - "8989:8989"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+```
 
 ```bash
-cd deploy/docker
-cp .env.example .env    # set a strong POSTGRES_PASSWORD
+# Set a strong password (or export POSTGRES_PASSWORD)
 docker compose up -d
 ```
 
-This starts PostgreSQL 17 and the Valka server with the web dashboard, REST API on `:8989`, and gRPC on `:50051`.
+This starts PostgreSQL 17 and the Valka server with the web dashboard on `:8989` and gRPC on `:50051`. Migrations run automatically on first boot.
 
-## Docker Image
+### Using an External Database
 
-Run the Valka server image directly against an existing PostgreSQL instance:
+If you already have a PostgreSQL instance, run the Valka image directly:
 
 ```bash
 docker run -d \
-  -e VALKA_DATABASE_URL=postgresql://user:pass@host:5432/valka \
+  -e VALKA_DATABASE_URL=postgresql://user:pass@your-db-host:5432/valka \
   -p 8989:8989 \
   -p 50051:50051 \
   ghcr.io/iwhitebird/valka:latest
@@ -33,50 +71,412 @@ The Docker image:
 - Bundles the web dashboard and CLI tool
 - Exposes ports 8989 (HTTP), 50051 (gRPC), 7280/udp (gossip)
 
-## Kubernetes (Helm)
+---
 
-A production-ready Helm chart is available at `deploy/helm/valka/`:
+## Cluster (Docker Compose)
 
-```bash
-helm install valka deploy/helm/valka/ \
-  --set database.url=postgresql://valka:valka@postgres:5432/valka \
-  --set replicas=3
+A 3-node cluster with PgBouncer connection pooling. This setup uses one migration leader (valka-1) while follower nodes wait for it to become healthy before starting.
+
+You need two files: a shared config file and the compose file.
+
+### 1. Create the cluster config
+
+```toml title="cluster.toml"
+# Shared config for 3-node cluster.
+# Node-specific values (node_id, advertise_addr) are set via env vars.
+
+[database]
+max_connections = 5
+
+[gossip]
+listen_addr = "0.0.0.0:7280"
+cluster_id = "valka"
+seed_nodes = ["valka-1:7280", "valka-2:7280", "valka-3:7280"]
+
+[matching]
+num_partitions = 12
 ```
 
-The chart uses a **StatefulSet** (not Deployment) for stable pod DNS names required by the gossip protocol.
+### 2. Create the compose file
 
-Key features:
-- PgBouncer sidecar for connection pooling (enabled by default)
-- Horizontal Pod Autoscaler support
-- Prometheus ServiceMonitor
-- Pod anti-affinity for high availability
-- Configurable partition count (default 12, should be a multiple of replica count)
+```yaml title="docker-compose.yml"
+# 3-node cluster: PostgreSQL + PgBouncer + 3x Valka
+#
+# valka-1 is the migration leader. Runs migrations on a direct PG connection.
+# valka-2 and valka-3 wait for valka-1 to be healthy before starting.
+#
+# Access:
+#   Node 1: gRPC :50061, REST :8991
+#   Node 2: gRPC :50062, REST :8992
+#   Node 3: gRPC :50063, REST :8993
+
+x-valka-follower: &valka-follower
+  image: ghcr.io/iwhitebird/valka:latest
+  depends_on:
+    valka-1:
+      condition: service_healthy
+    pgbouncer:
+      condition: service_started
+  volumes:
+    - ./cluster.toml:/etc/valka/valka.toml:ro
+  command: ["/etc/valka/valka.toml"]
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: valka-postgres
+    environment:
+      POSTGRES_USER: valka
+      POSTGRES_PASSWORD: valka
+      POSTGRES_DB: valka
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U valka"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    shm_size: 128mb
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: valka-pgbouncer
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://valka:valka@postgres:5432/valka
+      AUTH_TYPE: scram-sha-256
+      MAX_CLIENT_CONN: "100"
+      DEFAULT_POOL_SIZE: "20"
+      POOL_MODE: transaction
+      MAX_PREPARED_STATEMENTS: "100"
+
+  # Migration leader: runs migrations on direct PG, then starts normally.
+  valka-1:
+    image: ghcr.io/iwhitebird/valka:latest
+    container_name: valka-1
+    depends_on:
+      pgbouncer:
+        condition: service_started
+    volumes:
+      - ./cluster.toml:/etc/valka/valka.toml:ro
+    command: ["/etc/valka/valka.toml"]
+    environment:
+      VALKA_NODE_ID: valka-1
+      VALKA_DATABASE_URL: postgresql://valka:valka@pgbouncer:5432/valka
+      VALKA_MIGRATION_DATABASE_URL: postgresql://valka:valka@postgres:5432/valka
+      VALKA_GOSSIP__ADVERTISE_ADDR: "valka-1:7280"
+      RUST_LOG: valka=info
+    ports:
+      - "50061:50051"
+      - "8991:8989"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8989/healthz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  valka-2:
+    <<: *valka-follower
+    container_name: valka-2
+    environment:
+      VALKA_NODE_ID: valka-2
+      VALKA_DATABASE_URL: postgresql://valka:valka@pgbouncer:5432/valka
+      VALKA_SKIP_MIGRATIONS: "true"
+      VALKA_GOSSIP__ADVERTISE_ADDR: "valka-2:7280"
+      RUST_LOG: valka=info
+    ports:
+      - "50062:50051"
+      - "8992:8989"
+
+  valka-3:
+    <<: *valka-follower
+    container_name: valka-3
+    environment:
+      VALKA_NODE_ID: valka-3
+      VALKA_DATABASE_URL: postgresql://valka:valka@pgbouncer:5432/valka
+      VALKA_SKIP_MIGRATIONS: "true"
+      VALKA_GOSSIP__ADVERTISE_ADDR: "valka-3:7280"
+      RUST_LOG: valka=info
+    ports:
+      - "50063:50051"
+      - "8993:8989"
+
+volumes:
+  pgdata:
+```
+
+### 3. Start the cluster
+
+```bash
+docker compose up -d
+```
+
+### Cluster endpoints
+
+| Node | REST API / Dashboard | gRPC |
+|------|---------------------|------|
+| valka-1 | `http://localhost:8991` | `localhost:50061` |
+| valka-2 | `http://localhost:8992` | `localhost:50062` |
+| valka-3 | `http://localhost:8993` | `localhost:50063` |
+
+Workers and clients can connect to any node. Tasks are automatically forwarded to the correct partition owner.
+
+### How it works
+
+- **valka-1** runs database migrations on a direct PostgreSQL connection, then connects through PgBouncer for normal operation
+- **valka-2** and **valka-3** skip migrations and wait for valka-1 to be healthy
+- All nodes connect through **PgBouncer** for connection pooling
+- Nodes discover each other via **chitchat gossip** over UDP port 7280
+- The **scheduler** (lease reaper, retry engine, DLQ) runs on a single leader elected via PostgreSQL advisory locks
+
+### PgBouncer settings
+
+These settings are critical for sqlx compatibility:
+- `AUTH_TYPE=scram-sha-256`: required for PostgreSQL 17
+- `MAX_PREPARED_STATEMENTS=100`: required for sqlx prepared statement support
+- Use the `edoburu/pgbouncer` image (not `pgbouncer/pgbouncer` which is outdated)
+
+---
+
+## Kubernetes (Helm)
+
+Valka provides a Helm chart for production Kubernetes deployments. The chart uses a **StatefulSet** (not Deployment) for stable pod DNS names required by the gossip protocol.
+
+### Prerequisites
+
+- Kubernetes 1.24+
+- Helm 3.x
+- A PostgreSQL instance accessible from the cluster
+
+### Install the chart
+
+```bash
+helm install valka oci://ghcr.io/iwhitebird/charts/valka \
+  --set postgresql.host=your-pg-host \
+  --set postgresql.password=your-pg-password \
+  --set replicaCount=3
+```
+
+### values.yaml Reference
+
+Create a `values.yaml` to customize your deployment:
+
+```yaml title="values.yaml"
+replicaCount: 3
+
+image:
+  repository: ghcr.io/iwhitebird/valka
+  pullPolicy: IfNotPresent
+  tag: ""  # defaults to Chart.appVersion
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+service:
+  type: ClusterIP
+  grpcPort: 50051
+  httpPort: 8989
+
+# -- Valka configuration (rendered into ConfigMap as valka.toml)
+config:
+  numPartitions: 12  # should be a multiple of replicaCount
+
+  gossip:
+    clusterName: valka
+    port: 7280
+
+  database:
+    maxConnections: 5  # per-node, keep low with PgBouncer
+
+  matching:
+    maxBufferPerPartition: 1000
+    taskReaderBatchSize: 50
+
+  scheduler:
+    leaseTimeoutSecs: 60
+    reaperIntervalSecs: 10
+
+  logIngester:
+    batchSize: 100
+    flushIntervalMs: 500
+
+# -- Database connection
+database:
+  existingSecret: ""    # use an existing Secret instead of creating one
+  secretKey: database-url
+  url: ""               # only used if existingSecret is empty
+
+# -- PgBouncer sidecar
+pgbouncer:
+  enabled: true
+  poolMode: transaction
+  maxClientConn: 200
+  defaultPoolSize: 25
+  image:
+    repository: edoburu/pgbouncer
+    tag: "latest"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+# -- External PostgreSQL (used by PgBouncer sidecar and migration job)
+postgresql:
+  host: ""              # required
+  port: 5432
+  database: valka
+  username: valka
+  password: ""
+  existingSecret: ""    # Secret with key "password"
+
+# -- Horizontal Pod Autoscaler
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+# -- Prometheus ServiceMonitor
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+
+# -- Security
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  fsGroup: 1001
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# -- Pod anti-affinity (prefer spreading across nodes)
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - valka
+          topologyKey: kubernetes.io/hostname
+```
+
+### Install with custom values
+
+```bash
+helm install valka oci://ghcr.io/iwhitebird/charts/valka \
+  -f values.yaml
+```
+
+### What the chart deploys
+
+| Resource | Purpose |
+|----------|---------|
+| **StatefulSet** | Valka server pods with stable DNS names for gossip |
+| **Service** (ClusterIP) | Exposes gRPC (50051) and HTTP (8989) |
+| **Headless Service** | Pod discovery for gossip (UDP 7280) and internal gRPC |
+| **ConfigMap** | Generated `valka.toml` with seed nodes computed from pod names |
+| **Secrets** | Database URL and PostgreSQL password |
+| **Job** (pre-install hook) | Runs database migrations before pods start |
+| **HPA** (optional) | Horizontal Pod Autoscaler |
+| **ServiceMonitor** (optional) | Prometheus metrics scraping |
+
+### Architecture details
+
+The chart automatically configures gossip seed nodes using stable pod DNS names:
+
+```
+valka-0.valka-headless.<namespace>.svc.cluster.local:7280
+valka-1.valka-headless.<namespace>.svc.cluster.local:7280
+valka-2.valka-headless.<namespace>.svc.cluster.local:7280
+```
+
+Each pod's `advertise_addr` is set to its own stable DNS name via the downward API, so nodes can discover and route to each other.
+
+Database migrations run as a Helm **pre-install/pre-upgrade hook** Job. The StatefulSet pods all start with `VALKA_SKIP_MIGRATIONS=true` since the Job handles it.
+
+### Exposing Valka externally
+
+To expose Valka outside the cluster, use an Ingress or LoadBalancer:
+
+```yaml title="values.yaml"
+service:
+  type: LoadBalancer
+  grpcPort: 50051
+  httpPort: 8989
+```
+
+Or with an Ingress controller (e.g., nginx):
+
+```yaml title="ingress.yaml"
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: valka
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+spec:
+  rules:
+    - host: valka.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: valka
+                port:
+                  number: 8989
+```
+
+For gRPC, you'll need a separate Ingress with gRPC backend protocol or use a gRPC-aware load balancer.
+
+### Monitoring with Prometheus
+
+Enable the ServiceMonitor to scrape Valka metrics:
+
+```yaml title="values.yaml"
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  labels:
+    release: prometheus  # match your Prometheus operator selector
+```
+
+Metrics are available at `/metrics` on the HTTP port.
+
+---
 
 ## PostgreSQL Recommendations
 
 ### Connection Pooling
 
-For production, use **PgBouncer** between Valka and PostgreSQL:
-
-```yaml
-pgbouncer:
-  image: edoburu/pgbouncer
-  environment:
-    DATABASE_URL: postgresql://valka:valka@postgres:5432/valka
-    AUTH_TYPE: scram-sha-256
-    MAX_PREPARED_STATEMENTS: 100  # Required for sqlx
-    POOL_MODE: transaction
-    MAX_CLIENT_CONN: 200
-    DEFAULT_POOL_SIZE: 20
-```
+For production, use **PgBouncer** between Valka and PostgreSQL. Both the Docker Compose cluster and Helm chart include PgBouncer by default.
 
 Key settings:
 - Use `edoburu/pgbouncer` image (not `pgbouncer/pgbouncer` which is stale)
 - `AUTH_TYPE=scram-sha-256` for PostgreSQL 17 compatibility
 - `MAX_PREPARED_STATEMENTS=100` is required for sqlx compatibility
 - PgBouncer listens on port 5432 with the edoburu image
-
-A pre-configured cluster compose file with PgBouncer is available at `deploy/docker/docker-compose.cluster.yml`.
 
 ### Database Sizing
 
@@ -93,39 +493,56 @@ A pre-configured cluster compose file with PgBouncer is available at `deploy/doc
 - Archive completed tasks older than your retention period
 - Monitor WAL size if using replication
 
+---
+
 ## Configuration Reference
 
 ### Full Configuration File
 
-Mount a `valka.toml` into the container for file-based configuration. See `deploy/valka.example.toml` for a complete example.
+Mount a `valka.toml` into the container for file-based configuration:
 
-```toml
-[database]
-url = "postgresql://valka:valka@localhost:5432/valka"
-max_connections = 20
+```toml title="valka.toml"
+# Unique node identifier. Auto-generated UUIDv7 if empty.
+node_id = ""
 
-[server]
+# gRPC listen address
 grpc_addr = "0.0.0.0:50051"
+
+# HTTP/REST + Dashboard listen address
 http_addr = "0.0.0.0:8989"
 
-[scheduler]
-enabled = true
-lease_duration_secs = 300
-reaper_interval_secs = 30
-retry_interval_secs = 10
-delayed_promoter_interval_secs = 5
+# PostgreSQL connection string
+database_url = "postgresql://valka:valka@localhost:5432/valka"
 
-[cluster]
-enabled = false
-node_id = "node-1"
-gossip_addr = "0.0.0.0:7280"
-advertise_addr = "10.0.0.1:7280"
-seeds = []
-num_partitions = 12
+[database]
+max_connections = 20
+acquire_timeout_secs = 5
+
+[gossip]
+listen_addr = "0.0.0.0:7280"
+cluster_id = "valka"
+seed_nodes = []                # empty = single-node mode
+# advertise_addr = ""          # defaults to listen_addr
 
 [matching]
-task_reader_interval_ms = 500
+num_partitions = 4             # use 12+ for clusters
+branching_factor = 3
+max_buffer_per_partition = 1000
 task_reader_batch_size = 50
+task_reader_poll_busy_ms = 10
+task_reader_poll_idle_ms = 200
+
+[scheduler]
+reaper_interval_secs = 10
+lease_timeout_secs = 60
+retry_base_delay_secs = 1
+retry_max_delay_secs = 3600
+dlq_check_interval_secs = 30
+delayed_check_interval_secs = 5
+
+[log_ingester]
+batch_size = 100
+flush_interval_ms = 500
 ```
 
 ### Environment Variables
@@ -134,14 +551,19 @@ All configuration values can be set via environment variables with the `VALKA_` 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VALKA_DATABASE_URL` | — | PostgreSQL connection string |
+| `VALKA_DATABASE_URL` | - | PostgreSQL connection string |
 | `VALKA_DATABASE__MAX_CONNECTIONS` | `20` | Connection pool size |
 | `VALKA_SERVER__GRPC_ADDR` | `0.0.0.0:50051` | gRPC listen address |
 | `VALKA_SERVER__HTTP_ADDR` | `0.0.0.0:8989` | HTTP listen address |
 | `VALKA_SCHEDULER__ENABLED` | `true` | Enable scheduler loops |
 | `VALKA_SCHEDULER__LEASE_DURATION_SECS` | `300` | Default lease timeout |
 | `VALKA_SCHEDULER__REAPER_INTERVAL_SECS` | `30` | Reaper check interval |
+| `VALKA_CLUSTER__ENABLED` | `false` | Enable clustering |
+| `VALKA_CLUSTER__NUM_PARTITIONS` | `12` | Partition count |
+| `VALKA_SKIP_MIGRATIONS` | `false` | Skip auto-migrations on startup |
 | `RUST_LOG` | `valka=info` | Log level filter |
+
+---
 
 ## Health Checks
 
@@ -160,14 +582,14 @@ livenessProbe:
   httpGet:
     path: /healthz
     port: 8989
-  initialDelaySeconds: 5
+  initialDelaySeconds: 15
   periodSeconds: 10
 
 readinessProbe:
   httpGet:
     path: /healthz
     port: 8989
-  initialDelaySeconds: 3
+  initialDelaySeconds: 5
   periodSeconds: 5
 ```
 

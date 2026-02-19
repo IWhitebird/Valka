@@ -110,7 +110,7 @@ When a task is created:
 
 1. Task is inserted into PostgreSQL with status `PENDING`
 2. The `MatchingService` checks if any worker is waiting for this queue
-3. If yes: the task is sent via an in-memory oneshot channel directly to the `Dispatcher`, which pushes it over the gRPC stream to the worker — **zero database polling**
+3. If yes: the task is sent via an in-memory oneshot channel directly to the `Dispatcher`, which pushes it over the gRPC stream to the worker. **Zero database polling.**
 4. If no: the task stays `PENDING` in PostgreSQL for the cold path
 
 <Mermaid chart={`sequenceDiagram

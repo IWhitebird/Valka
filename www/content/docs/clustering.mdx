@@ -8,26 +8,39 @@ Valka supports horizontal scaling through a multi-node clustering architecture.
 ## How It Works
 
 <Mermaid chart={`graph TD
-    subgraph Cluster
-        N1[Node 1<br/>Partitions 0-3]
-        N2[Node 2<br/>Partitions 4-7]
-        N3[Node 3<br/>Partitions 8-11]
+    C[REST / gRPC Client] -->|CreateTask<br/>queue: emails| LB[Load Balancer]
+
+    LB --> N1
+    LB --> N2
+    LB --> N3
+
+    subgraph Cluster["Valka Cluster"]
+        N1["Node 1<br/>Partitions 0-3<br/>⚡ Scheduler Leader"]
+        N2["Node 2<br/>Partitions 4-7"]
+        N3["Node 3<br/>Partitions 8-11"]
+
+        N1 <-.->|gossip<br/>UDP :7280| N2
+        N2 <-.->|gossip<br/>UDP :7280| N3
+        N3 <-.->|gossip<br/>UDP :7280| N1
+
+        N1 -->|gRPC forward<br/>wrong partition| N2
     end
 
-    N1 <-->|chitchat gossip<br/>UDP| N2
-    N2 <-->|chitchat gossip<br/>UDP| N3
-    N3 <-->|chitchat gossip<br/>UDP| N1
+    N1 --> W1["Worker A<br/>queue: emails"]
+    N1 --> W2["Worker B<br/>queue: emails"]
+    N2 --> W3["Worker C<br/>queue: payments"]
+    N3 --> W4["Worker D<br/>queue: reports"]
 
-    W1[Workers] --> N1
-    W2[Workers] --> N2
-    W3[Workers] --> N3
-
-    C[Client] -->|CreateTask| N1
-    N1 -.->|Forward if<br/>wrong partition| N2
+    PG[(PostgreSQL<br/>Shared Storage)] <--> N1
+    PG <--> N2
+    PG <--> N3
 
     style N1 fill:#4f46e5,stroke:#6366f1,color:#fff
     style N2 fill:#7c3aed,stroke:#8b5cf6,color:#fff
     style N3 fill:#0284c7,stroke:#38bdf8,color:#fff
+    style PG fill:#336791,stroke:#2d5f8a,color:#fff
+    style LB fill:#059669,stroke:#10b981,color:#fff
+    style C fill:#475569,stroke:#64748b,color:#fff
 `} />
 
 ### Components
@@ -57,9 +70,13 @@ num_partitions = 12
 | `VALKA_CLUSTER__ENABLED` | `false` | Enable clustering |
 | `VALKA_CLUSTER__NODE_ID` | hostname | Unique node identifier |
 | `VALKA_CLUSTER__GOSSIP_ADDR` | `0.0.0.0:7280` | Gossip listen address |
-| `VALKA_CLUSTER__ADVERTISE_ADDR` | — | Address other nodes use to reach this node |
+| `VALKA_CLUSTER__ADVERTISE_ADDR` | - | Address other nodes use to reach this node |
 | `VALKA_CLUSTER__SEEDS` | `[]` | Comma-separated seed node addresses |
 | `VALKA_CLUSTER__NUM_PARTITIONS` | `12` | Number of partitions in the hash ring |
+
+### Partition Count
+
+The partition count must be **identical across all nodes** and should be a multiple of your expected replica count. For example, use 12 partitions for a 3-node cluster (4 partitions per node).
 
 ## Scheduler Leader Election
 
@@ -86,9 +103,37 @@ In a cluster, only one node runs the scheduler (lease reaper, retry engine, DLQ 
     N2->>N2: Start scheduler loops
 `} />
 
-## Docker Compose (Multi-Node)
+## Docker Compose Cluster
 
-```yaml
+For a full production-ready 3-node cluster with PgBouncer, see the [Deployment guide](/docs/deployment#cluster-docker-compose). Below is the minimal cluster configuration.
+
+Create a shared config file and compose file in the same directory:
+
+```toml title="cluster.toml"
+[database]
+max_connections = 5
+
+[gossip]
+listen_addr = "0.0.0.0:7280"
+cluster_id = "valka"
+seed_nodes = ["valka-1:7280", "valka-2:7280", "valka-3:7280"]
+
+[matching]
+num_partitions = 12
+```
+
+```yaml title="docker-compose.yml"
+x-valka-follower: &valka-follower
+  image: ghcr.io/iwhitebird/valka:latest
+  depends_on:
+    valka-1:
+      condition: service_healthy
+    pgbouncer:
+      condition: service_started
+  volumes:
+    - ./cluster.toml:/etc/valka/valka.toml:ro
+  command: ["/etc/valka/valka.toml"]
+
 services:
   postgres:
     image: postgres:17
@@ -96,37 +141,89 @@ services:
       POSTGRES_USER: valka
       POSTGRES_PASSWORD: valka
       POSTGRES_DB: valka
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U valka"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    shm_size: 128mb
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://valka:valka@postgres:5432/valka
+      AUTH_TYPE: scram-sha-256
+      MAX_CLIENT_CONN: "100"
+      DEFAULT_POOL_SIZE: "20"
+      POOL_MODE: transaction
+      MAX_PREPARED_STATEMENTS: "100"
 
   valka-1:
-    image: valka-server
+    image: ghcr.io/iwhitebird/valka:latest
+    depends_on:
+      pgbouncer:
+        condition: service_started
+    volumes:
+      - ./cluster.toml:/etc/valka/valka.toml:ro
+    command: ["/etc/valka/valka.toml"]
     environment:
-      VALKA_DATABASE__URL: postgresql://valka:valka@postgres:5432/valka
-      VALKA_CLUSTER__ENABLED: "true"
-      VALKA_CLUSTER__NODE_ID: "node-1"
-      VALKA_CLUSTER__GOSSIP_ADDR: "0.0.0.0:7280"
-      VALKA_CLUSTER__ADVERTISE_ADDR: "valka-1:7280"
-      VALKA_CLUSTER__SEEDS: "valka-2:7280,valka-3:7280"
+      VALKA_NODE_ID: valka-1
+      VALKA_DATABASE_URL: postgresql://valka:valka@pgbouncer:5432/valka
+      VALKA_MIGRATION_DATABASE_URL: postgresql://valka:valka@postgres:5432/valka
+      VALKA_GOSSIP__ADVERTISE_ADDR: "valka-1:7280"
+      RUST_LOG: valka=info
+    ports:
+      - "50061:50051"
+      - "8991:8989"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8989/healthz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   valka-2:
-    image: valka-server
+    <<: *valka-follower
     environment:
-      VALKA_DATABASE__URL: postgresql://valka:valka@postgres:5432/valka
-      VALKA_CLUSTER__ENABLED: "true"
-      VALKA_CLUSTER__NODE_ID: "node-2"
-      VALKA_CLUSTER__GOSSIP_ADDR: "0.0.0.0:7280"
-      VALKA_CLUSTER__ADVERTISE_ADDR: "valka-2:7280"
-      VALKA_CLUSTER__SEEDS: "valka-1:7280,valka-3:7280"
+      VALKA_NODE_ID: valka-2
+      VALKA_DATABASE_URL: postgresql://valka:valka@pgbouncer:5432/valka
+      VALKA_SKIP_MIGRATIONS: "true"
+      VALKA_GOSSIP__ADVERTISE_ADDR: "valka-2:7280"
+      RUST_LOG: valka=info
+    ports:
+      - "50062:50051"
+      - "8992:8989"
 
   valka-3:
-    image: valka-server
+    <<: *valka-follower
     environment:
-      VALKA_DATABASE__URL: postgresql://valka:valka@postgres:5432/valka
-      VALKA_CLUSTER__ENABLED: "true"
-      VALKA_CLUSTER__NODE_ID: "node-3"
-      VALKA_CLUSTER__GOSSIP_ADDR: "0.0.0.0:7280"
-      VALKA_CLUSTER__ADVERTISE_ADDR: "valka-3:7280"
-      VALKA_CLUSTER__SEEDS: "valka-1:7280,valka-2:7280"
+      VALKA_NODE_ID: valka-3
+      VALKA_DATABASE_URL: postgresql://valka:valka@pgbouncer:5432/valka
+      VALKA_SKIP_MIGRATIONS: "true"
+      VALKA_GOSSIP__ADVERTISE_ADDR: "valka-3:7280"
+      RUST_LOG: valka=info
+    ports:
+      - "50063:50051"
+      - "8993:8989"
+
+volumes:
+  pgdata:
 ```
+
+```bash
+docker compose up -d
+```
+
+Workers and clients can connect to **any node**. Tasks are automatically forwarded to the correct partition owner.
+
+## Kubernetes Cluster
+
+For Kubernetes deployments, the Helm chart automatically configures gossip seed nodes using stable StatefulSet pod DNS names. See the full [Kubernetes deployment guide](/docs/deployment#kubernetes-helm).
 
 ## Circuit Breaker
 
