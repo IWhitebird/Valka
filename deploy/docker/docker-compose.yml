@@ -1,0 +1,44 @@
+# Single-node production deployment: PostgreSQL + Valka
+# Copy .env.example to .env and edit before running.
+#
+# Usage:
+#   docker compose up -d
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-valka}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-valka}
+      POSTGRES_DB: ${POSTGRES_DB:-valka}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-valka}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    shm_size: 128mb
+
+  valka:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      VALKA_DATABASE_URL: postgresql://${POSTGRES_USER:-valka}:${POSTGRES_PASSWORD:-valka}@postgres:5432/${POSTGRES_DB:-valka}
+      VALKA_GRPC_ADDR: "0.0.0.0:50051"
+      VALKA_HTTP_ADDR: "0.0.0.0:8989"
+      RUST_LOG: ${RUST_LOG:-valka=info,tower_http=info}
+    ports:
+      - "50051:50051"
+      - "8989:8989"
+    restart: unless-stopped
+
+volumes:
+  pgdata:

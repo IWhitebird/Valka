@@ -1,0 +1,101 @@
+# Valka Server Configuration Reference
+#
+# Config layering: defaults -> this file -> VALKA_* env vars
+# Nested env vars use double underscore: VALKA_DATABASE__MAX_CONNECTIONS=10
+# Pass config path as first CLI argument: valka-server /etc/valka/valka.toml
+
+# Unique node identifier. Auto-generated UUIDv7 if empty.
+# In Kubernetes, set to the pod name for observability.
+node_id = ""
+
+# gRPC listen address (workers + internal cluster forwarding)
+grpc_addr = "0.0.0.0:50051"
+
+# HTTP/REST + WebUI listen address
+http_addr = "0.0.0.0:8989"
+
+# PostgreSQL connection string
+database_url = "postgresql://valka:valka@localhost:5432/valka"
+
+# Path to built WebUI static files
+web_dir = "/usr/share/valka/web"
+
+# --- Database Pool --------------------------------------------------------
+
+[database]
+# Max connections per Valka process.
+# Single-node without pooler: 10-30
+# Cluster with PgBouncer: 5-10 per node
+max_connections = 20
+
+# Timeout to acquire a connection from the pool (seconds)
+acquire_timeout_secs = 5
+
+# --- Gossip / Cluster -----------------------------------------------------
+
+[gossip]
+# UDP listen address for chitchat gossip protocol
+listen_addr = "0.0.0.0:7280"
+
+# Address advertised to peers. Defaults to listen_addr if empty.
+# In Kubernetes: "<pod-name>.<headless-svc>.<ns>.svc.cluster.local:7280"
+# advertise_addr = ""
+
+# Cluster name (must match across all nodes)
+cluster_id = "valka"
+
+# Seed nodes for gossip bootstrap. Empty = single-node mode.
+# seed_nodes = ["valka-1:7280", "valka-2:7280"]
+seed_nodes = []
+
+# --- Matching / Task Routing -----------------------------------------------
+
+[matching]
+# Number of task partitions. Must be identical across all cluster nodes.
+# Use a multiple of your expected replica count (e.g. 12 for 3 nodes).
+num_partitions = 4
+
+# Internal tree branching factor (rarely needs tuning)
+branching_factor = 3
+
+# Max tasks buffered per partition before back-pressure
+max_buffer_per_partition = 1000
+
+# Cold-path batch size when reading tasks from PG
+task_reader_batch_size = 50
+
+# Poll interval when tasks are actively flowing (ms)
+task_reader_poll_busy_ms = 10
+
+# Poll interval when queue is idle (ms)
+task_reader_poll_idle_ms = 200
+
+# --- Scheduler -------------------------------------------------------------
+
+[scheduler]
+# How often to scan for expired task leases (seconds)
+reaper_interval_secs = 10
+
+# Task lease duration. Workers must heartbeat before this expires.
+lease_timeout_secs = 60
+
+# Exponential backoff base for retries (seconds)
+retry_base_delay_secs = 1
+
+# Maximum retry delay cap (seconds)
+retry_max_delay_secs = 3600
+
+# How often to check for tasks that exceeded max retries (seconds)
+dlq_check_interval_secs = 30
+
+# How often to promote delayed tasks to PENDING (seconds)
+delayed_check_interval_secs = 5
+
+# --- Log Ingester ----------------------------------------------------------
+
+[log_ingester]
+# Max log entries per PG batch insert
+batch_size = 100
+
+# Max time to buffer logs before flushing (ms)
+flush_interval_ms = 500

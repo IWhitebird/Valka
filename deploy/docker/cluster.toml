@@ -1,0 +1,13 @@
+# Shared config for local 3-node cluster.
+# Node-specific values (node_id, advertise_addr) are set via env vars.
+
+[database]
+max_connections = 5
+
+[gossip]
+listen_addr = "0.0.0.0:7280"
+cluster_id = "valka"
+seed_nodes = ["valka-1:7280", "valka-2:7280", "valka-3:7280"]
+
+[matching]
+num_partitions = 12

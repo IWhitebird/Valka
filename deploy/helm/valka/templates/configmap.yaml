@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "valka.fullname" . }}-config
+  labels:
+    {{- include "valka.labels" . | nindent 4 }}
+data:
+  valka.toml: |
+    grpc_addr = "0.0.0.0:{{ .Values.service.grpcPort }}"
+    http_addr = "0.0.0.0:{{ .Values.service.httpPort }}"
+    web_dir = "/usr/share/valka/web"
+
+    [database]
+    max_connections = {{ .Values.config.database.maxConnections }}
+
+    [gossip]
+    listen_addr = "0.0.0.0:{{ .Values.config.gossip.port }}"
+    cluster_id = {{ .Values.config.gossip.clusterName | quote }}
+    seed_nodes = [
+    {{- $fullname := include "valka.fullname" . -}}
+    {{- $ns := .Release.Namespace -}}
+    {{- $port := .Values.config.gossip.port -}}
+    {{- $headless := printf "%s-headless" $fullname -}}
+    {{- range $i := until (int .Values.replicaCount) }}
+      {{ printf "%s-%d.%s.%s.svc.cluster.local:%d" $fullname (int $i) $headless $ns (int $port) | quote }},
+    {{- end }}
+    ]
+
+    [matching]
+    num_partitions = {{ .Values.config.numPartitions }}
+    max_buffer_per_partition = {{ .Values.config.matching.maxBufferPerPartition }}
+    task_reader_batch_size = {{ .Values.config.matching.taskReaderBatchSize }}
+
+    [scheduler]
+    lease_timeout_secs = {{ .Values.config.scheduler.leaseTimeoutSecs }}
+    reaper_interval_secs = {{ .Values.config.scheduler.reaperIntervalSecs }}
+
+    [log_ingester]
+    batch_size = {{ .Values.config.logIngester.batchSize }}
+    flush_interval_ms = {{ .Values.config.logIngester.flushIntervalMs }}

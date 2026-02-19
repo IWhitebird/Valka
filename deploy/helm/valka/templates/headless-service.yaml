@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "valka.fullname" . }}-headless
+  labels:
+    {{- include "valka.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "valka.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: gossip
+      port: {{ .Values.config.gossip.port }}
+      protocol: UDP
+    - name: grpc
+      port: {{ .Values.service.grpcPort }}
+      protocol: TCP

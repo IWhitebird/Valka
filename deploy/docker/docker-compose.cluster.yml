@@ -1,0 +1,116 @@
+# Local 3-node cluster for testing: PostgreSQL + PgBouncer + 3x Valka
+#
+# valka-1 is the migration leader — it runs migrations on a direct PG connection,
+# then starts normally. valka-2 and valka-3 wait for valka-1 to be healthy before
+# starting (with migrations skipped).
+#
+# Usage:
+#   docker compose -f docker-compose.cluster.yml up -d
+#
+# Access:
+#   Node 1: gRPC :50061, REST :8991
+#   Node 2: gRPC :50062, REST :8992
+#   Node 3: gRPC :50063, REST :8993
+
+x-valka-follower: &valka-follower
+  image: iwhitebird/valka
+  build:
+    context: ../../
+    dockerfile: Dockerfile
+  depends_on:
+    valka-1:
+      condition: service_healthy
+    pgbouncer:
+      condition: service_started
+  volumes:
+    - ./cluster.toml:/etc/valka/valka.toml:ro
+  command: ["/etc/valka/valka.toml"]
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: valka-postgres
+    environment:
+      POSTGRES_USER: valka
+      POSTGRES_PASSWORD: valka
+      POSTGRES_DB: valka
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U valka"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    shm_size: 128mb
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: valka-pgbouncer
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://valka:valka@postgres:5432/valka
+      AUTH_TYPE: scram-sha-256
+      MAX_CLIENT_CONN: "100"
+      DEFAULT_POOL_SIZE: "20"
+      POOL_MODE: transaction
+      MAX_PREPARED_STATEMENTS: "100"
+
+  # Migration leader: runs migrations on direct PG, then starts normally.
+  valka-1:
+    image: iwhitebird/valka
+    container_name: valka-1
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    depends_on:
+      pgbouncer:
+        condition: service_started
+    volumes:
+      - ./cluster.toml:/etc/valka/valka.toml:ro
+    command: ["/etc/valka/valka.toml"]
+    environment:
+      VALKA_NODE_ID: valka-1
+      VALKA_DATABASE_URL: postgresql://valka:valka@pgbouncer:5432/valka
+      VALKA_MIGRATION_DATABASE_URL: postgresql://valka:valka@postgres:5432/valka
+      VALKA_GOSSIP__ADVERTISE_ADDR: "valka-1:7280"
+      RUST_LOG: valka=info
+    ports:
+      - "50061:50051"
+      - "8991:8989"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8989/healthz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  valka-2:
+    <<: *valka-follower
+    container_name: valka-2
+    environment:
+      VALKA_NODE_ID: valka-2
+      VALKA_DATABASE_URL: postgresql://valka:valka@pgbouncer:5432/valka
+      VALKA_SKIP_MIGRATIONS: "true"
+      VALKA_GOSSIP__ADVERTISE_ADDR: "valka-2:7280"
+      RUST_LOG: valka=info
+    ports:
+      - "50062:50051"
+      - "8992:8989"
+
+  valka-3:
+    <<: *valka-follower
+    container_name: valka-3
+    environment:
+      VALKA_NODE_ID: valka-3
+      VALKA_DATABASE_URL: postgresql://valka:valka@pgbouncer:5432/valka
+      VALKA_SKIP_MIGRATIONS: "true"
+      VALKA_GOSSIP__ADVERTISE_ADDR: "valka-3:7280"
+      RUST_LOG: valka=info
+    ports:
+      - "50063:50051"
+      - "8993:8989"
+
+volumes:
+  pgdata:
