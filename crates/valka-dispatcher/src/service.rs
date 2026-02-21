@@ -75,6 +75,8 @@ impl DispatcherService {
 
     /// Background loop: register as waiting in matching service, receive tasks, push to worker
     pub async fn run_worker_match_loop(&self, worker_id: WorkerId, queues: Vec<String>) {
+        use futures::FutureExt;
+
         let num_partitions = self.matching.config().num_partitions;
 
         loop {
@@ -90,14 +92,16 @@ impl DispatcherService {
                 continue;
             }
 
-            // Register as waiting on ALL partitions for all queues simultaneously
             let mut receivers = Vec::new();
             for queue in &queues {
                 for pid in 0..num_partitions {
-                    let rx =
-                        self.matching
-                            .register_worker(queue, PartitionId(pid), worker_id.clone());
-                    receivers.push(Box::pin(rx));
+                    let partition_id = PartitionId(pid);
+                    let rx = self.matching.register_worker(
+                        queue,
+                        partition_id,
+                        worker_id.clone(),
+                    );
+                    receivers.push((queue.clone(), partition_id, rx));
                 }
             }
 
@@ -106,12 +110,23 @@ impl DispatcherService {
                 continue;
             }
 
-            // Wait for the FIRST match from any partition (non-blocking across all)
-            let (result, _index, _remaining) = futures::future::select_all(receivers).await;
-            // Remaining receivers are dropped — their senders become stale and will
-            // be cleaned up on the next offer_task (try_match_task pops + retries).
+            let futs: Vec<_> = receivers
+                .into_iter()
+                .map(|(queue, pid, rx)| {
+                    Box::pin(async move { (queue, pid, rx.await) })
+                })
+                .collect();
 
-            match result {
+            let (first_result, _index, remaining) =
+                futures::future::select_all(futs).await;
+
+            for fut in remaining {
+                if let Some((q, p, Ok(envelope))) = fut.now_or_never() {
+                    self.matching.buffer_task(&q, p, envelope);
+                }
+            }
+
+            match first_result.2 {
                 Ok(envelope) => {
                     self.dispatch_to_worker(&worker_id, envelope).await;
                 }
