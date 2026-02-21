@@ -1,0 +1,73 @@
+[package]
+name = "valka-web"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "valka-web"
+path = "src/main.rs"
+
+[dependencies]
+leptos = { workspace = true }
+leptos_meta = { workspace = true }
+leptos_router = { workspace = true }
+server_fn = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+
+# Server-only
+leptos_axum = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+# Client-only
+wasm-bindgen = { workspace = true, optional = true }
+web-sys = { workspace = true, optional = true }
+console_error_panic_hook = { workspace = true, optional = true }
+gloo-net = { workspace = true, optional = true }
+
+[features]
+hydrate = [
+    "leptos/hydrate",
+    "dep:wasm-bindgen",
+    "dep:web-sys",
+    "dep:console_error_panic_hook",
+    "dep:gloo-net",
+]
+ssr = [
+    "leptos/ssr",
+    "leptos_meta/ssr",
+    "leptos_router/ssr",
+    "dep:leptos_axum",
+    "dep:axum",
+    "dep:tokio",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:reqwest",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+]
+
+[package.metadata.leptos]
+output-name = "valka-web"
+site-root = "target/site"
+site-pkg-dir = "pkg"
+assets-dir = "assets"
+site-addr = "127.0.0.1:3080"
+reload-port = 3081
+tailwind-input-file = "style/tailwind.css"
+tailwind-config-file = "tailwind.config.js"
+bin-features = ["ssr"]
+bin-default-features = false
+lib-features = ["hydrate"]
+lib-default-features = false
