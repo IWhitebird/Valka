@@ -115,6 +115,7 @@ pub fn build_api_router(
         .layer(cors)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_rest(
     addr: SocketAddr,
     pool: DbPool,

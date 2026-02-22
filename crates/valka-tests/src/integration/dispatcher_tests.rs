@@ -287,3 +287,176 @@ async fn test_dispatcher_multiple_workers(pool: PgPool) {
     assert_eq!(dispatcher.workers().len(), 1);
     assert!(dispatcher.workers().contains_key(id2.as_ref()));
 }
+
+// ─── Additional integration tests ───────────────────────────────────
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_handle_task_result_success_complex_json(pool: PgPool) {
+    let (task, run) = create_running_task(&pool, "demo").await;
+    let (dispatcher, _matching) = make_dispatcher(pool.clone());
+
+    let (handle, _rx) = make_worker_handle(2);
+    let worker_id = handle.worker_id.clone();
+    dispatcher.register_worker(handle).await;
+
+    let complex_output = serde_json::json!({
+        "nested": {"key": [1, 2, 3]},
+        "flag": true,
+        "data": null
+    });
+
+    let result = valka_proto::TaskResult {
+        task_id: task.id.clone(),
+        task_run_id: run.id.clone(),
+        success: true,
+        output: complex_output.to_string(),
+        error_message: String::new(),
+        retryable: false,
+    };
+    dispatcher.handle_task_result(&worker_id, result).await;
+
+    // Verify DB preserves exact JSON structure on both task and run
+    let task_after = tasks::get_task(&pool, &task.id).await.unwrap().unwrap();
+    assert_eq!(task_after.status, "COMPLETED");
+    assert_eq!(
+        task_after.output.unwrap()["nested"]["key"],
+        serde_json::json!([1, 2, 3])
+    );
+
+    let run_after = task_runs::get_task_run(&pool, &run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run_after.status, "COMPLETED");
+    assert_eq!(run_after.output.unwrap()["flag"], true);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_handle_task_result_success_empty_output(pool: PgPool) {
+    let (task, run) = create_running_task(&pool, "demo").await;
+    let (dispatcher, _matching) = make_dispatcher(pool.clone());
+
+    let (handle, _rx) = make_worker_handle(2);
+    let worker_id = handle.worker_id.clone();
+    dispatcher.register_worker(handle).await;
+
+    let result = valka_proto::TaskResult {
+        task_id: task.id.clone(),
+        task_run_id: run.id.clone(),
+        success: true,
+        output: String::new(), // empty output
+        error_message: String::new(),
+        retryable: false,
+    };
+    dispatcher.handle_task_result(&worker_id, result).await;
+
+    let task_after = tasks::get_task(&pool, &task.id).await.unwrap().unwrap();
+    assert_eq!(task_after.status, "COMPLETED");
+    assert!(
+        task_after.output.is_none(),
+        "Empty output should map to NULL"
+    );
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_handle_task_result_retryable_cleans_worker_state(pool: PgPool) {
+    let (task, run) = create_running_task(&pool, "demo").await;
+    let (dispatcher, _matching) = make_dispatcher(pool.clone());
+
+    let (handle, _rx) = make_worker_handle(2);
+    let worker_id = handle.worker_id.clone();
+    dispatcher.register_worker(handle).await;
+
+    // Assign the task to the worker
+    if let Some(mut h) = dispatcher.workers().get_mut(worker_id.as_ref()) {
+        h.assign_task(task.id.clone());
+    }
+
+    let result = valka_proto::TaskResult {
+        task_id: task.id.clone(),
+        task_run_id: run.id.clone(),
+        success: false,
+        output: String::new(),
+        error_message: "transient".to_string(),
+        retryable: true,
+    };
+    dispatcher.handle_task_result(&worker_id, result).await;
+
+    // Worker state should be cleaned up
+    let h = dispatcher.workers().get(worker_id.as_ref()).unwrap();
+    assert!(
+        !h.active_tasks.contains(&task.id),
+        "Task should be removed from active"
+    );
+
+    // DB should show task=RETRY, run=FAILED atomically
+    let task_after = tasks::get_task(&pool, &task.id).await.unwrap().unwrap();
+    assert_eq!(task_after.status, "RETRY");
+
+    let run_after = task_runs::get_task_run(&pool, &run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run_after.status, "FAILED");
+    assert_eq!(run_after.error_message.as_deref(), Some("transient"));
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_signal_ack_marks_acknowledged(pool: PgPool) {
+    let task = create_test_task(&pool, "q", "t").await;
+
+    // Create signal and mark it delivered
+    let signal = create_test_signal(&pool, &task.id, "approve").await;
+    valka_db::queries::signals::mark_delivered(&pool, &signal.id)
+        .await
+        .unwrap();
+
+    let (dispatcher, _matching) = make_dispatcher(pool.clone());
+
+    let ack = valka_proto::SignalAck {
+        signal_id: signal.id.clone(),
+    };
+    dispatcher.handle_signal_ack(&ack).await;
+
+    // Verify signal is now ACKNOWLEDGED
+    let signals = valka_db::queries::signals::list_signals(&pool, &task.id, Some("ACKNOWLEDGED"))
+        .await
+        .unwrap();
+    assert_eq!(signals.len(), 1);
+    assert_eq!(signals[0].id, signal.id);
+    assert!(signals[0].acknowledged_at.is_some());
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_deregister_resets_delivered_signals(pool: PgPool) {
+    let (task, _run) = create_running_task(&pool, "q").await;
+
+    // Create a signal and mark it delivered
+    let signal = create_test_signal(&pool, &task.id, "progress").await;
+    valka_db::queries::signals::mark_delivered(&pool, &signal.id)
+        .await
+        .unwrap();
+
+    let (dispatcher, _matching) = make_dispatcher(pool.clone());
+    let (handle, _rx) = make_worker_handle(2);
+    let worker_id = handle.worker_id.clone();
+    dispatcher.register_worker(handle).await;
+
+    // Assign the task to the worker
+    if let Some(mut h) = dispatcher.workers().get_mut(worker_id.as_ref()) {
+        h.assign_task(task.id.clone());
+    }
+
+    // Deregister the worker — delivered signals should reset to PENDING
+    dispatcher.deregister_worker(&worker_id).await;
+
+    let signals = valka_db::queries::signals::list_signals(&pool, &task.id, Some("PENDING"))
+        .await
+        .unwrap();
+    assert_eq!(
+        signals.len(),
+        1,
+        "Delivered signal should be reset to PENDING"
+    );
+    assert_eq!(signals[0].id, signal.id);
+}

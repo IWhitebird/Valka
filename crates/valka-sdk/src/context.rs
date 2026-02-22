@@ -32,6 +32,7 @@ pub struct TaskContext {
 }
 
 impl TaskContext {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         task_id: String,
         task_run_id: String,

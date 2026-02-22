@@ -8,6 +8,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::info;
 
+use crate::internal_grpc::InternalServiceImpl;
 use valka_cluster::{ClusterManager, NodeForwarder};
 use valka_core::{NodeId, TaskId, partition_for_task};
 use valka_db::DbPool;
@@ -15,7 +16,6 @@ use valka_dispatcher::DispatcherService;
 use valka_matching::MatchingService;
 use valka_matching::partition::TaskEnvelope;
 use valka_proto::*;
-use crate::internal_grpc::InternalServiceImpl;
 
 pub struct ApiServiceImpl {
     pool: DbPool,
@@ -435,6 +435,7 @@ impl worker_service_server::WorkerService for WorkerServiceImpl {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_grpc(
     addr: SocketAddr,
     pool: DbPool,

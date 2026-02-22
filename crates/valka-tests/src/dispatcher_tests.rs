@@ -1,6 +1,6 @@
 use chrono::Utc;
 use tokio::sync::{broadcast, mpsc};
-use valka_core::{MatchingConfig, NodeId, WorkerId};
+use valka_core::{MatchingConfig, NodeId, PartitionId, WorkerId};
 use valka_db::DbPool;
 use valka_dispatcher::DispatcherService;
 use valka_dispatcher::worker_handle::WorkerHandle;
@@ -290,5 +290,178 @@ async fn test_dispatcher_send_signal_wrong_task() {
     assert!(
         !delivered,
         "Should return false when worker has different task"
+    );
+}
+
+// ─── Additional WorkerHandle edge cases ─────────────────────────────
+
+#[test]
+fn test_worker_at_capacity_zero_slots() {
+    let (mut handle, _rx) = make_handle_with_id(WorkerId::new(), 1);
+    handle.assign_task("task-1".to_string());
+    assert_eq!(handle.available_slots(), 0, "Should have zero slots");
+    assert!(!handle.is_idle());
+}
+
+#[test]
+fn test_worker_assign_beyond_capacity() {
+    let (mut handle, _rx) = make_handle_with_id(WorkerId::new(), 2);
+    handle.assign_task("t1".to_string());
+    handle.assign_task("t2".to_string());
+    handle.assign_task("t3".to_string());
+    // available_slots goes negative — enforcement is in the match loop, not the handle
+    assert_eq!(handle.available_slots(), -1);
+}
+
+#[tokio::test]
+async fn test_handle_task_result_empty_output() {
+    let dispatcher = make_dispatcher();
+    let worker_id = WorkerId::new();
+    let (mut handle, _rx) = make_handle_with_id(worker_id.clone(), 2);
+    handle.assign_task("task-empty".to_string());
+    dispatcher.register_worker(handle).await;
+
+    // Verify the task is assigned
+    {
+        let h = dispatcher.workers().get(worker_id.as_ref()).unwrap();
+        assert!(h.active_tasks.contains("task-empty"));
+    }
+
+    // handle_task_result requires DB — but we can test worker state cleanup via
+    // complete_task on the handle directly
+    if let Some(mut h) = dispatcher.workers().get_mut(worker_id.as_ref()) {
+        h.complete_task("task-empty");
+    }
+
+    let h = dispatcher.workers().get(worker_id.as_ref()).unwrap();
+    assert!(
+        !h.active_tasks.contains("task-empty"),
+        "Task should be removed"
+    );
+    assert_eq!(h.available_slots(), 2);
+}
+
+#[tokio::test]
+async fn test_send_signal_worker_channel_closed() {
+    let dispatcher = make_dispatcher();
+    let worker_id = WorkerId::new();
+    let (mut handle, rx) = make_handle_with_id(worker_id.clone(), 2);
+    handle.assign_task("task-orphan".to_string());
+    dispatcher.register_worker(handle).await;
+
+    // Drop the receiver — simulates worker disconnect
+    drop(rx);
+
+    let signal = valka_proto::TaskSignal {
+        signal_id: "sig-closed".to_string(),
+        task_id: "task-orphan".to_string(),
+        signal_name: "ping".to_string(),
+        payload: String::new(),
+        timestamp_ms: 0,
+    };
+
+    // send_signal_to_worker finds the task but send may silently fail
+    let delivered = dispatcher
+        .send_signal_to_worker("task-orphan", signal)
+        .await;
+    assert!(delivered, "Should return true (found the task)");
+    // No panic despite closed channel
+}
+
+#[tokio::test]
+async fn test_cancel_worker_channel_closed() {
+    let dispatcher = make_dispatcher();
+    let worker_id = WorkerId::new();
+    let (mut handle, rx) = make_handle_with_id(worker_id.clone(), 2);
+    handle.assign_task("task-cancel-closed".to_string());
+    dispatcher.register_worker(handle).await;
+
+    // Drop the receiver
+    drop(rx);
+
+    let result = dispatcher.cancel_task_on_worker("task-cancel-closed").await;
+    assert!(result, "Should return true (found the task)");
+    // No panic despite closed channel
+}
+
+#[tokio::test]
+async fn test_register_same_worker_id_twice() {
+    let dispatcher = make_dispatcher();
+    let worker_id = WorkerId::new();
+
+    let (h1, _rx1) = make_handle_with_id(worker_id.clone(), 1);
+    let (h2, _rx2) = make_handle_with_id(worker_id.clone(), 3);
+
+    dispatcher.register_worker(h1).await;
+    dispatcher.register_worker(h2).await;
+
+    // DashMap overwrites — only 1 entry
+    assert_eq!(dispatcher.workers().len(), 1);
+    // Should have the latest concurrency
+    let h = dispatcher.workers().get(worker_id.as_ref()).unwrap();
+    assert_eq!(h.concurrency, 3);
+}
+
+#[tokio::test]
+async fn test_deregister_nonexistent_worker() {
+    let dispatcher = make_dispatcher();
+    // Should not panic
+    dispatcher.deregister_worker(&WorkerId::new()).await;
+    assert_eq!(dispatcher.workers().len(), 0);
+}
+
+#[tokio::test]
+async fn test_dispatcher_clone_shares_workers() {
+    let dispatcher_a = make_dispatcher();
+    let dispatcher_b = dispatcher_a.clone();
+
+    let (handle, _rx) = make_handle_with_id(WorkerId::new(), 1);
+    dispatcher_a.register_worker(handle).await;
+
+    // Clone B should see the worker registered on A
+    assert_eq!(
+        dispatcher_b.workers().len(),
+        1,
+        "Clone should share workers via Arc"
+    );
+}
+
+#[tokio::test]
+async fn test_deregister_clears_matching_service() {
+    let matching = MatchingService::new(MatchingConfig::default());
+    let pool = make_pool();
+    let node_id = NodeId::new();
+    let (event_tx, _) = broadcast::channel(64);
+    let (log_tx, _) = mpsc::channel(64);
+    let dispatcher = DispatcherService::new(matching.clone(), pool, node_id, event_tx, log_tx);
+
+    let worker_id = WorkerId::new();
+    let (handle, _rx) = make_handle_with_id(worker_id.clone(), 2);
+    dispatcher.register_worker(handle).await;
+
+    // Manually register worker in matching service (like the stream handler does)
+    matching.ensure_queue("default");
+    let _mrx = matching.register_worker("default", PartitionId(0), worker_id.clone());
+
+    // Deregister — should remove from both dispatcher AND matching service
+    dispatcher.deregister_worker(&worker_id).await;
+    assert_eq!(dispatcher.workers().len(), 0);
+
+    // Offer task — should fail because worker is gone from matching too
+    let envelope = valka_matching::partition::TaskEnvelope {
+        task_id: "t1".to_string(),
+        task_run_id: String::new(),
+        queue_name: "default".to_string(),
+        task_name: "test".to_string(),
+        input: None,
+        attempt_number: 1,
+        timeout_seconds: 300,
+        metadata: "{}".to_string(),
+        priority: 0,
+    };
+    let result = matching.offer_task("default", PartitionId(0), envelope);
+    assert!(
+        result.is_err(),
+        "Worker should be gone from matching service"
     );
 }
