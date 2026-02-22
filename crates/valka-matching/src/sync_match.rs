@@ -5,6 +5,7 @@ use valka_core::PartitionId;
 
 /// Attempt a synchronous match for a task.
 /// Returns Ok(()) if matched, Err(task) if no worker available.
+#[allow(clippy::result_large_err)]
 pub fn try_sync_match(
     service: &MatchingService,
     queue_name: &str,
@@ -36,6 +37,7 @@ pub fn try_sync_match(
 }
 
 /// Forward a task up the partition tree looking for available workers
+#[allow(clippy::result_large_err)]
 fn try_forward_up(
     service: &MatchingService,
     queue_name: &str,

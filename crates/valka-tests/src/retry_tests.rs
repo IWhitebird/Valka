@@ -153,3 +153,35 @@ fn test_sdk_retry_reset_restarts_sequence() {
         after_reset.as_millis()
     );
 }
+
+// ─── Edge Cases ─────────────────────────────────────────────────────
+
+#[test]
+fn test_retry_delay_zero_base_zero_max() {
+    let d = compute_retry_delay(0, 0, 0);
+    assert_eq!(
+        d.num_seconds(),
+        0,
+        "Zero base and zero max should produce zero delay"
+    );
+
+    let d1 = compute_retry_delay(5, 0, 0);
+    assert_eq!(d1.num_seconds(), 0);
+}
+
+#[test]
+fn test_retry_delay_negative_attempt() {
+    // Negative attempt_count wraps to a large u32 for pow — but saturating_mul caps it
+    let d = compute_retry_delay(-1, 1, 3600);
+    assert_eq!(d.num_seconds(), 3600, "Should be capped at max_delay");
+}
+
+#[test]
+fn test_retry_delay_saturating_overflow() {
+    // u64::MAX base * 2^huge — saturating arithmetic should prevent panic
+    // Note: u64::MAX as i64 wraps, but the important thing is no panic from overflow
+    let _d = compute_retry_delay(0, u64::MAX, u64::MAX);
+    // Also test with large but representable values
+    let d2 = compute_retry_delay(30, 1, i64::MAX as u64);
+    assert_eq!(d2.num_seconds(), 1 << 30, "2^30 seconds");
+}

@@ -78,6 +78,7 @@ impl MatchingService {
     }
 
     /// Offer a task for sync matching. Returns the task back if no match.
+    #[allow(clippy::result_large_err)]
     pub fn offer_task(
         &self,
         queue_name: &str,

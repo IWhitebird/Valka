@@ -140,7 +140,7 @@ impl Default for LogIngesterConfig {
 }
 
 impl ServerConfig {
-    pub fn load(config_path: Option<&str>) -> Result<Self, figment::Error> {
+    pub fn load(config_path: Option<&str>) -> Result<Self, Box<figment::Error>> {
         let mut figment = Figment::from(Serialized::defaults(ServerConfig::default()));
 
         if let Some(path) = config_path {
@@ -149,6 +149,6 @@ impl ServerConfig {
 
         figment = figment.merge(Env::prefixed("VALKA_").split("__"));
 
-        figment.extract()
+        figment.extract().map_err(Box::new)
     }
 }

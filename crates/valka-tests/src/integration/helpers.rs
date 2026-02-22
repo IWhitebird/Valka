@@ -171,6 +171,23 @@ pub fn default_task_params(queue: &str, name: &str) -> CreateTaskParams {
     }
 }
 
+/// Create a signal for a task.
+pub async fn create_test_signal(
+    pool: &PgPool,
+    task_id: &str,
+    name: &str,
+) -> valka_db::queries::signals::SignalRow {
+    valka_db::queries::signals::create_signal(
+        pool,
+        &uuid::Uuid::now_v7().to_string(),
+        task_id,
+        name,
+        None,
+    )
+    .await
+    .expect("create_test_signal failed")
+}
+
 /// Shorthand: create a task run for an existing task.
 pub async fn create_test_run(
     pool: &PgPool,
