@@ -34,3 +34,4 @@ http-body-util = "0.1"
 hyper = { version = "1.6", features = ["full"] }
 tokio-stream = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+cargo-husky = { version = "1", default-features = false, features = ["prepush-hook", "run-cargo-fmt", "run-cargo-clippy"] }

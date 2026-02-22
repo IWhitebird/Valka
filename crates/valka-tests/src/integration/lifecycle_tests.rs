@@ -418,3 +418,221 @@ async fn test_idempotency_key_prevents_duplicate(pool: PgPool) {
     let result = tasks::create_task(&pool, p2).await;
     assert!(result.is_err(), "Duplicate idempotency key should fail");
 }
+
+// ─── Additional Lifecycle Tests ─────────────────────────────────────
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_full_retry_cycle_fail_retry_promote_succeed(pool: PgPool) {
+    let task = create_test_task(&pool, "q", "t").await;
+    let (dispatcher, _matching, _rx) = setup(pool.clone()).await;
+
+    let worker_id = {
+        let entry = dispatcher.workers().iter().next().unwrap();
+        WorkerId(entry.key().clone())
+    };
+
+    // Attempt 1: dispatch and fail (retryable)
+    tasks::update_task_status(&pool, &task.id, "RUNNING")
+        .await
+        .unwrap();
+    tasks::increment_attempt_count(&pool, &task.id)
+        .await
+        .unwrap();
+    let run1 = create_test_run(&pool, &task.id, 1, Utc::now() + Duration::seconds(300)).await;
+
+    let result = valka_proto::TaskResult {
+        task_id: task.id.clone(),
+        task_run_id: run1.id.clone(),
+        success: false,
+        output: String::new(),
+        error_message: "transient".to_string(),
+        retryable: true,
+    };
+    dispatcher.handle_task_result(&worker_id, result).await;
+
+    let retrying = tasks::get_task(&pool, &task.id).await.unwrap().unwrap();
+    assert_eq!(retrying.status, "RETRY");
+
+    // Process retries → sets scheduled_at
+    valka_scheduler::retry::process_retries(&pool, 1, 3600)
+        .await
+        .unwrap();
+
+    // Time-travel: move scheduled_at to the past
+    sqlx::query("UPDATE tasks SET scheduled_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(&task.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Promote → PENDING
+    valka_scheduler::delayed::promote_delayed_tasks(&pool)
+        .await
+        .unwrap();
+
+    // Attempt 2: dispatch and succeed
+    tasks::update_task_status(&pool, &task.id, "RUNNING")
+        .await
+        .unwrap();
+    tasks::increment_attempt_count(&pool, &task.id)
+        .await
+        .unwrap();
+    let run2 = create_test_run(&pool, &task.id, 2, Utc::now() + Duration::seconds(300)).await;
+
+    let result2 = valka_proto::TaskResult {
+        task_id: task.id.clone(),
+        task_run_id: run2.id.clone(),
+        success: true,
+        output: serde_json::json!({"ok": true}).to_string(),
+        error_message: String::new(),
+        retryable: false,
+    };
+    dispatcher.handle_task_result(&worker_id, result2).await;
+
+    let final_task = tasks::get_task(&pool, &task.id).await.unwrap().unwrap();
+    assert_eq!(final_task.status, "COMPLETED");
+    assert_eq!(final_task.attempt_count, 2);
+
+    // Should have 2 runs total
+    let runs = task_runs::get_runs_for_task(&pool, &task.id).await.unwrap();
+    assert_eq!(runs.len(), 2);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_full_dlq_cycle_exhaust_retries(pool: PgPool) {
+    let mut params = default_task_params("q", "t");
+    params.max_retries = 2;
+    let task = create_test_task_full(&pool, params).await;
+
+    // Fail twice through full cycle
+    for attempt in 1..=2 {
+        tasks::update_task_status(&pool, &task.id, "RUNNING")
+            .await
+            .unwrap();
+        tasks::increment_attempt_count(&pool, &task.id)
+            .await
+            .unwrap();
+        let run = create_test_run(
+            &pool,
+            &task.id,
+            attempt,
+            Utc::now() + Duration::seconds(300),
+        )
+        .await;
+        task_runs::fail_task_run(&pool, &run.id, &format!("error {attempt}"))
+            .await
+            .unwrap();
+    }
+
+    // Final failure
+    tasks::fail_task(&pool, &task.id, "final error")
+        .await
+        .unwrap();
+
+    // Process DLQ
+    let count = valka_scheduler::dlq::process_dead_letters(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    let final_task = tasks::get_task(&pool, &task.id).await.unwrap().unwrap();
+    assert_eq!(final_task.status, "DEAD_LETTER");
+
+    let dls = dead_letter::list_dead_letters(&pool, None, 50, 0)
+        .await
+        .unwrap();
+    assert_eq!(dls.len(), 1);
+    assert_eq!(dls[0].task_id, task.id);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_cancel_dispatching_task(pool: PgPool) {
+    let task = create_test_task(&pool, "q", "t").await;
+
+    // Dequeue sets task to DISPATCHING
+    let dequeued = tasks::dequeue_tasks(&pool, "q", task.partition_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(dequeued.len(), 1);
+    assert_eq!(dequeued[0].status, "DISPATCHING");
+
+    // Cancel the DISPATCHING task
+    let cancelled = tasks::cancel_task_any(&pool, &task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancelled.status, "CANCELLED");
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_multiple_concurrent_dequeues_different_partitions(pool: PgPool) {
+    // Create tasks on partitions 0, 1, 2, 3
+    for pid in 0..4 {
+        let mut params = default_task_params("q", &format!("t-p{pid}"));
+        params.partition_id = pid;
+        create_test_task_full(&pool, params).await;
+    }
+
+    // Concurrent dequeue per partition
+    let (r0, r1, r2, r3) = tokio::join!(
+        tasks::dequeue_tasks(&pool, "q", 0, 10),
+        tasks::dequeue_tasks(&pool, "q", 1, 10),
+        tasks::dequeue_tasks(&pool, "q", 2, 10),
+        tasks::dequeue_tasks(&pool, "q", 3, 10),
+    );
+
+    // Each partition should get exactly 1 task (no cross-partition leakage)
+    assert_eq!(r0.unwrap().len(), 1);
+    assert_eq!(r1.unwrap().len(), 1);
+    assert_eq!(r2.unwrap().len(), 1);
+    assert_eq!(r3.unwrap().len(), 1);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_max_retries_zero_immediate_dlq(pool: PgPool) {
+    let mut params = default_task_params("q", "t");
+    params.max_retries = 0;
+    let task = create_test_task_full(&pool, params).await;
+
+    // Fail once
+    tasks::fail_task(&pool, &task.id, "error").await.unwrap();
+
+    // Process DLQ immediately (attempt_count=0 >= max_retries=0)
+    let count = valka_scheduler::dlq::process_dead_letters(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    let final_task = tasks::get_task(&pool, &task.id).await.unwrap().unwrap();
+    assert_eq!(final_task.status, "DEAD_LETTER");
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_dequeue_priority_then_fifo(pool: PgPool) {
+    // Create tasks with different priorities
+    for (name, prio) in [("p5a", 5), ("p3", 3), ("p1", 1), ("p5b", 5)] {
+        let mut params = default_task_params("prio-q", name);
+        params.partition_id = 0;
+        params.priority = prio;
+        create_test_task_full(&pool, params).await;
+    }
+
+    // Dequeue 1 at a time to verify ordering: priority DESC, then created_at ASC
+    let d1 = tasks::dequeue_tasks(&pool, "prio-q", 0, 1).await.unwrap();
+    assert_eq!(
+        d1[0].task_name, "p5a",
+        "First dequeue: highest priority, earliest created"
+    );
+
+    let d2 = tasks::dequeue_tasks(&pool, "prio-q", 0, 1).await.unwrap();
+    assert_eq!(
+        d2[0].task_name, "p5b",
+        "Second dequeue: same priority, later created"
+    );
+
+    let d3 = tasks::dequeue_tasks(&pool, "prio-q", 0, 1).await.unwrap();
+    assert_eq!(d3[0].task_name, "p3", "Third dequeue: next priority level");
+
+    let d4 = tasks::dequeue_tasks(&pool, "prio-q", 0, 1).await.unwrap();
+    assert_eq!(d4[0].task_name, "p1", "Fourth dequeue: lowest priority");
+}

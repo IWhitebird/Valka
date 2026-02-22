@@ -161,11 +161,7 @@ async fn wait_for_members(cluster: &ClusterManager, expected: usize, timeout_sec
 }
 
 /// Determine which partitions a given cluster node owns for the specified queue.
-async fn owned_partitions(
-    cluster: &ClusterManager,
-    queue: &str,
-    num_partitions: i32,
-) -> Vec<i32> {
+async fn owned_partitions(cluster: &ClusterManager, queue: &str, num_partitions: i32) -> Vec<i32> {
     let mut owned = Vec::new();
     for pid in 0..num_partitions {
         if cluster.owns_partition(queue, pid).await {
@@ -189,9 +185,7 @@ fn find_task_for_partition(
             return (id, pid.0);
         }
     }
-    panic!(
-        "Could not find task_id for partitions {target_partitions:?} after 100k attempts"
-    );
+    panic!("Could not find task_id for partitions {target_partitions:?} after 100k attempts");
 }
 
 /// Insert a task into PG with a specific task_id and partition_id.
@@ -294,11 +288,23 @@ async fn test_cluster_partition_ownership_split(pool: PgPool) {
     let queue = "ownership-queue";
 
     let node_a = TestNode::start(
-        pool.clone(), "own-a", 18801, 19801, vec![18802], "test-own", num_partitions,
+        pool.clone(),
+        "own-a",
+        18801,
+        19801,
+        vec![18802],
+        "test-own",
+        num_partitions,
     )
     .await;
     let node_b = TestNode::start(
-        pool, "own-b", 18802, 19802, vec![18801], "test-own", num_partitions,
+        pool,
+        "own-b",
+        18802,
+        19802,
+        vec![18801],
+        "test-own",
+        num_partitions,
     )
     .await;
 
@@ -358,11 +364,23 @@ async fn test_forward_task_no_worker_returns_not_accepted(pool: PgPool) {
     let queue = "noworker-queue";
 
     let node_a = TestNode::start(
-        pool.clone(), "nw-a", 18811, 19811, vec![18812], "test-nw", num_partitions,
+        pool.clone(),
+        "nw-a",
+        18811,
+        19811,
+        vec![18812],
+        "test-nw",
+        num_partitions,
     )
     .await;
     let node_b = TestNode::start(
-        pool.clone(), "nw-b", 18812, 19812, vec![18811], "test-nw", num_partitions,
+        pool.clone(),
+        "nw-b",
+        18812,
+        19812,
+        vec![18811],
+        "test-nw",
+        num_partitions,
     )
     .await;
 
@@ -382,7 +400,10 @@ async fn test_forward_task_no_worker_returns_not_accepted(pool: PgPool) {
         .forward_task(&node_b.grpc_addr.to_string(), &task_id, queue, partition_id)
         .await;
 
-    assert!(result.is_ok(), "forward_task should succeed, got: {result:?}");
+    assert!(
+        result.is_ok(),
+        "forward_task should succeed, got: {result:?}"
+    );
     assert_eq!(
         result.unwrap(),
         false,
@@ -407,11 +428,23 @@ async fn test_forward_task_with_waiting_worker(pool: PgPool) {
     let queue = "worker-queue";
 
     let node_a = TestNode::start(
-        pool.clone(), "fw-a", 18821, 19821, vec![18822], "test-fw", num_partitions,
+        pool.clone(),
+        "fw-a",
+        18821,
+        19821,
+        vec![18822],
+        "test-fw",
+        num_partitions,
     )
     .await;
     let node_b = TestNode::start(
-        pool.clone(), "fw-b", 18822, 19822, vec![18821], "test-fw", num_partitions,
+        pool.clone(),
+        "fw-b",
+        18822,
+        19822,
+        vec![18821],
+        "test-fw",
+        num_partitions,
     )
     .await;
 
@@ -457,11 +490,23 @@ async fn test_cross_node_task_completion(pool: PgPool) {
     let queue = "complete-queue";
 
     let node_a = TestNode::start(
-        pool.clone(), "cmp-a", 18831, 19831, vec![18832], "test-cmp", num_partitions,
+        pool.clone(),
+        "cmp-a",
+        18831,
+        19831,
+        vec![18832],
+        "test-cmp",
+        num_partitions,
     )
     .await;
     let node_b = TestNode::start(
-        pool.clone(), "cmp-b", 18832, 19832, vec![18831], "test-cmp", num_partitions,
+        pool.clone(),
+        "cmp-b",
+        18832,
+        19832,
+        vec![18831],
+        "test-cmp",
+        num_partitions,
     )
     .await;
 
@@ -520,7 +565,10 @@ async fn test_cross_node_task_completion(pool: PgPool) {
             break;
         }
         if tokio::time::Instant::now() > deadline {
-            panic!("Task did not reach COMPLETED status within 5s, status={}", task.status);
+            panic!(
+                "Task did not reach COMPLETED status within 5s, status={}",
+                task.status
+            );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -536,15 +584,33 @@ async fn test_three_node_task_routing(pool: PgPool) {
     let queue = "tri-queue";
 
     let node_a = TestNode::start(
-        pool.clone(), "tri-a", 18841, 19841, vec![18842], "test-tri", num_partitions,
+        pool.clone(),
+        "tri-a",
+        18841,
+        19841,
+        vec![18842],
+        "test-tri",
+        num_partitions,
     )
     .await;
     let node_b = TestNode::start(
-        pool.clone(), "tri-b", 18842, 19842, vec![18841], "test-tri", num_partitions,
+        pool.clone(),
+        "tri-b",
+        18842,
+        19842,
+        vec![18841],
+        "test-tri",
+        num_partitions,
     )
     .await;
     let node_c = TestNode::start(
-        pool.clone(), "tri-c", 18843, 19843, vec![18841, 18842], "test-tri", num_partitions,
+        pool.clone(),
+        "tri-c",
+        18843,
+        19843,
+        vec![18841, 18842],
+        "test-tri",
+        num_partitions,
     )
     .await;
 
@@ -584,7 +650,10 @@ async fn test_three_node_task_routing(pool: PgPool) {
         assert!(accepted, "Node B should accept forwarded task");
 
         let assignment = wait_for_task_assignment(&mut wb_stream, 5).await;
-        assert_eq!(assignment.task_id, task_id, "Worker on Node B should receive the task");
+        assert_eq!(
+            assignment.task_id, task_id,
+            "Worker on Node B should receive the task"
+        );
     }
 
     // Forward a task from Node A to Node C
@@ -600,7 +669,10 @@ async fn test_three_node_task_routing(pool: PgPool) {
         assert!(accepted, "Node C should accept forwarded task");
 
         let assignment = wait_for_task_assignment(&mut wc_stream, 5).await;
-        assert_eq!(assignment.task_id, task_id, "Worker on Node C should receive the task");
+        assert_eq!(
+            assignment.task_id, task_id,
+            "Worker on Node C should receive the task"
+        );
     }
 
     // Forward a task from Node B to Node A
@@ -616,7 +688,10 @@ async fn test_three_node_task_routing(pool: PgPool) {
         assert!(accepted, "Node A should accept forwarded task");
 
         let assignment = wait_for_task_assignment(&mut wa_stream, 5).await;
-        assert_eq!(assignment.task_id, task_id, "Worker on Node A should receive the task");
+        assert_eq!(
+            assignment.task_id, task_id,
+            "Worker on Node A should receive the task"
+        );
     }
 
     node_a.shutdown().await;
@@ -631,11 +706,23 @@ async fn test_grpc_create_task_auto_forwards(pool: PgPool) {
     let queue = "auto-fwd-queue";
 
     let node_a = TestNode::start(
-        pool.clone(), "af-a", 18851, 19851, vec![18852], "test-af", num_partitions,
+        pool.clone(),
+        "af-a",
+        18851,
+        19851,
+        vec![18852],
+        "test-af",
+        num_partitions,
     )
     .await;
     let node_b = TestNode::start(
-        pool.clone(), "af-b", 18852, 19852, vec![18851], "test-af", num_partitions,
+        pool.clone(),
+        "af-b",
+        18852,
+        19852,
+        vec![18851],
+        "test-af",
+        num_partitions,
     )
     .await;
 
@@ -683,9 +770,8 @@ async fn test_grpc_create_task_auto_forwards(pool: PgPool) {
         }
     }
 
-    let forwarded_id = forwarded_task_id.expect(
-        "After 50 tasks, at least one should have landed on a partition owned by Node B",
-    );
+    let forwarded_id = forwarded_task_id
+        .expect("After 50 tasks, at least one should have landed on a partition owned by Node B");
 
     // Worker on Node B should receive the forwarded task
     let assignment = wait_for_task_assignment(&mut worker_stream, 5).await;

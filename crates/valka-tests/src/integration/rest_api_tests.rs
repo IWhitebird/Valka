@@ -859,3 +859,205 @@ async fn test_rest_delete_task_success(pool: PgPool) {
     let body = parse_response_json(resp).await;
     assert_eq!(body["deleted"], true);
 }
+
+// ─── Validation & Edge Cases ────────────────────────────────────────
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_create_task_missing_queue_name(pool: PgPool) {
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(post_json(
+            "/api/v1/tasks",
+            serde_json::json!({"task_name": "t"}),
+        ))
+        .await
+        .unwrap();
+
+    // Missing required field → 422 (Unprocessable Entity from axum deserialization)
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_create_task_missing_task_name(pool: PgPool) {
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(post_json(
+            "/api/v1/tasks",
+            serde_json::json!({"queue_name": "q"}),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_create_task_empty_body(pool: PgPool) {
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(post_json("/api/v1/tasks", serde_json::json!({})))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_create_task_idempotency_conflict(pool: PgPool) {
+    let app = build_test_router(pool.clone());
+
+    let body = serde_json::json!({
+        "queue_name": "q",
+        "task_name": "t",
+        "idempotency_key": "dup-key"
+    });
+
+    let resp1 = app
+        .oneshot(post_json("/api/v1/tasks", body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), StatusCode::CREATED);
+
+    let app2 = build_test_router(pool);
+    let resp2 = app2
+        .oneshot(post_json("/api/v1/tasks", body))
+        .await
+        .unwrap();
+    // Duplicate idempotency_key should fail
+    assert_eq!(resp2.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_delete_running_task(pool: PgPool) {
+    let (task, _run) = create_running_task(&pool, "q").await;
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(delete_req(&format!("/api/v1/tasks/{}", task.id)))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = parse_response_json(resp).await;
+    assert_eq!(body["deleted"], true);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_list_tasks_combined_filters(pool: PgPool) {
+    create_test_task(&pool, "demo", "t1").await;
+    create_test_task(&pool, "demo", "t2").await;
+    create_test_task(&pool, "other", "t3").await;
+    let t4 = create_test_task(&pool, "demo", "t4").await;
+    valka_db::queries::tasks::complete_task(&pool, &t4.id, None)
+        .await
+        .unwrap();
+
+    let app = build_test_router(pool);
+
+    // Filter: queue_name=demo AND status=PENDING AND limit=1
+    let resp = app
+        .oneshot(get_req(
+            "/api/v1/tasks?queue_name=demo&status=PENDING&limit=1",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = parse_response_json(resp).await;
+    let tasks = body.as_array().unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["queue_name"], "demo");
+    assert_eq!(tasks[0]["status"], "PENDING");
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_cancel_running_task(pool: PgPool) {
+    let (task, _run) = create_running_task(&pool, "q").await;
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(post_json(
+            &format!("/api/v1/tasks/{}/cancel", task.id),
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = parse_response_json(resp).await;
+    assert_eq!(body["status"], "CANCELLED");
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_send_signal_dead_letter_task(pool: PgPool) {
+    let task = create_test_task(&pool, "q", "t").await;
+    valka_db::queries::tasks::move_to_dead_letter(&pool, &task.id)
+        .await
+        .unwrap();
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(post_json(
+            &format!("/api/v1/tasks/{}/signal", task.id),
+            serde_json::json!({"signal_name": "test"}),
+        ))
+        .await
+        .unwrap();
+
+    assert_error_response(
+        resp,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "INVALID_STATE",
+        "Cannot send signal to task in DEAD_LETTER state",
+    )
+    .await;
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_create_task_negative_priority(pool: PgPool) {
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(post_json(
+            "/api/v1/tasks",
+            serde_json::json!({
+                "queue_name": "q",
+                "task_name": "t",
+                "priority": -5
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = parse_response_json(resp).await;
+    assert_eq!(body["priority"], -5);
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_rest_create_task_invalid_scheduled_at(pool: PgPool) {
+    let app = build_test_router(pool);
+
+    let resp = app
+        .oneshot(post_json(
+            "/api/v1/tasks",
+            serde_json::json!({
+                "queue_name": "q",
+                "task_name": "t",
+                "scheduled_at": "not-a-date"
+            }),
+        ))
+        .await
+        .unwrap();
+
+    // scheduled_at is parsed with .ok() — invalid string treated as None
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = parse_response_json(resp).await;
+    assert!(
+        body["scheduled_at"].is_null(),
+        "Invalid date should be treated as null"
+    );
+}

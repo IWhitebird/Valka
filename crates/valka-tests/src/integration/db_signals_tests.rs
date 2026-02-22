@@ -279,3 +279,97 @@ async fn test_signal_cascade_on_task_delete(pool: PgPool) {
         "Signals should be cascade-deleted with task"
     );
 }
+
+// ─── Additional Signal Tests ────────────────────────────────────────
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_signal_full_lifecycle_pending_delivered_acknowledged(pool: PgPool) {
+    let task = create_test_task(&pool, "q", "t").await;
+
+    // Create signal → PENDING
+    let signal = create_signal(&pool, "sig-lc", &task.id, "approve", None)
+        .await
+        .unwrap();
+    assert_eq!(signal.status, "PENDING");
+    assert!(signal.delivered_at.is_none());
+    assert!(signal.acknowledged_at.is_none());
+
+    // Mark delivered → DELIVERED
+    let delivered = mark_delivered(&pool, "sig-lc").await.unwrap();
+    assert!(delivered);
+    let sigs = list_signals(&pool, &task.id, Some("DELIVERED"))
+        .await
+        .unwrap();
+    assert_eq!(sigs.len(), 1);
+    assert!(sigs[0].delivered_at.is_some());
+
+    // Mark acknowledged → ACKNOWLEDGED
+    let acked = mark_acknowledged(&pool, "sig-lc").await.unwrap();
+    assert!(acked);
+    let sigs = list_signals(&pool, &task.id, Some("ACKNOWLEDGED"))
+        .await
+        .unwrap();
+    assert_eq!(sigs.len(), 1);
+    assert!(sigs[0].acknowledged_at.is_some());
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_get_pending_signals_excludes_acknowledged(pool: PgPool) {
+    let task = create_test_task(&pool, "q", "t").await;
+
+    // 1 PENDING, 1 DELIVERED, 1 ACKNOWLEDGED
+    create_signal(&pool, "s-p", &task.id, "a", None)
+        .await
+        .unwrap();
+    create_signal(&pool, "s-d", &task.id, "b", None)
+        .await
+        .unwrap();
+    create_signal(&pool, "s-a", &task.id, "c", None)
+        .await
+        .unwrap();
+
+    mark_delivered(&pool, "s-d").await.unwrap();
+    mark_delivered(&pool, "s-a").await.unwrap();
+    mark_acknowledged(&pool, "s-a").await.unwrap();
+
+    let pending = get_pending_signals(&pool, &task.id).await.unwrap();
+    assert_eq!(pending.len(), 1, "Should only return PENDING signals");
+    assert_eq!(pending[0].id, "s-p");
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_reset_signals_leaves_acknowledged_untouched(pool: PgPool) {
+    let task = create_test_task(&pool, "q", "t").await;
+
+    // 1 DELIVERED + 1 ACKNOWLEDGED
+    create_signal(&pool, "s-del", &task.id, "a", None)
+        .await
+        .unwrap();
+    create_signal(&pool, "s-ack", &task.id, "b", None)
+        .await
+        .unwrap();
+
+    mark_delivered(&pool, "s-del").await.unwrap();
+    mark_delivered(&pool, "s-ack").await.unwrap();
+    mark_acknowledged(&pool, "s-ack").await.unwrap();
+
+    // Reset delivered signals
+    let reset_count = reset_delivered_signals(&pool, &task.id).await.unwrap();
+    assert_eq!(
+        reset_count, 1,
+        "Only DELIVERED should be reset, not ACKNOWLEDGED"
+    );
+
+    // Verify: s-del should be PENDING, s-ack should still be ACKNOWLEDGED
+    let pending = list_signals(&pool, &task.id, Some("PENDING"))
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, "s-del");
+
+    let acked = list_signals(&pool, &task.id, Some("ACKNOWLEDGED"))
+        .await
+        .unwrap();
+    assert_eq!(acked.len(), 1);
+    assert_eq!(acked[0].id, "s-ack");
+}

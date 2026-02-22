@@ -96,11 +96,9 @@ impl DispatcherService {
             for queue in &queues {
                 for pid in 0..num_partitions {
                     let partition_id = PartitionId(pid);
-                    let rx = self.matching.register_worker(
-                        queue,
-                        partition_id,
-                        worker_id.clone(),
-                    );
+                    let rx = self
+                        .matching
+                        .register_worker(queue, partition_id, worker_id.clone());
                     receivers.push((queue.clone(), partition_id, rx));
                 }
             }
@@ -112,13 +110,10 @@ impl DispatcherService {
 
             let futs: Vec<_> = receivers
                 .into_iter()
-                .map(|(queue, pid, rx)| {
-                    Box::pin(async move { (queue, pid, rx.await) })
-                })
+                .map(|(queue, pid, rx)| Box::pin(async move { (queue, pid, rx.await) }))
                 .collect();
 
-            let (first_result, _index, remaining) =
-                futures::future::select_all(futs).await;
+            let (first_result, _index, remaining) = futures::future::select_all(futs).await;
 
             for fut in remaining {
                 if let Some((q, p, Ok(envelope))) = fut.now_or_never() {

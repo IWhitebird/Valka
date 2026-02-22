@@ -362,3 +362,68 @@ async fn test_recover_orphaned_dispatching(pool: PgPool) {
     assert_eq!(recovered[0].id, task.id);
     assert_eq!(recovered[0].status, "PENDING");
 }
+
+// ─── Additional Dequeue Tests ───────────────────────────────────────
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_dequeue_respects_partition_filter(pool: PgPool) {
+    // 2 tasks on partition 0, 2 on partition 1
+    for i in 0..2 {
+        let mut params = default_task_params("q", &format!("p0-{i}"));
+        params.partition_id = 0;
+        create_test_task_full(&pool, params).await;
+    }
+    for i in 0..2 {
+        let mut params = default_task_params("q", &format!("p1-{i}"));
+        params.partition_id = 1;
+        create_test_task_full(&pool, params).await;
+    }
+
+    let dequeued_p0 = dequeue_tasks(&pool, "q", 0, 10).await.unwrap();
+    assert_eq!(dequeued_p0.len(), 2, "Should get only partition 0 tasks");
+    for t in &dequeued_p0 {
+        assert_eq!(t.partition_id, 0);
+    }
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_dequeue_priority_ordering(pool: PgPool) {
+    // Create 3 tasks: one with priority 1, one with 5
+    for (name, prio) in [("low", 1), ("high", 5)] {
+        let mut params = default_task_params("pq", name);
+        params.partition_id = 0;
+        params.priority = prio;
+        create_test_task_full(&pool, params).await;
+    }
+
+    // Dequeue 1 — SKIP LOCKED with ORDER BY priority DESC picks the highest priority
+    let dequeued = dequeue_tasks(&pool, "pq", 0, 1).await.unwrap();
+    assert_eq!(dequeued.len(), 1);
+    assert_eq!(
+        dequeued[0].task_name, "high",
+        "Higher priority dequeued first"
+    );
+}
+
+#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
+async fn test_dequeue_fifo_within_same_priority(pool: PgPool) {
+    // 3 tasks with same priority 0
+    for name in ["first", "second", "third"] {
+        let mut params = default_task_params("fifo-q", name);
+        params.partition_id = 0;
+        create_test_task_full(&pool, params).await;
+    }
+
+    // Dequeue 1 at a time — ORDER BY created_at ASC picks oldest first
+    let d1 = dequeue_tasks(&pool, "fifo-q", 0, 1).await.unwrap();
+    assert_eq!(d1.len(), 1);
+    assert_eq!(d1[0].task_name, "first", "Oldest task dequeued first");
+
+    let d2 = dequeue_tasks(&pool, "fifo-q", 0, 1).await.unwrap();
+    assert_eq!(d2.len(), 1);
+    assert_eq!(d2[0].task_name, "second");
+
+    let d3 = dequeue_tasks(&pool, "fifo-q", 0, 1).await.unwrap();
+    assert_eq!(d3.len(), 1);
+    assert_eq!(d3[0].task_name, "third");
+}

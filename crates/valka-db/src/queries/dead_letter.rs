@@ -13,6 +13,7 @@ pub struct DeadLetterRow {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_dead_letter(
     pool: &PgPool,
     id: &str,
