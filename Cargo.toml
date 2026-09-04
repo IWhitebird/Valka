@@ -3,10 +3,10 @@ resolver = "3"
 members = [
     "crates/valka-proto",
     "crates/valka-core",
-    "crates/valka-db",
+    "crates/valka-wal",
+    "crates/valka-engine",
     "crates/valka-matching",
     "crates/valka-dispatcher",
-    "crates/valka-scheduler",
     "crates/valka-cluster",
     "crates/valka-server",
     "crates/valka-sdk",
@@ -41,8 +41,15 @@ axum-extra = { version = "0.10", features = ["typed-header"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 
-# Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "json", "chrono", "uuid", "migrate"] }
+# Object storage / WAL
+object_store = { version = "0.14", features = ["aws"] }
+bytes = "1.10"
+zstd = "0.13"
+crc32fast = "1.4"
+async-trait = "0.1"
+rand = "0.9"
+parking_lot = "0.12"
+xxhash-rust = { version = "0.8", features = ["xxh3", "xxh64"] }
 
 # Cluster
 chitchat = "0.10"
@@ -83,10 +90,10 @@ tikv-jemallocator = "0.6"
 # Workspace crates
 valka-proto = { path = "crates/valka-proto" }
 valka-core = { path = "crates/valka-core" }
-valka-db = { path = "crates/valka-db" }
+valka-wal = { path = "crates/valka-wal" }
+valka-engine = { path = "crates/valka-engine" }
 valka-matching = { path = "crates/valka-matching" }
 valka-dispatcher = { path = "crates/valka-dispatcher" }
-valka-scheduler = { path = "crates/valka-scheduler" }
 valka-cluster = { path = "crates/valka-cluster" }
 valka-sdk = { path = "crates/valka-sdk" }
 

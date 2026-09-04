@@ -1,46 +1,47 @@
 use crate::heartbeat;
 use crate::worker_handle::WorkerHandle;
-use chrono::{Duration, Utc};
 use dashmap::DashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, watch};
-use tracing::{debug, error, info, warn};
-use valka_core::{NodeId, PartitionId, TaskRunId, WorkerId};
-use valka_db::DbPool;
+use tokio::sync::{mpsc, watch};
+use tracing::{debug, info, warn};
+use valka_core::{NodeId, PartitionId, WorkerId};
+use valka_engine::Engine;
 use valka_matching::MatchingService;
 use valka_matching::partition::TaskEnvelope;
 use valka_proto::{
-    Heartbeat, LogBatch, SignalAck, TaskAssignment, TaskCancellation, TaskEvent, TaskResult,
-    TaskSignal, WorkerResponse, worker_response,
+    Heartbeat, LogBatch, SignalAck, TaskAssignment, TaskCancellation, TaskResult, TaskSignal,
+    WorkerResponse, worker_response,
 };
+use valka_wal::logstore::LogLine;
 
 /// The dispatcher manages all connected workers and their gRPC streams.
 #[derive(Clone)]
 pub struct DispatcherService {
     workers: Arc<DashMap<String, WorkerHandle>>,
     matching: MatchingService,
-    pool: DbPool,
+    engine: Engine,
     node_id: NodeId,
-    event_tx: broadcast::Sender<TaskEvent>,
-    log_tx: mpsc::Sender<valka_proto::LogEntry>,
+    log_tx: mpsc::Sender<LogLine>,
 }
 
 impl DispatcherService {
     pub fn new(
         matching: MatchingService,
-        pool: DbPool,
+        engine: Engine,
         node_id: NodeId,
-        event_tx: broadcast::Sender<TaskEvent>,
-        log_tx: mpsc::Sender<valka_proto::LogEntry>,
+        log_tx: mpsc::Sender<LogLine>,
     ) -> Self {
         Self {
             workers: Arc::new(DashMap::new()),
             matching,
-            pool,
+            engine,
             node_id,
-            event_tx,
             log_tx,
         }
+    }
+
+    pub fn engine(&self) -> &Engine {
+        &self.engine
     }
 
     pub async fn register_worker(&self, handle: WorkerHandle) {
@@ -51,24 +52,17 @@ impl DispatcherService {
 
     pub async fn deregister_worker(&self, worker_id: &WorkerId) {
         if let Some((_, handle)) = self.workers.remove(worker_id.as_ref()) {
-            // Deregister from matching service
             self.matching.deregister_worker(worker_id);
-
-            // Reset delivered (unacknowledged) signals for all active tasks
+            // Delivered-but-unacked signals go back to PENDING for redelivery.
             for task_id in &handle.active_tasks {
-                if let Err(e) =
-                    valka_db::queries::signals::reset_delivered_signals(&self.pool, task_id).await
-                {
-                    warn!(task_id = %task_id, error = %e, "Failed to reset signals on deregister");
-                }
+                self.engine.reset_signals(task_id);
             }
-
             info!(
                 worker_id = %worker_id,
                 active_tasks = handle.active_tasks.len(),
                 "Worker deregistered"
             );
-            // Active tasks will be handled by lease expiry in the scheduler
+            // Active tasks are reclaimed by lease expiry in the engine.
         }
         valka_core::metrics::set_active_workers(self.workers.len() as f64);
     }
@@ -116,8 +110,12 @@ impl DispatcherService {
             let (first_result, _index, remaining) = futures::future::select_all(futs).await;
 
             for fut in remaining {
-                if let Some((q, p, Ok(envelope))) = fut.now_or_never() {
-                    self.matching.buffer_task(&q, p, envelope);
+                if let Some((q, p, Ok(envelope))) = fut.now_or_never()
+                    && !self
+                        .matching
+                        .buffer_task(&q, p, envelope.clone_for_requeue())
+                {
+                    self.engine.unoffer(&envelope.task_id);
                 }
             }
 
@@ -132,263 +130,129 @@ impl DispatcherService {
         }
     }
 
-    async fn dispatch_to_worker(&self, worker_id: &WorkerId, mut envelope: TaskEnvelope) {
-        // Create a task run
-        let run_id = TaskRunId::new();
-        envelope.task_run_id = run_id.0.clone();
+    async fn dispatch_to_worker(&self, worker_id: &WorkerId, envelope: TaskEnvelope) {
+        // Is the worker still here? If not, hand the task back before recording anything.
+        if !self.workers.contains_key(worker_id.as_ref()) {
+            self.engine.unoffer(&envelope.task_id);
+            return;
+        }
 
-        let lease_duration = Duration::seconds(envelope.timeout_seconds as i64 + 30);
-        let lease_expires = Utc::now() + lease_duration;
-
-        // Use a transaction to atomically: increment attempt, set RUNNING, create run
-        let mut tx = match self.pool.begin().await {
-            Ok(tx) => tx,
+        // Record the dispatch (RUNNING + run + lease) in the engine.
+        let info = match self.engine.dispatch(&envelope.task_id, &worker_id.0) {
+            Ok(info) => info,
             Err(e) => {
-                error!(task_id = %envelope.task_id, error = %e, "Failed to begin transaction");
+                // Cancelled / deleted / already running: nothing to do.
+                debug!(task_id = %envelope.task_id, error = %e, "dispatch refused by engine");
                 return;
             }
         };
 
-        // Increment attempt count
-        if let Err(e) = sqlx::query(
-            "UPDATE tasks SET attempt_count = attempt_count + 1, updated_at = NOW() WHERE id = $1",
-        )
-        .bind(&envelope.task_id)
-        .execute(&mut *tx)
-        .await
-        {
-            error!(task_id = %envelope.task_id, error = %e, "Failed to increment attempt count");
-            let _ = tx.rollback().await;
-            return;
-        }
+        valka_core::metrics::record_dispatch_latency(&info.task.queue_name, 0.0);
 
-        // Update task status to RUNNING
-        if let Err(e) =
-            sqlx::query("UPDATE tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1")
-                .bind(&envelope.task_id)
-                .execute(&mut *tx)
-                .await
-        {
-            error!(task_id = %envelope.task_id, error = %e, "Failed to update task status");
-            let _ = tx.rollback().await;
-            return;
-        }
-
-        // Create task run
-        if let Err(e) = sqlx::query(
-            r#"INSERT INTO task_runs (id, task_id, attempt_number, worker_id, assigned_node_id, lease_expires_at)
-               VALUES ($1, $2, $3, $4, $5, $6)"#,
-        )
-        .bind(&run_id.0)
-        .bind(&envelope.task_id)
-        .bind(envelope.attempt_number)
-        .bind(&worker_id.0)
-        .bind(&self.node_id.0)
-        .bind(lease_expires)
-        .execute(&mut *tx)
-        .await
-        {
-            error!(task_id = %envelope.task_id, error = %e, "Failed to create task run");
-            let _ = tx.rollback().await;
-            return;
-        }
-
-        if let Err(e) = tx.commit().await {
-            error!(task_id = %envelope.task_id, error = %e, "Failed to commit dispatch transaction");
-            return;
-        }
-
-        // Record dispatch latency metric
-        valka_core::metrics::record_dispatch_latency(&envelope.queue_name, 0.0);
-
-        // Emit TaskEvent for RUNNING
-        self.emit_event(&envelope.task_id, &envelope.queue_name, 3); // 3 = RUNNING
-
-        // Build assignment message
         let assignment = TaskAssignment {
-            task_id: envelope.task_id.clone(),
-            task_run_id: run_id.0.clone(),
-            queue_name: envelope.queue_name.clone(),
-            task_name: envelope.task_name.clone(),
-            input: envelope.input.unwrap_or_default(),
-            attempt_number: envelope.attempt_number,
-            timeout_seconds: envelope.timeout_seconds,
-            metadata: envelope.metadata,
+            task_id: info.task.task_id.clone(),
+            task_run_id: info.run_id.clone(),
+            queue_name: info.task.queue_name.clone(),
+            task_name: info.task.task_name.clone(),
+            input: info.task.input.map(|v| v.to_string()).unwrap_or_default(),
+            attempt_number: info.attempt,
+            timeout_seconds: info.task.timeout_seconds,
+            metadata: info.task.metadata.to_string(),
         };
 
-        // Send to worker via their response channel
-        if let Some(mut handle) = self.workers.get_mut(worker_id.as_ref()) {
-            handle.assign_task(envelope.task_id.clone());
-            let response = WorkerResponse {
-                response: Some(worker_response::Response::TaskAssignment(assignment)),
-            };
-            if handle.response_tx.send(response).await.is_err() {
-                warn!(worker_id = %worker_id, "Failed to send task assignment - worker disconnected");
+        let tx = {
+            let Some(mut handle) = self.workers.get_mut(worker_id.as_ref()) else {
+                // Worker vanished between the check and now: the lease will expire and
+                // the task retries. At-least-once.
                 return;
-            }
+            };
+            handle.assign_task(envelope.task_id.clone());
+            handle.response_tx.clone()
+        };
+        let response = WorkerResponse {
+            response: Some(worker_response::Response::TaskAssignment(assignment)),
+        };
+        if tx.send(response).await.is_err() {
+            warn!(worker_id = %worker_id, "Failed to send task assignment - worker disconnected");
+            return;
+        }
 
-            // Deliver any pending signals for this task
-            let tx = handle.response_tx.clone();
-            drop(handle); // Release DashMap guard before DB call
-            match valka_db::queries::signals::get_pending_signals(&self.pool, &envelope.task_id)
-                .await
-            {
-                Ok(signals) => {
-                    for sig in signals {
-                        let signal_response = WorkerResponse {
-                            response: Some(worker_response::Response::TaskSignal(TaskSignal {
-                                signal_id: sig.id.clone(),
-                                task_id: sig.task_id,
-                                signal_name: sig.signal_name,
-                                payload: sig.payload.map(|v| v.to_string()).unwrap_or_default(),
-                                timestamp_ms: sig.created_at.timestamp_millis(),
-                            })),
-                        };
-                        if tx.send(signal_response).await.is_ok() {
-                            let _ = valka_db::queries::signals::mark_delivered(&self.pool, &sig.id)
-                                .await;
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(task_id = %envelope.task_id, error = %e, "Failed to load pending signals");
-                }
+        // Deliver any pending signals for this task.
+        for sig in self.engine.pending_signals(&envelope.task_id) {
+            let signal_response = WorkerResponse {
+                response: Some(worker_response::Response::TaskSignal(TaskSignal {
+                    signal_id: sig.id.clone(),
+                    task_id: sig.task_id,
+                    signal_name: sig.signal_name,
+                    payload: sig.payload.map(|v| v.to_string()).unwrap_or_default(),
+                    timestamp_ms: sig.created_at.timestamp_millis(),
+                })),
+            };
+            if tx.send(signal_response).await.is_ok() {
+                self.engine.signal_delivered(&sig.id);
             }
         }
     }
 
     pub async fn handle_task_result(&self, worker_id: &WorkerId, result: TaskResult) {
-        // Update worker state
         if let Some(mut handle) = self.workers.get_mut(worker_id.as_ref()) {
             handle.complete_task(&result.task_id);
         }
 
-        if result.success {
+        let outcome = if result.success {
             let output: Option<serde_json::Value> = if result.output.is_empty() {
                 None
             } else {
                 serde_json::from_str(&result.output).ok()
             };
-
-            // Atomically complete both run and task in a single transaction
-            let tx_result: Result<(), sqlx::Error> = async {
-                let mut tx = self.pool.begin().await?;
-
-                sqlx::query(
-                    "UPDATE task_runs SET status = 'COMPLETED', output = $2, completed_at = NOW() \
-                     WHERE id = $1 AND status = 'RUNNING'",
-                )
-                .bind(&result.task_run_id)
-                .bind(&output)
-                .execute(&mut *tx)
-                .await?;
-
-                sqlx::query(
-                    "UPDATE tasks SET status = 'COMPLETED', output = $2, updated_at = NOW() \
-                     WHERE id = $1",
-                )
-                .bind(&result.task_id)
-                .bind(&output)
-                .execute(&mut *tx)
-                .await?;
-
-                tx.commit().await?;
-                Ok(())
-            }
-            .await;
-
-            if let Err(e) = tx_result {
-                error!(
-                    task_id = %result.task_id,
-                    task_run_id = %result.task_run_id,
-                    error = %e,
-                    "Failed to complete task/run transaction"
-                );
-            }
-
-            valka_core::metrics::record_task_completed("");
-            self.emit_event(&result.task_id, "", 4); // 4 = COMPLETED
+            self.engine
+                .complete_run(&result.task_id, &result.task_run_id, output)
+                .await
+                .map(|_| ())
         } else {
-            // Atomically fail run and update task status in a single transaction
-            let tx_result: Result<(), sqlx::Error> = async {
-                let mut tx = self.pool.begin().await?;
-
-                sqlx::query(
-                    "UPDATE task_runs SET status = 'FAILED', error_message = $2, \
-                     completed_at = NOW() WHERE id = $1 AND status = 'RUNNING'",
+            self.engine
+                .fail_run(
+                    &result.task_id,
+                    &result.task_run_id,
+                    &result.error_message,
+                    result.retryable,
                 )
-                .bind(&result.task_run_id)
-                .bind(&result.error_message)
-                .execute(&mut *tx)
-                .await?;
+                .await
+                .map(|_| ())
+        };
 
-                if result.retryable {
-                    sqlx::query(
-                        "UPDATE tasks SET status = 'RETRY', updated_at = NOW() WHERE id = $1",
-                    )
-                    .bind(&result.task_id)
-                    .execute(&mut *tx)
-                    .await?;
-                } else {
-                    sqlx::query(
-                        "UPDATE tasks SET status = 'FAILED', error_message = $2, \
-                         updated_at = NOW() WHERE id = $1",
-                    )
-                    .bind(&result.task_id)
-                    .bind(&result.error_message)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-
-                tx.commit().await?;
-                Ok(())
-            }
-            .await;
-
-            if let Err(e) = tx_result {
-                error!(
-                    task_id = %result.task_id,
-                    task_run_id = %result.task_run_id,
-                    error = %e,
-                    "Failed to process task result transaction"
-                );
-            }
-
-            if result.retryable {
-                valka_core::metrics::record_task_retried("");
-                self.emit_event(&result.task_id, "", 6); // 6 = RETRY
-            } else {
-                valka_core::metrics::record_task_failed("");
-                self.emit_event(&result.task_id, "", 5); // 5 = FAILED
-            }
+        if let Err(e) = outcome {
+            // Stale result (task cancelled, lease already expired, duplicate): log and drop.
+            warn!(
+                task_id = %result.task_id,
+                task_run_id = %result.task_run_id,
+                error = %e,
+                "task result not applied"
+            );
         }
     }
 
     pub async fn handle_heartbeat(&self, worker_id: &WorkerId, heartbeat: Heartbeat) {
         if let Some(mut handle) = self.workers.get_mut(worker_id.as_ref()) {
             handle.update_heartbeat();
-
-            // Extend leases for active tasks
-            for task_id in &heartbeat.active_task_ids {
-                // Look up the task run ID from active tasks
-                // We use the task_id to update the lease on any RUNNING run
-                let lease_extension = Duration::seconds(60); // Extend by 60 seconds
-                let new_lease = Utc::now() + lease_extension;
-                // Update heartbeat for all running runs of this task
-                if let Err(e) = valka_db::queries::task_runs::update_heartbeat_by_task(
-                    &self.pool, task_id, new_lease,
-                )
-                .await
-                {
-                    error!(task_id = %task_id, error = %e, "Failed to extend task run lease");
-                }
-            }
         }
+        self.engine.heartbeat(&heartbeat.active_task_ids);
     }
 
     pub async fn handle_log_batch(&self, _worker_id: &WorkerId, batch: LogBatch) {
         for entry in batch.entries {
-            let _ = self.log_tx.send(entry).await;
+            let line = LogLine {
+                task_run_id: entry.task_run_id,
+                timestamp_ms: entry.timestamp_ms,
+                level: log_level_to_string(entry.level),
+                message: entry.message,
+                metadata: if entry.metadata.is_empty() {
+                    None
+                } else {
+                    serde_json::from_str(&entry.metadata).ok()
+                },
+            };
+            let _ = self.log_tx.send(line).await;
         }
     }
 
@@ -429,36 +293,15 @@ impl DispatcherService {
 
     /// Handle a signal acknowledgement from a worker
     pub async fn handle_signal_ack(&self, ack: &SignalAck) {
-        if let Err(e) =
-            valka_db::queries::signals::mark_acknowledged(&self.pool, &ack.signal_id).await
-        {
-            warn!(signal_id = %ack.signal_id, error = %e, "Failed to acknowledge signal");
-        }
+        self.engine.signal_acked(&ack.signal_id);
     }
 
     pub fn workers(&self) -> &Arc<DashMap<String, WorkerHandle>> {
         &self.workers
     }
 
-    pub fn event_tx(&self) -> &broadcast::Sender<TaskEvent> {
-        &self.event_tx
-    }
-
-    /// Emit a task event
-    fn emit_event(&self, task_id: &str, queue_name: &str, new_status: i32) {
-        let event = TaskEvent {
-            event_id: uuid::Uuid::now_v7().to_string(),
-            task_id: task_id.to_string(),
-            queue_name: queue_name.to_string(),
-            previous_status: 0,
-            new_status,
-            worker_id: String::new(),
-            node_id: self.node_id.0.clone(),
-            attempt_number: 0,
-            error_message: String::new(),
-            timestamp_ms: Utc::now().timestamp_millis(),
-        };
-        let _ = self.event_tx.send(event);
+    pub fn node_id(&self) -> &NodeId {
+        &self.node_id
     }
 
     /// Start the heartbeat checker background task
@@ -471,4 +314,15 @@ impl DispatcherService {
         let handle = tokio::spawn(heartbeat::heartbeat_checker(workers, shutdown, dead_tx));
         (handle, dead_rx)
     }
+}
+
+pub fn log_level_to_string(level: i32) -> String {
+    match level {
+        1 => "DEBUG",
+        2 => "INFO",
+        3 => "WARN",
+        4 => "ERROR",
+        _ => "INFO",
+    }
+    .to_string()
 }

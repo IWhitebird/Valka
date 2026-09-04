@@ -9,25 +9,55 @@ pub struct ServerConfig {
     pub node_id: String,
     pub grpc_addr: String,
     pub http_addr: String,
-    pub database_url: String,
-    /// Direct PG URL for migrations (bypasses PgBouncer). Falls back to database_url.
-    pub migration_database_url: Option<String>,
-    /// Run migrations then exit. Used by Helm pre-install Jobs.
-    pub migrate_only: bool,
-    /// Skip migrations on startup. Follower nodes set this when the leader handles migrations.
-    pub skip_migrations: bool,
     pub web_dir: String,
-    pub database: DatabaseConfig,
+    pub storage: StorageConfig,
+    pub wal: WalConfig,
     pub gossip: GossipConfig,
     pub matching: MatchingConfig,
     pub scheduler: SchedulerConfig,
     pub log_ingester: LogIngesterConfig,
 }
 
+/// Where the WAL, snapshots and logs live. The bucket is the only durable state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DatabaseConfig {
-    pub max_connections: u32,
-    pub acquire_timeout_secs: u64,
+pub struct StorageConfig {
+    /// `memory` (tests), `local` (a directory), or `s3` (AWS S3 / MinIO / any S3-compatible).
+    pub backend: String,
+    /// Directory for the `local` backend.
+    pub path: String,
+    /// Bucket name for the `s3` backend.
+    pub bucket: String,
+    /// Optional key prefix inside the bucket (e.g. `valka/prod`).
+    pub prefix: String,
+    /// Custom endpoint for S3-compatible stores (MinIO: `http://localhost:9000`).
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    /// Credentials. When unset, the AWS default chain (env, profile, IMDS) is used.
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    /// Allow plain-HTTP endpoints (MinIO in dev).
+    pub allow_http: bool,
+}
+
+/// WAL writer / snapshot knobs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalConfig {
+    /// Group-commit window. Nothing is acked before its segment is written.
+    pub flush_interval_ms: u64,
+    /// Flush early once the buffer reaches this many bytes.
+    pub max_batch_bytes: usize,
+    /// How many segment PUTs may be in flight concurrently.
+    pub max_inflight_segments: usize,
+    /// PUT retry attempts before parked acks fail with UNAVAILABLE.
+    pub put_retries: u32,
+    /// Snapshot dirty shards at least this often.
+    pub snapshot_interval_secs: u64,
+    /// Snapshot a shard once it has this many records since its last snapshot.
+    pub snapshot_after_records: u64,
+    /// Snapshots older than the newest N per shard are deleted.
+    pub snapshots_to_keep: usize,
+    /// Terminal tasks (COMPLETED/FAILED/CANCELLED/DEAD_LETTER) are dropped from RAM after this.
+    pub completed_retention_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,19 +73,24 @@ pub struct MatchingConfig {
     pub num_partitions: i32,
     pub branching_factor: usize,
     pub max_buffer_per_partition: usize,
-    pub task_reader_batch_size: i64,
-    pub task_reader_poll_busy_ms: u64,
-    pub task_reader_poll_idle_ms: u64,
+    /// How often the feeder tops up matching buffers from the engine's pending heaps.
+    pub feeder_interval_ms: u64,
+    /// Max tasks moved per queue per feeder tick.
+    pub feeder_batch_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerConfig {
-    pub reaper_interval_secs: u64,
-    pub lease_timeout_secs: i64,
+    /// Timer wheel resolution (lease expiry, retry promotion, delayed tasks).
+    pub timer_tick_ms: u64,
+    /// Extra time granted on top of a task's timeout before its lease expires.
+    pub lease_grace_secs: i64,
+    /// Lease granted to RUNNING tasks recovered from the WAL until the worker re-handshakes.
+    pub recovery_grace_secs: i64,
+    /// Lease granted from each heartbeat: the worker has this long to heartbeat again.
+    pub heartbeat_lease_secs: i64,
     pub retry_base_delay_secs: u64,
     pub retry_max_delay_secs: u64,
-    pub dlq_check_interval_secs: u64,
-    pub delayed_check_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,12 +105,9 @@ impl Default for ServerConfig {
             node_id: String::new(),
             grpc_addr: "0.0.0.0:50051".to_string(),
             http_addr: "0.0.0.0:8989".to_string(),
-            database_url: "postgresql://valka:valka@localhost:5432/valka".to_string(),
-            migration_database_url: None,
-            migrate_only: false,
-            skip_migrations: false,
             web_dir: "web/dist".to_string(),
-            database: DatabaseConfig::default(),
+            storage: StorageConfig::default(),
+            wal: WalConfig::default(),
             gossip: GossipConfig::default(),
             matching: MatchingConfig::default(),
             scheduler: SchedulerConfig::default(),
@@ -84,11 +116,33 @@ impl Default for ServerConfig {
     }
 }
 
-impl Default for DatabaseConfig {
+impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            max_connections: 20,
-            acquire_timeout_secs: 5,
+            backend: "local".to_string(),
+            path: "./data".to_string(),
+            bucket: "valka".to_string(),
+            prefix: String::new(),
+            endpoint: None,
+            region: None,
+            access_key_id: None,
+            secret_access_key: None,
+            allow_http: false,
+        }
+    }
+}
+
+impl Default for WalConfig {
+    fn default() -> Self {
+        Self {
+            flush_interval_ms: 50,
+            max_batch_bytes: 4 * 1024 * 1024,
+            max_inflight_segments: 4,
+            put_retries: 8,
+            snapshot_interval_secs: 60,
+            snapshot_after_records: 50_000,
+            snapshots_to_keep: 2,
+            completed_retention_secs: 24 * 3600,
         }
     }
 }
@@ -110,9 +164,8 @@ impl Default for MatchingConfig {
             num_partitions: 4,
             branching_factor: 3,
             max_buffer_per_partition: 1000,
-            task_reader_batch_size: 50,
-            task_reader_poll_busy_ms: 10,
-            task_reader_poll_idle_ms: 200,
+            feeder_interval_ms: 20,
+            feeder_batch_size: 200,
         }
     }
 }
@@ -120,12 +173,12 @@ impl Default for MatchingConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            reaper_interval_secs: 10,
-            lease_timeout_secs: 60,
+            timer_tick_ms: 100,
+            lease_grace_secs: 30,
+            recovery_grace_secs: 60,
+            heartbeat_lease_secs: 60,
             retry_base_delay_secs: 1,
             retry_max_delay_secs: 3600,
-            dlq_check_interval_secs: 30,
-            delayed_check_interval_secs: 5,
         }
     }
 }

@@ -16,6 +16,23 @@ pub struct TaskEnvelope {
     pub priority: i32,
 }
 
+impl TaskEnvelope {
+    /// Clone for re-buffering (envelopes are otherwise moved through channels).
+    pub fn clone_for_requeue(&self) -> TaskEnvelope {
+        TaskEnvelope {
+            task_id: self.task_id.clone(),
+            task_run_id: self.task_run_id.clone(),
+            queue_name: self.queue_name.clone(),
+            task_name: self.task_name.clone(),
+            input: self.input.clone(),
+            attempt_number: self.attempt_number,
+            timeout_seconds: self.timeout_seconds,
+            metadata: self.metadata.clone(),
+            priority: self.priority,
+        }
+    }
+}
+
 /// A worker slot waiting for a task assignment
 pub struct WorkerSlot {
     pub worker_id: WorkerId,

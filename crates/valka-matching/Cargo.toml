@@ -6,10 +6,9 @@ license.workspace = true
 
 [dependencies]
 valka-core = { workspace = true }
-valka-db = { workspace = true }
+valka-engine = { workspace = true }
 dashmap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 metrics = { workspace = true }
-sqlx = { workspace = true }

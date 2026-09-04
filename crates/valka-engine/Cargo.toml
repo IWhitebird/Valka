@@ -1,0 +1,24 @@
+[package]
+name = "valka-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+valka-core = { workspace = true }
+valka-wal = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+xxhash-rust = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+rand = { workspace = true }
+object_store = { workspace = true }

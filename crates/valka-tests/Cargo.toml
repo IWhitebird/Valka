@@ -11,10 +11,8 @@ integration = []
 [dependencies]
 valka-core = { workspace = true }
 valka-proto = { workspace = true }
-valka-db = { workspace = true }
 valka-matching = { workspace = true }
 valka-dispatcher = { workspace = true }
-valka-scheduler = { workspace = true }
 valka-cluster = { workspace = true }
 valka-sdk = { workspace = true }
 valka-server = { path = "../valka-server" }
@@ -26,7 +24,6 @@ uuid = { workspace = true }
 futures = { workspace = true }
 tonic = { workspace = true }
 dashmap = { workspace = true }
-sqlx = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }

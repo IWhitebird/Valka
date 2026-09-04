@@ -16,4 +16,4 @@ tracing = { workspace = true }
 metrics = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
-sqlx = { workspace = true }
+xxhash-rust = { workspace = true }

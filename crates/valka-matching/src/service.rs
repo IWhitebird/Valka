@@ -149,4 +149,34 @@ impl MatchingService {
     pub fn config(&self) -> &MatchingConfig {
         &self.config
     }
+
+    /// Free buffer slots across a queue's partitions (0 for unknown queues, which are
+    /// created on first offer, so report the full capacity instead).
+    pub fn free_capacity(&self, queue_name: &str) -> usize {
+        let n = self.config.num_partitions;
+        let mut known = false;
+        let mut free = 0usize;
+        for i in 0..n {
+            if let Some(p) = self.partitions.get(&(queue_name.to_string(), i)) {
+                known = true;
+                free += p.max_buffer_size.saturating_sub(p.pending_tasks.len());
+            }
+        }
+        if known {
+            free
+        } else {
+            self.config.max_buffer_per_partition * n as usize
+        }
+    }
+
+    /// Total buffered (not yet dispatched) tasks for a queue.
+    pub fn buffered(&self, queue_name: &str) -> usize {
+        (0..self.config.num_partitions)
+            .filter_map(|i| {
+                self.partitions
+                    .get(&(queue_name.to_string(), i))
+                    .map(|p| p.pending_tasks.len())
+            })
+            .sum()
+    }
 }

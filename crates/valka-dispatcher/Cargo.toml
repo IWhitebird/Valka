@@ -8,7 +8,8 @@ license.workspace = true
 valka-core = { workspace = true }
 valka-proto = { workspace = true }
 valka-matching = { workspace = true }
-valka-db = { workspace = true }
+valka-engine = { workspace = true }
+valka-wal = { workspace = true }
 dashmap = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -19,5 +20,4 @@ metrics = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 serde_json = { workspace = true }
-sqlx = { workspace = true }
 futures = { workspace = true }
