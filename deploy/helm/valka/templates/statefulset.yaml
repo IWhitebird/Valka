@@ -47,13 +47,18 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: VALKA_DATABASE_URL
+            {{- if or .Values.storage.existingSecret .Values.storage.accessKeyId }}
+            - name: VALKA_STORAGE__ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.database.existingSecret | default (printf "%s-db" (include "valka.fullname" .)) }}
-                  key: {{ .Values.database.secretKey }}
-            - name: VALKA_SKIP_MIGRATIONS
-              value: "true"
+                  name: {{ .Values.storage.existingSecret | default (printf "%s-s3" (include "valka.fullname" .)) }}
+                  key: access-key-id
+            - name: VALKA_STORAGE__SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.storage.existingSecret | default (printf "%s-s3" (include "valka.fullname" .)) }}
+                  key: secret-access-key
+            {{- end }}
             - name: VALKA_GOSSIP__ADVERTISE_ADDR
               value: "$(POD_NAME).{{ include "valka.fullname" . }}-headless.$(POD_NAMESPACE).svc.cluster.local:{{ .Values.config.gossip.port }}"
             - name: RUST_LOG
@@ -92,36 +97,6 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-        {{- if .Values.pgbouncer.enabled }}
-        - name: pgbouncer
-          image: "{{ .Values.pgbouncer.image.repository }}:{{ .Values.pgbouncer.image.tag }}"
-          env:
-            - name: DATABASE_URL
-              value: {{ printf "postgresql://%s:$(PG_PASSWORD)@%s:%v/%s" .Values.postgresql.username .Values.postgresql.host (.Values.postgresql.port | int) .Values.postgresql.database | quote }}
-            - name: PG_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.postgresql.existingSecret | default (printf "%s-pg" (include "valka.fullname" .)) }}
-                  key: password
-            - name: AUTH_TYPE
-              value: scram-sha-256
-            - name: MAX_CLIENT_CONN
-              value: {{ .Values.pgbouncer.maxClientConn | quote }}
-            - name: DEFAULT_POOL_SIZE
-              value: {{ .Values.pgbouncer.defaultPoolSize | quote }}
-            - name: POOL_MODE
-              value: {{ .Values.pgbouncer.poolMode | quote }}
-            - name: MAX_PREPARED_STATEMENTS
-              value: "100"
-          ports:
-            - name: pgbouncer
-              containerPort: 5432
-              protocol: TCP
-          {{- with .Values.pgbouncer.resources }}
-          resources:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-        {{- end }}
       volumes:
         - name: config
           configMap:

@@ -1,8 +1,8 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::{Duration, Utc};
-use sqlx::PgPool;
 use tower::ServiceExt;
+use valka_core::TaskStatus;
 
 use super::helpers::*;
 
@@ -23,78 +23,82 @@ fn post_json(uri: &str, body: serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
+fn post_empty(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap()
+}
+
 fn get_req(uri: &str) -> Request<Body> {
     Request::builder().uri(uri).body(Body::empty()).unwrap()
 }
 
 // ─── POST /api/v1/tasks ─────────────────────────────────────────────
 
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_create_task(pool: PgPool) {
-    let app = build_test_router(pool);
-
-    let resp = app
+#[tokio::test(start_paused = true)]
+async fn test_rest_create_task() {
+    let node = TestNode::new().await;
+    let resp = node
+        .router()
         .oneshot(post_json(
             "/api/v1/tasks",
-            serde_json::json!({
-                "queue_name": "demo",
-                "task_name": "email.send",
-                "input": {"to": "user@example.com"}
-            }),
+            serde_json::json!({"queue_name": "demo", "task_name": "email.send", "input": {"to": "user@example.com"}}),
         ))
         .await
         .unwrap();
-
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body = parse_response_json(resp).await;
     assert_eq!(body["queue_name"], "demo");
     assert_eq!(body["task_name"], "email.send");
     assert_eq!(body["status"], "PENDING");
+    assert_eq!(body["input"]["to"], "user@example.com");
     assert!(!body["id"].as_str().unwrap().is_empty());
+    // Durable in the bucket.
+    node.engine.sync().await.unwrap();
+    assert_eq!(
+        valka_wal::reader::read_all(&node.store, "test-node", None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_create_task_minimal(pool: PgPool) {
-    let app = build_test_router(pool);
-
-    let resp = app
+#[tokio::test(start_paused = true)]
+async fn test_rest_create_task_minimal() {
+    let node = TestNode::new().await;
+    let resp = node
+        .router()
         .oneshot(post_json(
             "/api/v1/tasks",
-            serde_json::json!({
-                "queue_name": "q",
-                "task_name": "t"
-            }),
+            serde_json::json!({"queue_name": "q", "task_name": "t"}),
         ))
         .await
         .unwrap();
-
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body = parse_response_json(resp).await;
     assert_eq!(body["status"], "PENDING");
     assert!(body["input"].is_null());
+    assert_eq!(body["metadata"], serde_json::json!({}));
 }
 
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_create_task_all_fields(pool: PgPool) {
-    let app = build_test_router(pool);
-
-    let resp = app
+#[tokio::test(start_paused = true)]
+async fn test_rest_create_task_all_fields() {
+    let node = TestNode::new().await;
+    let resp = node
+        .router()
         .oneshot(post_json(
             "/api/v1/tasks",
             serde_json::json!({
-                "queue_name": "billing",
-                "task_name": "charge",
-                "input": {"amount": 100},
-                "priority": 10,
-                "max_retries": 5,
-                "timeout_seconds": 600,
-                "idempotency_key": "idem-001",
-                "metadata": {"source": "api"}
+                "queue_name": "billing", "task_name": "charge", "input": {"amount": 100},
+                "priority": 10, "max_retries": 5, "timeout_seconds": 600,
+                "idempotency_key": "idem-001", "metadata": {"source": "api"}
             }),
         ))
         .await
         .unwrap();
-
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body = parse_response_json(resp).await;
     assert_eq!(body["priority"], 10);
@@ -104,960 +108,926 @@ async fn test_rest_create_task_all_fields(pool: PgPool) {
     assert_eq!(body["metadata"]["source"], "api");
 }
 
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_create_task_with_scheduled_at(pool: PgPool) {
-    let app = build_test_router(pool);
-    let future = (Utc::now() + Duration::hours(1)).to_rfc3339();
-
-    let resp = app
+#[tokio::test(start_paused = true)]
+async fn test_rest_create_task_with_scheduled_at() {
+    let node = TestNode::new().await;
+    let future = (node.engine.clock().now() + Duration::hours(1)).to_rfc3339();
+    let resp = node
+        .router()
         .oneshot(post_json(
             "/api/v1/tasks",
-            serde_json::json!({
-                "queue_name": "q",
-                "task_name": "t",
-                "scheduled_at": future
-            }),
+            serde_json::json!({"queue_name": "q", "task_name": "t", "scheduled_at": future}),
         ))
         .await
         .unwrap();
-
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body = parse_response_json(resp).await;
-    assert!(!body["scheduled_at"].is_null());
+    assert_eq!(body["status"], "PENDING");
+    assert!(body["scheduled_at"].as_str().is_some());
+    // Not runnable yet.
+    assert_eq!(node.engine.pending_count("q"), 0);
 }
 
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_create_task_defaults(pool: PgPool) {
-    let app = build_test_router(pool);
-
-    let resp = app
+#[tokio::test(start_paused = true)]
+async fn test_rest_create_task_defaults() {
+    let node = TestNode::new().await;
+    let resp = node
+        .router()
         .oneshot(post_json(
             "/api/v1/tasks",
-            serde_json::json!({
-                "queue_name": "q",
-                "task_name": "t"
-            }),
+            serde_json::json!({"queue_name": "q", "task_name": "t"}),
         ))
         .await
         .unwrap();
-
     let body = parse_response_json(resp).await;
     assert_eq!(body["priority"], 0);
     assert_eq!(body["max_retries"], 3);
     assert_eq!(body["timeout_seconds"], 300);
+    assert_eq!(body["attempt_count"], 0);
+    assert!(body["idempotency_key"].is_null());
 }
 
-// ─── GET /api/v1/tasks/{id} ─────────────────────────────────────────
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_get_task(pool: PgPool) {
-    let task = create_test_task(&pool, "q", "t").await;
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(get_req(&format!("/api/v1/tasks/{}", task.id)))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = parse_response_json(resp).await;
-    assert_eq!(body["id"], task.id);
-    assert_eq!(body["queue_name"], "q");
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_get_task_not_found(pool: PgPool) {
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(get_req("/api/v1/tasks/nonexistent-id"))
-        .await
-        .unwrap();
-
-    assert_error_response(resp, StatusCode::NOT_FOUND, "NOT_FOUND", "Task not found").await;
-}
-
-// ─── GET /api/v1/tasks ──────────────────────────────────────────────
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_list_tasks(pool: PgPool) {
-    for i in 0..5 {
-        create_test_task(&pool, "q", &format!("t{i}")).await;
-    }
-    let app = build_test_router(pool);
-
-    let resp = app.oneshot(get_req("/api/v1/tasks")).await.unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = parse_response_json(resp).await;
-    assert_eq!(body.as_array().unwrap().len(), 5);
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_list_tasks_filter_queue(pool: PgPool) {
-    create_test_task(&pool, "demo", "t1").await;
-    create_test_task(&pool, "demo", "t2").await;
-    create_test_task(&pool, "other", "t3").await;
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(get_req("/api/v1/tasks?queue_name=demo"))
-        .await
-        .unwrap();
-
-    let body = parse_response_json(resp).await;
-    let tasks = body.as_array().unwrap();
-    assert_eq!(tasks.len(), 2);
-    assert!(tasks.iter().all(|t| t["queue_name"] == "demo"));
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_list_tasks_filter_status(pool: PgPool) {
-    let t1 = create_test_task(&pool, "q", "t1").await;
-    create_test_task(&pool, "q", "t2").await;
-    valka_db::queries::tasks::complete_task(&pool, &t1.id, None)
-        .await
-        .unwrap();
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(get_req("/api/v1/tasks?status=PENDING"))
-        .await
-        .unwrap();
-
-    let body = parse_response_json(resp).await;
-    assert_eq!(body.as_array().unwrap().len(), 1);
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_list_tasks_pagination(pool: PgPool) {
-    for i in 0..5 {
-        create_test_task(&pool, "q", &format!("t{i}")).await;
-    }
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(get_req("/api/v1/tasks?limit=2&offset=2"))
-        .await
-        .unwrap();
-
-    let body = parse_response_json(resp).await;
-    assert_eq!(body.as_array().unwrap().len(), 2);
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_list_tasks_empty(pool: PgPool) {
-    let app = build_test_router(pool);
-
-    let resp = app.oneshot(get_req("/api/v1/tasks")).await.unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = parse_response_json(resp).await;
-    assert_eq!(body.as_array().unwrap().len(), 0);
-}
-
-// ─── POST /api/v1/tasks/{id}/cancel ─────────────────────────────────
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_cancel_task_pending(pool: PgPool) {
-    let task = create_test_task(&pool, "q", "t").await;
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(post_json(
-            &format!("/api/v1/tasks/{}/cancel", task.id),
-            serde_json::json!({}),
-        ))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = parse_response_json(resp).await;
-    assert_eq!(body["status"], "CANCELLED");
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_cancel_task_not_found(pool: PgPool) {
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(post_json(
-            "/api/v1/tasks/nonexistent/cancel",
-            serde_json::json!({}),
-        ))
-        .await
-        .unwrap();
-
-    assert_error_response(
-        resp,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "INVALID_STATE",
-        "not in cancellable state",
-    )
-    .await;
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_cancel_task_already_completed(pool: PgPool) {
-    let task = create_test_task(&pool, "q", "t").await;
-    valka_db::queries::tasks::complete_task(&pool, &task.id, None)
-        .await
-        .unwrap();
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(post_json(
-            &format!("/api/v1/tasks/{}/cancel", task.id),
-            serde_json::json!({}),
-        ))
-        .await
-        .unwrap();
-
-    assert_error_response(
-        resp,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "INVALID_STATE",
-        "not in cancellable state",
-    )
-    .await;
-}
-
-// ─── GET /api/v1/tasks/{id}/runs ────────────────────────────────────
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_get_task_runs(pool: PgPool) {
-    let (task, _run) = create_running_task(&pool, "q").await;
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(get_req(&format!("/api/v1/tasks/{}/runs", task.id)))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = parse_response_json(resp).await;
-    let runs = body.as_array().unwrap();
-    assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0]["task_id"], task.id);
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_get_task_runs_empty(pool: PgPool) {
-    let task = create_test_task(&pool, "q", "t").await;
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(get_req(&format!("/api/v1/tasks/{}/runs", task.id)))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = parse_response_json(resp).await;
-    assert_eq!(body.as_array().unwrap().len(), 0);
-}
-
-// ─── GET /api/v1/tasks/{task_id}/runs/{run_id}/logs ─────────────────
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_get_run_logs(pool: PgPool) {
-    let (task, run) = create_running_task(&pool, "q").await;
-    let entries = vec![valka_db::queries::task_logs::InsertLogEntry {
-        task_run_id: run.id.clone(),
-        timestamp_ms: 1000,
-        level: "INFO".to_string(),
-        message: "hello".to_string(),
-        metadata: None,
-    }];
-    valka_db::queries::task_logs::batch_insert_logs(&pool, &entries)
-        .await
-        .unwrap();
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(get_req(&format!(
-            "/api/v1/tasks/{}/runs/{}/logs",
-            task.id, run.id
-        )))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = parse_response_json(resp).await;
-    let logs = body.as_array().unwrap();
-    assert_eq!(logs.len(), 1);
-    assert_eq!(logs[0]["message"], "hello");
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_get_run_logs_with_after_id(pool: PgPool) {
-    let (task, run) = create_running_task(&pool, "q").await;
-    let entries: Vec<valka_db::queries::task_logs::InsertLogEntry> = (0..5)
-        .map(|i| valka_db::queries::task_logs::InsertLogEntry {
-            task_run_id: run.id.clone(),
-            timestamp_ms: 1000 + i,
-            level: "INFO".to_string(),
-            message: format!("msg-{i}"),
-            metadata: None,
-        })
-        .collect();
-    valka_db::queries::task_logs::batch_insert_logs(&pool, &entries)
-        .await
-        .unwrap();
-
-    // Get all logs to find an ID for cursor
-    let app = build_test_router(pool.clone());
-    let resp = app
-        .oneshot(get_req(&format!(
-            "/api/v1/tasks/{}/runs/{}/logs?limit=2",
-            task.id, run.id
-        )))
-        .await
-        .unwrap();
-    let body = parse_response_json(resp).await;
-    let logs = body.as_array().unwrap();
-    let after_id = logs.last().unwrap()["id"].as_i64().unwrap();
-
-    // Page 2 using after_id
-    let app2 = build_test_router(pool);
-    let resp2 = app2
-        .oneshot(get_req(&format!(
-            "/api/v1/tasks/{}/runs/{}/logs?limit=2&after_id={after_id}",
-            task.id, run.id
-        )))
-        .await
-        .unwrap();
-    let body2 = parse_response_json(resp2).await;
-    let page2 = body2.as_array().unwrap();
-    assert_eq!(page2.len(), 2);
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_get_run_logs_empty(pool: PgPool) {
-    let (task, run) = create_running_task(&pool, "q").await;
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(get_req(&format!(
-            "/api/v1/tasks/{}/runs/{}/logs",
-            task.id, run.id
-        )))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = parse_response_json(resp).await;
-    assert_eq!(body.as_array().unwrap().len(), 0);
-}
-
-// ─── GET /api/v1/workers ────────────────────────────────────────────
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_list_workers_empty(pool: PgPool) {
-    let app = build_test_router(pool);
-
-    let resp = app.oneshot(get_req("/api/v1/workers")).await.unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = parse_response_json(resp).await;
-    assert_eq!(body.as_array().unwrap().len(), 0);
-}
-
-// ─── GET /api/v1/dead-letters ───────────────────────────────────────
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_list_dead_letters(pool: PgPool) {
-    let task = create_test_task(&pool, "q", "t").await;
-    valka_db::queries::dead_letter::insert_dead_letter(
-        &pool,
-        &uuid::Uuid::now_v7().to_string(),
-        &task.id,
-        "q",
-        "t",
-        None,
-        Some("error"),
-        3,
-        &serde_json::json!({}),
-    )
-    .await
-    .unwrap();
-    let app = build_test_router(pool);
-
-    let resp = app.oneshot(get_req("/api/v1/dead-letters")).await.unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = parse_response_json(resp).await;
-    assert_eq!(body.as_array().unwrap().len(), 1);
-    assert_eq!(body[0]["task_id"], task.id);
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_list_dead_letters_filter_queue(pool: PgPool) {
-    let task_a = create_test_task(&pool, "queue-a", "t").await;
-    let task_b = create_test_task(&pool, "queue-b", "t").await;
-
-    for (task, queue) in [(&task_a, "queue-a"), (&task_b, "queue-b")] {
-        valka_db::queries::dead_letter::insert_dead_letter(
-            &pool,
-            &uuid::Uuid::now_v7().to_string(),
-            &task.id,
-            queue,
-            "t",
-            None,
-            None,
-            1,
-            &serde_json::json!({}),
-        )
-        .await
-        .unwrap();
-    }
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(get_req("/api/v1/dead-letters?queue_name=queue-a"))
-        .await
-        .unwrap();
-
-    let body = parse_response_json(resp).await;
-    let dls = body.as_array().unwrap();
-    assert_eq!(dls.len(), 1);
-    assert_eq!(dls[0]["queue_name"], "queue-a");
-}
-
-// ─── GET /healthz ───────────────────────────────────────────────────
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_healthz(pool: PgPool) {
-    let app = build_test_router(pool);
-
-    let resp = app.oneshot(get_req("/healthz")).await.unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(body.as_ref(), b"ok");
-}
-
-// ─── POST /api/v1/tasks/{id}/signal ─────────────────────────────────
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_send_signal(pool: PgPool) {
-    let task = create_test_task(&pool, "q", "t").await;
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(post_json(
-            &format!("/api/v1/tasks/{}/signal", task.id),
-            serde_json::json!({ "signal_name": "approve" }),
-        ))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let body = parse_response_json(resp).await;
-    assert!(!body["signal_id"].as_str().unwrap().is_empty());
-    // No worker connected in tests, so delivered should be false
-    assert_eq!(body["delivered"], false);
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_send_signal_with_payload(pool: PgPool) {
-    let task = create_test_task(&pool, "q", "t").await;
-    let app = build_test_router(pool.clone());
-
-    let resp = app
-        .oneshot(post_json(
-            &format!("/api/v1/tasks/{}/signal", task.id),
-            serde_json::json!({
-                "signal_name": "data",
-                "payload": {"key": "value", "count": 42}
-            }),
-        ))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::CREATED);
-
-    // Verify payload persisted via list
-    let app2 = build_test_router(pool);
-    let resp2 = app2
-        .oneshot(get_req(&format!("/api/v1/tasks/{}/signals", task.id)))
-        .await
-        .unwrap();
-    let body = parse_response_json(resp2).await;
-    let signals = body.as_array().unwrap();
-    assert_eq!(signals.len(), 1);
-    assert_eq!(signals[0]["payload"]["key"], "value");
-    assert_eq!(signals[0]["payload"]["count"], 42);
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_send_signal_no_payload(pool: PgPool) {
-    let task = create_test_task(&pool, "q", "t").await;
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(post_json(
-            &format!("/api/v1/tasks/{}/signal", task.id),
-            serde_json::json!({ "signal_name": "ping" }),
-        ))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::CREATED);
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_send_signal_task_not_found(pool: PgPool) {
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(post_json(
-            "/api/v1/tasks/nonexistent-id/signal",
-            serde_json::json!({ "signal_name": "test" }),
-        ))
-        .await
-        .unwrap();
-
-    assert_error_response(resp, StatusCode::NOT_FOUND, "NOT_FOUND", "Task not found").await;
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_send_signal_completed_task(pool: PgPool) {
-    let task = create_test_task(&pool, "q", "t").await;
-    valka_db::queries::tasks::complete_task(&pool, &task.id, None)
-        .await
-        .unwrap();
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(post_json(
-            &format!("/api/v1/tasks/{}/signal", task.id),
-            serde_json::json!({ "signal_name": "test" }),
-        ))
-        .await
-        .unwrap();
-
-    assert_error_response(
-        resp,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "INVALID_STATE",
-        "Cannot send signal to task in COMPLETED state",
-    )
-    .await;
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_send_signal_failed_task(pool: PgPool) {
-    let task = create_test_task(&pool, "q", "t").await;
-    valka_db::queries::tasks::fail_task(&pool, &task.id, "error")
-        .await
-        .unwrap();
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(post_json(
-            &format!("/api/v1/tasks/{}/signal", task.id),
-            serde_json::json!({ "signal_name": "test" }),
-        ))
-        .await
-        .unwrap();
-
-    assert_error_response(
-        resp,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "INVALID_STATE",
-        "Cannot send signal to task in FAILED state",
-    )
-    .await;
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_send_signal_cancelled_task(pool: PgPool) {
-    let task = create_test_task(&pool, "q", "t").await;
-    valka_db::queries::tasks::cancel_task_any(&pool, &task.id)
-        .await
-        .unwrap();
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(post_json(
-            &format!("/api/v1/tasks/{}/signal", task.id),
-            serde_json::json!({ "signal_name": "test" }),
-        ))
-        .await
-        .unwrap();
-
-    assert_error_response(
-        resp,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "INVALID_STATE",
-        "Cannot send signal to task in CANCELLED state",
-    )
-    .await;
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_send_signal_running_task(pool: PgPool) {
-    let (task, _run) = create_running_task(&pool, "q").await;
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(post_json(
-            &format!("/api/v1/tasks/{}/signal", task.id),
-            serde_json::json!({ "signal_name": "pause" }),
-        ))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::CREATED);
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_send_signal_retry_task(pool: PgPool) {
-    let task = create_test_task(&pool, "q", "t").await;
-    valka_db::queries::tasks::update_task_status(&pool, &task.id, "RETRY")
-        .await
-        .unwrap();
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(post_json(
-            &format!("/api/v1/tasks/{}/signal", task.id),
-            serde_json::json!({ "signal_name": "nudge" }),
-        ))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::CREATED);
-}
-
-// ─── GET /api/v1/tasks/{id}/signals ─────────────────────────────────
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_list_signals(pool: PgPool) {
-    let task = create_test_task(&pool, "q", "t").await;
-    for i in 0..3 {
-        valka_db::queries::signals::create_signal(
-            &pool,
-            &format!("sig-{i}"),
-            &task.id,
-            &format!("signal-{i}"),
-            None,
-        )
-        .await
-        .unwrap();
-    }
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(get_req(&format!("/api/v1/tasks/{}/signals", task.id)))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = parse_response_json(resp).await;
-    assert_eq!(body.as_array().unwrap().len(), 3);
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_list_signals_filter_status(pool: PgPool) {
-    let task = create_test_task(&pool, "q", "t").await;
-    valka_db::queries::signals::create_signal(&pool, "s1", &task.id, "a", None)
-        .await
-        .unwrap();
-    valka_db::queries::signals::create_signal(&pool, "s2", &task.id, "b", None)
-        .await
-        .unwrap();
-    valka_db::queries::signals::mark_delivered(&pool, "s2")
-        .await
-        .unwrap();
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(get_req(&format!(
-            "/api/v1/tasks/{}/signals?status=PENDING",
-            task.id
-        )))
-        .await
-        .unwrap();
-
-    let body = parse_response_json(resp).await;
-    let signals = body.as_array().unwrap();
-    assert_eq!(signals.len(), 1);
-    assert_eq!(signals[0]["status"], "PENDING");
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_list_signals_empty(pool: PgPool) {
-    let task = create_test_task(&pool, "q", "t").await;
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(get_req(&format!("/api/v1/tasks/{}/signals", task.id)))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = parse_response_json(resp).await;
-    assert_eq!(body.as_array().unwrap().len(), 0);
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_send_multiple_signals_same_name(pool: PgPool) {
-    let task = create_test_task(&pool, "q", "t").await;
-    let app = build_test_router(pool.clone());
-
-    for _ in 0..3 {
-        let app_inner = build_test_router(pool.clone());
-        let resp = app_inner
-            .oneshot(post_json(
-                &format!("/api/v1/tasks/{}/signal", task.id),
-                serde_json::json!({ "signal_name": "approve" }),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-    }
-
-    // Verify all 3 persisted
-    let resp = app
-        .oneshot(get_req(&format!("/api/v1/tasks/{}/signals", task.id)))
-        .await
-        .unwrap();
-    let body = parse_response_json(resp).await;
-    let signals = body.as_array().unwrap();
-    assert_eq!(signals.len(), 3);
-    assert!(signals.iter().all(|s| s["signal_name"] == "approve"));
-}
-
-// ─── DELETE /api/v1/tasks/{id} error ─────────────────────────────────
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_delete_task_not_found(pool: PgPool) {
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(delete_req("/api/v1/tasks/nonexistent-id"))
-        .await
-        .unwrap();
-
-    assert_error_response(resp, StatusCode::NOT_FOUND, "NOT_FOUND", "Task not found").await;
-}
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_delete_task_success(pool: PgPool) {
-    let task = create_test_task(&pool, "q", "t").await;
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(delete_req(&format!("/api/v1/tasks/{}", task.id)))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = parse_response_json(resp).await;
-    assert_eq!(body["deleted"], true);
-}
-
-// ─── Validation & Edge Cases ────────────────────────────────────────
-
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_create_task_missing_queue_name(pool: PgPool) {
-    let app = build_test_router(pool);
-
-    let resp = app
+#[tokio::test(start_paused = true)]
+async fn test_rest_create_task_missing_queue_name() {
+    let node = TestNode::new().await;
+    let resp = node
+        .router()
         .oneshot(post_json(
             "/api/v1/tasks",
             serde_json::json!({"task_name": "t"}),
         ))
         .await
         .unwrap();
-
-    // Missing required field → 422 (Unprocessable Entity from axum deserialization)
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_create_task_missing_task_name(pool: PgPool) {
-    let app = build_test_router(pool);
-
-    let resp = app
+#[tokio::test(start_paused = true)]
+async fn test_rest_create_task_missing_task_name() {
+    let node = TestNode::new().await;
+    let resp = node
+        .router()
         .oneshot(post_json(
             "/api/v1/tasks",
             serde_json::json!({"queue_name": "q"}),
         ))
         .await
         .unwrap();
-
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_create_task_empty_body(pool: PgPool) {
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(post_json("/api/v1/tasks", serde_json::json!({})))
+#[tokio::test(start_paused = true)]
+async fn test_rest_create_task_empty_names_rejected() {
+    let node = TestNode::new().await;
+    let resp = node
+        .router()
+        .oneshot(post_json(
+            "/api/v1/tasks",
+            serde_json::json!({"queue_name": "", "task_name": ""}),
+        ))
         .await
         .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_error_response(resp, StatusCode::BAD_REQUEST, "BAD_REQUEST", "required").await;
 }
 
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_create_task_idempotency_conflict(pool: PgPool) {
-    let app = build_test_router(pool.clone());
+#[tokio::test(start_paused = true)]
+async fn test_rest_create_task_empty_body() {
+    let node = TestNode::new().await;
+    let resp = node
+        .router()
+        .oneshot(post_empty("/api/v1/tasks"))
+        .await
+        .unwrap();
+    assert!(resp.status().is_client_error());
+}
 
-    let body = serde_json::json!({
-        "queue_name": "q",
-        "task_name": "t",
-        "idempotency_key": "dup-key"
-    });
-
-    let resp1 = app
+#[tokio::test(start_paused = true)]
+async fn test_rest_create_task_idempotency_conflict() {
+    let node = TestNode::new().await;
+    let body = serde_json::json!({"queue_name": "q", "task_name": "t", "idempotency_key": "same"});
+    let r1 = node
+        .router()
         .oneshot(post_json("/api/v1/tasks", body.clone()))
         .await
         .unwrap();
-    assert_eq!(resp1.status(), StatusCode::CREATED);
-
-    let app2 = build_test_router(pool);
-    let resp2 = app2
+    assert_eq!(r1.status(), StatusCode::CREATED);
+    let r2 = node
+        .router()
         .oneshot(post_json("/api/v1/tasks", body))
         .await
         .unwrap();
-    // Duplicate idempotency_key should fail
-    assert_eq!(resp2.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_error_response(r2, StatusCode::CONFLICT, "CONFLICT", "same").await;
 }
 
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_delete_running_task(pool: PgPool) {
-    let (task, _run) = create_running_task(&pool, "q").await;
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(delete_req(&format!("/api/v1/tasks/{}", task.id)))
+#[tokio::test(start_paused = true)]
+async fn test_rest_create_task_negative_priority() {
+    let node = TestNode::new().await;
+    let resp = node
+        .router()
+        .oneshot(post_json(
+            "/api/v1/tasks",
+            serde_json::json!({"queue_name": "q", "task_name": "t", "priority": -5}),
+        ))
         .await
         .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(parse_response_json(resp).await["priority"], -5);
+}
 
+#[tokio::test(start_paused = true)]
+async fn test_rest_create_task_invalid_scheduled_at() {
+    let node = TestNode::new().await;
+    let resp = node
+        .router()
+        .oneshot(post_json(
+            "/api/v1/tasks",
+            serde_json::json!({"queue_name": "q", "task_name": "t", "scheduled_at": "not-a-date"}),
+        ))
+        .await
+        .unwrap();
+    assert_error_response(resp, StatusCode::BAD_REQUEST, "BAD_REQUEST", "scheduled_at").await;
+}
+
+// ─── GET /api/v1/tasks/:id ──────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_get_task() {
+    let node = TestNode::new().await;
+    let t = node.create("q", "t").await;
+    let resp = node
+        .router()
+        .oneshot(get_req(&format!("/api/v1/tasks/{}", t.id)))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = parse_response_json(resp).await;
-    assert_eq!(body["deleted"], true);
+    assert_eq!(body["id"], t.id);
+    assert_eq!(body["status"], "PENDING");
+    assert_eq!(body["input"]["key"], "value");
 }
 
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_list_tasks_combined_filters(pool: PgPool) {
-    create_test_task(&pool, "demo", "t1").await;
-    create_test_task(&pool, "demo", "t2").await;
-    create_test_task(&pool, "other", "t3").await;
-    let t4 = create_test_task(&pool, "demo", "t4").await;
-    valka_db::queries::tasks::complete_task(&pool, &t4.id, None)
+#[tokio::test(start_paused = true)]
+async fn test_rest_get_task_not_found() {
+    let node = TestNode::new().await;
+    let resp = node
+        .router()
+        .oneshot(get_req("/api/v1/tasks/does-not-exist"))
         .await
         .unwrap();
-
-    let app = build_test_router(pool);
-
-    // Filter: queue_name=demo AND status=PENDING AND limit=1
-    let resp = app
+    assert_error_response(resp, StatusCode::NOT_FOUND, "NOT_FOUND", "not found").await;
+    let resp = node
+        .router()
         .oneshot(get_req(
-            "/api/v1/tasks?queue_name=demo&status=PENDING&limit=1",
+            "/api/v1/tasks/00000000-0000-7000-8000-000000000001",
         ))
         .await
         .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = parse_response_json(resp).await;
-    let tasks = body.as_array().unwrap();
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0]["queue_name"], "demo");
-    assert_eq!(tasks[0]["status"], "PENDING");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_cancel_running_task(pool: PgPool) {
-    let (task, _run) = create_running_task(&pool, "q").await;
-    let app = build_test_router(pool);
+// ─── GET /api/v1/tasks ──────────────────────────────────────────────
 
-    let resp = app
-        .oneshot(post_json(
-            &format!("/api/v1/tasks/{}/cancel", task.id),
-            serde_json::json!({}),
-        ))
+#[tokio::test(start_paused = true)]
+async fn test_rest_list_tasks() {
+    let node = TestNode::new().await;
+    for i in 0..3 {
+        node.create("q", &format!("t{i}")).await;
+    }
+    let resp = node
+        .router()
+        .oneshot(get_req("/api/v1/tasks"))
         .await
         .unwrap();
-
     assert_eq!(resp.status(), StatusCode::OK);
     let body = parse_response_json(resp).await;
-    assert_eq!(body["status"], "CANCELLED");
+    assert_eq!(body.as_array().unwrap().len(), 3);
 }
 
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_send_signal_dead_letter_task(pool: PgPool) {
-    let task = create_test_task(&pool, "q", "t").await;
-    valka_db::queries::tasks::move_to_dead_letter(&pool, &task.id)
+#[tokio::test(start_paused = true)]
+async fn test_rest_list_tasks_filter_queue() {
+    let node = TestNode::new().await;
+    node.create("a", "t").await;
+    node.create("a", "t").await;
+    node.create("b", "t").await;
+    let body = parse_response_json(
+        node.router()
+            .oneshot(get_req("/api/v1/tasks?queue_name=a"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body.as_array().unwrap().len(), 2);
+    assert!(
+        body.as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["queue_name"] == "a")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_list_tasks_filter_status() {
+    let node = TestNode::new().await;
+    let a = node.create("q", "t").await;
+    node.create("q", "t").await;
+    node.complete(&a.id).await;
+    let body = parse_response_json(
+        node.router()
+            .oneshot(get_req("/api/v1/tasks?status=COMPLETED"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["id"], a.id);
+    let body = parse_response_json(
+        node.router()
+            .oneshot(get_req("/api/v1/tasks?status=PENDING"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    let resp = node
+        .router()
+        .oneshot(get_req("/api/v1/tasks?status=BOGUS"))
         .await
         .unwrap();
-    let app = build_test_router(pool);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
 
-    let resp = app
-        .oneshot(post_json(
-            &format!("/api/v1/tasks/{}/signal", task.id),
-            serde_json::json!({"signal_name": "test"}),
-        ))
+#[tokio::test(start_paused = true)]
+async fn test_rest_list_tasks_pagination() {
+    let node = TestNode::new().await;
+    for _ in 0..5 {
+        node.create("q", "t").await;
+        tokio::time::advance(std::time::Duration::from_millis(2)).await;
+    }
+    let p1 = parse_response_json(
+        node.router()
+            .oneshot(get_req("/api/v1/tasks?limit=2&offset=0"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let p2 = parse_response_json(
+        node.router()
+            .oneshot(get_req("/api/v1/tasks?limit=2&offset=2"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let p3 = parse_response_json(
+        node.router()
+            .oneshot(get_req("/api/v1/tasks?limit=2&offset=4"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(p1.as_array().unwrap().len(), 2);
+    assert_eq!(p2.as_array().unwrap().len(), 2);
+    assert_eq!(p3.as_array().unwrap().len(), 1);
+    assert_ne!(p1[0]["id"], p2[0]["id"]);
+    // newest first
+    assert!(p1[0]["created_at"].as_str().unwrap() >= p1[1]["created_at"].as_str().unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_list_tasks_empty() {
+    let node = TestNode::new().await;
+    let body = parse_response_json(
+        node.router()
+            .oneshot(get_req("/api/v1/tasks"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body, serde_json::json!([]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_list_tasks_combined_filters() {
+    let node = TestNode::new().await;
+    let a = node.create("a", "t").await;
+    node.create("a", "t").await;
+    let b = node.create("b", "t").await;
+    node.complete(&a.id).await;
+    node.complete(&b.id).await;
+    let body = parse_response_json(
+        node.router()
+            .oneshot(get_req("/api/v1/tasks?queue_name=a&status=COMPLETED"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["id"], a.id);
+}
+
+// ─── POST /api/v1/tasks/:id/cancel ──────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_cancel_task_pending() {
+    let node = TestNode::new().await;
+    let t = node.create("q", "t").await;
+    let resp = node
+        .router()
+        .oneshot(post_empty(&format!("/api/v1/tasks/{}/cancel", t.id)))
         .await
         .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(parse_response_json(resp).await["status"], "CANCELLED");
+    assert_eq!(node.engine.pending_count("q"), 0);
+}
 
+#[tokio::test(start_paused = true)]
+async fn test_rest_cancel_task_not_found() {
+    let node = TestNode::new().await;
+    let resp = node
+        .router()
+        .oneshot(post_empty("/api/v1/tasks/nope/cancel"))
+        .await
+        .unwrap();
     assert_error_response(
         resp,
         StatusCode::UNPROCESSABLE_ENTITY,
         "INVALID_STATE",
-        "Cannot send signal to task in DEAD_LETTER state",
+        "not found or not in cancellable state",
     )
     .await;
 }
 
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_create_task_negative_priority(pool: PgPool) {
-    let app = build_test_router(pool);
-
-    let resp = app
-        .oneshot(post_json(
-            "/api/v1/tasks",
-            serde_json::json!({
-                "queue_name": "q",
-                "task_name": "t",
-                "priority": -5
-            }),
-        ))
+#[tokio::test(start_paused = true)]
+async fn test_rest_cancel_task_already_completed() {
+    let node = TestNode::new().await;
+    let t = node.create("q", "t").await;
+    node.complete(&t.id).await;
+    let resp = node
+        .router()
+        .oneshot(post_empty(&format!("/api/v1/tasks/{}/cancel", t.id)))
         .await
         .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let body = parse_response_json(resp).await;
-    assert_eq!(body["priority"], -5);
+    assert_error_response(
+        resp,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "INVALID_STATE",
+        "cancellable",
+    )
+    .await;
 }
 
-#[sqlx::test(migrations = "../../crates/valka-db/migrations")]
-async fn test_rest_create_task_invalid_scheduled_at(pool: PgPool) {
-    let app = build_test_router(pool);
+#[tokio::test(start_paused = true)]
+async fn test_rest_cancel_running_task() {
+    let node = TestNode::new().await;
+    let t = node.create("q", "t").await;
+    let (wid, mut rx) = node.register_worker(&["q"], 1).await;
+    node.engine.dispatch(&t.id, &wid.0).unwrap();
+    node.dispatcher
+        .workers()
+        .get_mut(wid.as_ref())
+        .unwrap()
+        .assign_task(t.id.clone());
+    let resp = node
+        .router()
+        .oneshot(post_empty(&format!("/api/v1/tasks/{}/cancel", t.id)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(parse_response_json(resp).await["status"], "CANCELLED");
+    // The worker was told.
+    let msg = rx.recv().await.unwrap();
+    assert!(
+        matches!(msg.response, Some(valka_proto::worker_response::Response::TaskCancellation(c)) if c.task_id == t.id)
+    );
+    // The run is closed.
+    let runs = node.engine.runs_for_task(&t.id).unwrap();
+    assert_eq!(runs[0].status, "FAILED");
+}
 
-    let resp = app
+// ─── runs & logs ────────────────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_get_task_runs() {
+    let node = TestNode::new().await;
+    let t = node.create("q", "t").await;
+    let run = node.start(&t.id, "worker-1");
+    let body = parse_response_json(
+        node.router()
+            .oneshot(get_req(&format!("/api/v1/tasks/{}/runs", t.id)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["id"], run);
+    assert_eq!(body[0]["worker_id"], "worker-1");
+    assert_eq!(body[0]["attempt_number"], 1);
+    assert_eq!(body[0]["status"], "RUNNING");
+    assert_eq!(body[0]["assigned_node_id"], "test-node");
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_get_task_runs_empty() {
+    let node = TestNode::new().await;
+    let t = node.create("q", "t").await;
+    let body = parse_response_json(
+        node.router()
+            .oneshot(get_req(&format!("/api/v1/tasks/{}/runs", t.id)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body, serde_json::json!([]));
+    let body = parse_response_json(
+        node.router()
+            .oneshot(get_req("/api/v1/tasks/unknown/runs"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body, serde_json::json!([]));
+}
+
+async fn push_logs(node: &TestNode, run: &str, n: i64) {
+    for i in 0..n {
+        node.log_tx
+            .send(valka_wal::logstore::LogLine {
+                task_run_id: run.to_string(),
+                timestamp_ms: 1000 + i,
+                level: "INFO".into(),
+                message: format!("line {i}"),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+    }
+    settle().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_get_run_logs() {
+    let node = TestNode::new().await;
+    let t = node.create("q", "t").await;
+    let run = node.start(&t.id, "w");
+    push_logs(&node, &run, 3).await;
+    let body = parse_response_json(
+        node.router()
+            .oneshot(get_req(&format!(
+                "/api/v1/tasks/{}/runs/{}/logs",
+                t.id, run
+            )))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr[0]["message"], "line 0");
+    assert_eq!(arr[0]["id"], 1);
+    assert_eq!(arr[2]["timestamp_ms"], 1002);
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_get_run_logs_with_after_id() {
+    let node = TestNode::new().await;
+    let t = node.create("q", "t").await;
+    let run = node.start(&t.id, "w");
+    push_logs(&node, &run, 5).await;
+    let body = parse_response_json(
+        node.router()
+            .oneshot(get_req(&format!(
+                "/api/v1/tasks/{}/runs/{}/logs?after_id=2&limit=2",
+                t.id, run
+            )))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["id"], 3);
+    assert_eq!(arr[0]["message"], "line 2");
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_get_run_logs_empty() {
+    let node = TestNode::new().await;
+    let body = parse_response_json(
+        node.router()
+            .oneshot(get_req("/api/v1/tasks/x/runs/y/logs"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body, serde_json::json!([]));
+}
+
+// ─── workers, dead letters, health ──────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_list_workers_empty() {
+    let node = TestNode::new().await;
+    let body = parse_response_json(
+        node.router()
+            .oneshot(get_req("/api/v1/workers"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body, serde_json::json!([]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_list_workers_connected() {
+    let node = TestNode::new().await;
+    let (wid, _rx) = node.register_worker(&["q"], 3).await;
+    let body = parse_response_json(
+        node.router()
+            .oneshot(get_req("/api/v1/workers"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["id"], wid.0);
+    assert_eq!(body[0]["concurrency"], 3);
+    assert_eq!(body[0]["status"], "CONNECTED");
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_list_dead_letters() {
+    let node = TestNode::new().await;
+    let t = node
+        .create_with(valka_engine::CreateTask {
+            max_retries: 1,
+            ..task_req("q", "t")
+        })
+        .await;
+    node.dead_letter(&t.id).await;
+    let body = parse_response_json(
+        node.router()
+            .oneshot(get_req("/api/v1/dead-letters"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["task_id"], t.id);
+    assert_eq!(body[0]["queue_name"], "q");
+    assert_eq!(body[0]["error_message"], "boom");
+    assert_eq!(body[0]["attempt_count"], 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_list_dead_letters_filter_queue() {
+    let node = TestNode::new().await;
+    let a = node
+        .create_with(valka_engine::CreateTask {
+            max_retries: 1,
+            ..task_req("a", "t")
+        })
+        .await;
+    let b = node
+        .create_with(valka_engine::CreateTask {
+            max_retries: 1,
+            ..task_req("b", "t")
+        })
+        .await;
+    node.dead_letter(&a.id).await;
+    node.dead_letter(&b.id).await;
+    let body = parse_response_json(
+        node.router()
+            .oneshot(get_req("/api/v1/dead-letters?queue_name=b"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["task_id"], b.id);
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_healthz_and_cluster() {
+    let node = TestNode::new().await;
+    let resp = node.router().oneshot(get_req("/healthz")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = parse_response_json(
+        node.router()
+            .oneshot(get_req("/api/v1/cluster"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["node_id"], "test-node");
+    assert_eq!(body["clustered"], false);
+    assert!(body["poisoned"].is_null());
+}
+
+// ─── signals ────────────────────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_send_signal() {
+    let node = TestNode::new().await;
+    let t = node.create("q", "t").await;
+    let resp = node
+        .router()
         .oneshot(post_json(
-            "/api/v1/tasks",
-            serde_json::json!({
-                "queue_name": "q",
-                "task_name": "t",
-                "scheduled_at": "not-a-date"
-            }),
+            &format!("/api/v1/tasks/{}/signal", t.id),
+            serde_json::json!({"signal_name": "pause"}),
         ))
         .await
         .unwrap();
-
-    // scheduled_at is parsed with .ok() — invalid string treated as None
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body = parse_response_json(resp).await;
+    assert!(!body["signal_id"].as_str().unwrap().is_empty());
+    assert_eq!(body["delivered"], false, "no worker is running it");
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_send_signal_with_payload() {
+    let node = TestNode::new().await;
+    let t = node.create("q", "t").await;
+    let resp = node
+        .router()
+        .oneshot(post_json(
+            &format!("/api/v1/tasks/{}/signal", t.id),
+            serde_json::json!({"signal_name": "cfg", "payload": {"rate": 5}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let list = parse_response_json(
+        node.router()
+            .oneshot(get_req(&format!("/api/v1/tasks/{}/signals", t.id)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(list[0]["payload"]["rate"], 5);
+    assert_eq!(list[0]["status"], "PENDING");
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_send_signal_task_not_found() {
+    let node = TestNode::new().await;
+    let resp = node
+        .router()
+        .oneshot(post_json(
+            "/api/v1/tasks/00000000-0000-7000-8000-000000000001/signal",
+            serde_json::json!({"signal_name": "x"}),
+        ))
+        .await
+        .unwrap();
+    assert_error_response(resp, StatusCode::NOT_FOUND, "NOT_FOUND", "not found").await;
+}
+
+async fn assert_signal_rejected(node: &TestNode, task_id: &str, status: &str) {
+    let resp = node
+        .router()
+        .oneshot(post_json(
+            &format!("/api/v1/tasks/{task_id}/signal"),
+            serde_json::json!({"signal_name": "x"}),
+        ))
+        .await
+        .unwrap();
+    assert_error_response(
+        resp,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "INVALID_STATE",
+        status,
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_send_signal_terminal_tasks_rejected() {
+    let node = TestNode::new().await;
+    let c = node.create("q", "t").await;
+    node.complete(&c.id).await;
+    assert_signal_rejected(&node, &c.id, "COMPLETED").await;
+
+    let f = node.create("q", "t").await;
+    node.fail_terminal(&f.id).await;
+    assert_signal_rejected(&node, &f.id, "FAILED").await;
+
+    let x = node.create("q", "t").await;
+    node.engine.cancel_task(&x.id, "u").await.unwrap();
+    assert_signal_rejected(&node, &x.id, "CANCELLED").await;
+
+    let d = node
+        .create_with(valka_engine::CreateTask {
+            max_retries: 1,
+            ..task_req("q", "t")
+        })
+        .await;
+    node.dead_letter(&d.id).await;
+    assert_signal_rejected(&node, &d.id, "DEAD_LETTER").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_send_signal_running_task_delivers() {
+    let node = TestNode::new().await;
+    let t = node.create("q", "t").await;
+    let (wid, mut rx) = node.register_worker(&["q"], 1).await;
+    node.engine.dispatch(&t.id, &wid.0).unwrap();
+    node.dispatcher
+        .workers()
+        .get_mut(wid.as_ref())
+        .unwrap()
+        .assign_task(t.id.clone());
+    let resp = node
+        .router()
+        .oneshot(post_json(
+            &format!("/api/v1/tasks/{}/signal", t.id),
+            serde_json::json!({"signal_name": "progress"}),
+        ))
+        .await
+        .unwrap();
+    let body = parse_response_json(resp).await;
+    assert_eq!(body["delivered"], true);
+    let msg = rx.recv().await.unwrap();
     assert!(
-        body["scheduled_at"].is_null(),
-        "Invalid date should be treated as null"
+        matches!(msg.response, Some(valka_proto::worker_response::Response::TaskSignal(s)) if s.signal_name == "progress")
     );
+    settle().await;
+    let list = parse_response_json(
+        node.router()
+            .oneshot(get_req(&format!("/api/v1/tasks/{}/signals", t.id)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(list[0]["status"], "DELIVERED");
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_send_signal_retry_task_allowed() {
+    let node = TestNode::new().await;
+    let t = node.create("q", "t").await;
+    let run = node.start(&t.id, "w");
+    node.engine.fail_run(&t.id, &run, "e", true).await.unwrap();
+    assert_eq!(
+        node.engine.get_task(&t.id).unwrap().status,
+        TaskStatus::Retry
+    );
+    let resp = node
+        .router()
+        .oneshot(post_json(
+            &format!("/api/v1/tasks/{}/signal", t.id),
+            serde_json::json!({"signal_name": "x"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_list_signals_filter_status_and_empty() {
+    let node = TestNode::new().await;
+    let t = node.create("q", "t").await;
+    let empty = parse_response_json(
+        node.router()
+            .oneshot(get_req(&format!("/api/v1/tasks/{}/signals", t.id)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(empty, serde_json::json!([]));
+    let s1 = node.engine.send_signal(&t.id, "a", None).await.unwrap();
+    node.engine.send_signal(&t.id, "a", None).await.unwrap();
+    node.engine.signal_delivered(&s1.id);
+    settle().await;
+    let pending = parse_response_json(
+        node.router()
+            .oneshot(get_req(&format!(
+                "/api/v1/tasks/{}/signals?status=PENDING",
+                t.id
+            )))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(pending.as_array().unwrap().len(), 1);
+    let all = parse_response_json(
+        node.router()
+            .oneshot(get_req(&format!("/api/v1/tasks/{}/signals", t.id)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(all.as_array().unwrap().len(), 2);
+    assert_eq!(all[0]["signal_name"], "a");
+    let bad = node
+        .router()
+        .oneshot(get_req(&format!(
+            "/api/v1/tasks/{}/signals?status=NOPE",
+            t.id
+        )))
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+}
+
+// ─── DELETE ─────────────────────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_delete_task_not_found() {
+    let node = TestNode::new().await;
+    let resp = node
+        .router()
+        .oneshot(delete_req(
+            "/api/v1/tasks/00000000-0000-7000-8000-000000000001",
+        ))
+        .await
+        .unwrap();
+    assert_error_response(resp, StatusCode::NOT_FOUND, "NOT_FOUND", "not found").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_delete_task_success() {
+    let node = TestNode::new().await;
+    let t = node.create("q", "t").await;
+    let resp = node
+        .router()
+        .oneshot(delete_req(&format!("/api/v1/tasks/{}", t.id)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(parse_response_json(resp).await["deleted"], true);
+    let resp = node
+        .router()
+        .oneshot(get_req(&format!("/api/v1/tasks/{}", t.id)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_delete_running_task_removes_runs() {
+    let node = TestNode::new().await;
+    let t = node.create("q", "t").await;
+    node.start(&t.id, "w");
+    let resp = node
+        .router()
+        .oneshot(delete_req(&format!("/api/v1/tasks/{}", t.id)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(node.engine.runs_for_task(&t.id).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_clear_all_tasks() {
+    let node = TestNode::new().await;
+    for _ in 0..4 {
+        node.create("q", "t").await;
+    }
+    let resp = node
+        .router()
+        .oneshot(delete_req("/api/v1/tasks"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(parse_response_json(resp).await["deleted_count"], 4);
+    let body = parse_response_json(
+        node.router()
+            .oneshot(get_req("/api/v1/tasks"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body, serde_json::json!([]));
+}
+
+// ─── the REST layer's view survives a node restart ──────────────────
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_state_survives_restart() {
+    let store = valka_wal::Store::memory();
+    let (a, b);
+    {
+        let node = TestNode::on_store(store.clone(), "n1").await;
+        a = node.create("q", "t").await;
+        b = node.create("q", "t").await;
+        node.complete(&a.id).await;
+        node.engine.send_signal(&b.id, "s", None).await.unwrap();
+        node.engine.sync().await.unwrap();
+    }
+    let node = TestNode::on_store(store, "n1").await;
+    let body = parse_response_json(
+        node.router()
+            .oneshot(get_req(&format!("/api/v1/tasks/{}", a.id)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["status"], "COMPLETED");
+    let list = parse_response_json(
+        node.router()
+            .oneshot(get_req(&format!("/api/v1/tasks/{}/signals", b.id)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    let _ = Utc::now();
 }

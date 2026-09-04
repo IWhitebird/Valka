@@ -3,8 +3,8 @@
 </p>
 
 <p align="center">
-  <strong>A Rust-native distributed task queue powered by PostgreSQL.</strong><br/>
-  One dependency. Zero brokers. Built for simplicity.
+  <strong>A Rust-native distributed task queue with a write-ahead log on object storage.</strong><br/>
+  One bucket. Zero databases. Zero brokers. Nodes you can kill.
 </p>
 
 <p align="center">
@@ -25,18 +25,21 @@
 
 Most task queues bolt together a message broker, a database, and a cache. Every moving part is another thing to deploy, monitor, and debug at 3 AM.
 
-**Valka takes a different approach.** PostgreSQL is the single source of truth. An in-memory matching engine and gRPC bidirectional streaming replace the message broker entirely. The result: simple to operate, easy to reason about, and fast where it matters.
+**Valka takes a different approach.** An S3-compatible bucket is the single source of truth: every state transition is appended to a write-ahead log, group-committed to the bucket, and nothing is acknowledged before it lands there. Nodes hold only rebuildable RAM state, so any node can be killed at any time and a fresh one rebuilds itself from snapshots plus the WAL tail. An in-memory matching engine and gRPC bidirectional streaming replace the message broker entirely.
 
-- **One dependency.** If you have Postgres, you can run Valka.
+- **One dependency.** If you have a bucket (S3, MinIO, R2, or a local directory), you can run Valka.
+- **Diskless, disposable nodes.** Acked = durable in the bucket, 11 nines of durability, no replication to operate.
+- **Free history and CDC.** The WAL is plain zstd-compressed JSON; anything can tail it straight from the bucket.
 - **Zero-latency hot path.** Tasks are matched to waiting workers in-memory — no polling.
 - **Polyglot.** Rust, TypeScript, Go, and Python SDKs. Or just use the REST API.
 - **Observable.** Real-time log streaming, event feeds, Prometheus metrics, and a web dashboard out of the box.
 
 ## Features
 
-- In-memory task matching with PG `SKIP LOCKED` fallback
+- Write-ahead log on object storage: group commit, per-shard snapshots, exact replay
+- In-memory task matching fed from a RAM pending index (no polling, no DB on the hot path)
 - gRPC bidirectional streaming (single connection per worker, no polling)
-- Multi-node clustering with chitchat gossip + consistent hash ring
+- 4096 fixed storage shards with single-writer ownership (multi-node takeover: phase 2, see `docs/wal/PLAN.md`)
 - Task signals — send real-time signals to running workers
 - Automatic retries with exponential backoff + dead letter queue
 - Structured log streaming per task run
@@ -48,11 +51,15 @@ Most task queues bolt together a message broker, a database, and a cache. Every 
 ## Quick Start
 
 ```bash
-# 1. Start PostgreSQL
-docker compose up -d postgres
-
-# 2. Start the server (runs migrations automatically)
+# 1. Start the server against a local directory (./data). No services needed.
 cargo run -p valka-server
+
+#    ...or against MinIO (S3-compatible):
+#    docker compose up -d minio minio-init
+#    VALKA_STORAGE__BACKEND=s3 VALKA_STORAGE__BUCKET=valka \
+#    VALKA_STORAGE__ENDPOINT=http://localhost:9000 VALKA_STORAGE__ALLOW_HTTP=true \
+#    VALKA_STORAGE__ACCESS_KEY_ID=minioadmin VALKA_STORAGE__SECRET_ACCESS_KEY=minioadmin \
+#    cargo run -p valka-server
 
 # 3. Run a worker
 cargo run -p valka-examples --example worker
@@ -112,38 +119,37 @@ await worker.run();
 ## Architecture
 
 ```
-                    ┌─────────────────────────────────────────────┐
-                    │                VALKA SERVER                  │
-                    │                                             │
-  REST clients ───► │  REST API ──┐                               │
-                    │             ├──► MatchingService             │
-  gRPC clients ───► │  gRPC API ──┘     (partition tree)          │
-                    │                       │                     │
-                    │               ┌───────┴───────┐             │
-                    │               ▼               ▼             │
-                    │          Hot Path         Cold Path          │
-                    │       (in-memory         (PG SKIP           │
-                    │        oneshot)           LOCKED)            │
-                    │               │               │             │
-                    │               └───────┬───────┘             │
-                    │                       ▼                     │
-                    │                  Dispatcher                  │
-                    │              (gRPC bidi stream)              │
-                    │                       │                     │
-                    │   ┌───────────────────┼───────────────────┐ │
-                    │   │  Scheduler        │                   │ │
-                    │   │  ├─ Lease Reaper  │  Event Broadcast  │ │
-                    │   │  ├─ Retry Engine  │  (tokio broadcast)│ │
-                    │   │  ├─ DLQ Mover     │                   │ │
-                    │   │  └─ Delayed Promo │                   │ │
-                    │   └───────────────────┼───────────────────┘ │
-                    └───────────────────────┼─────────────────────┘
-                                            │
-                              ┌─────────────┼─────────────┐
-                              ▼             ▼             ▼
-                          Worker A      Worker B      Worker C
-                         (Rust SDK)    (Go SDK)    (Python SDK)
+                    ┌─────────────────────────────────────────────────┐
+                    │                  VALKA NODE                     │
+  REST clients ───► │  REST API ──┐                                   │
+  gRPC clients ───► │  gRPC API ──┴──► Engine (4096 shard state       │
+                    │                  machines in RAM)               │
+                    │                    │  validate → apply → append  │
+                    │                    ▼                            │
+                    │            WAL buffer (RAM, unacked only)       │
+                    │                    │ group commit 50 ms / 4 MB   │
+                    │                    ▼                            │
+                    │      ┌─────────────────────────────────┐        │
+                    │      │  BUCKET — the only truth        │        │
+                    │      │  wal/{node}/{epoch}-{seq}.seg   │        │
+                    │      │  snapshots/{shard}/{lsn}.snap   │        │
+                    │      │  logs/{run}/…   assignment      │        │
+                    │      └─────────────────────────────────┘        │
+                    │                    │ ack ← durable                │
+                    │   pending index ──► MatchingService ──► Dispatcher│
+                    │   timer wheel       (partition tree)   (gRPC bidi)│
+                    │   (leases, retries, delayed)                │    │
+                    └─────────────────────────────────────────────┼────┘
+                                                                  │
+                                              ┌───────────────────┼─────────────┐
+                                              ▼                   ▼             ▼
+                                          Worker A            Worker B      Worker C
+                                         (Rust SDK)          (Go SDK)    (Python SDK)
 ```
+
+Crash recovery: a new node loads the newest snapshot per shard, replays the WAL tail
+(exact, via per-shard sequence numbers), re-arms leases and timers, and serves. Workers
+keep executing throughout and reconnect. Full design: [`docs/wal/DESIGN.md`](docs/wal/DESIGN.md).
 
 ### Task Lifecycle
 
@@ -173,7 +179,8 @@ Pages: Dashboard, Tasks, Task Detail (runs, logs, signals), Workers, Events, Dea
 docker compose up
 ```
 
-Starts PostgreSQL 17 + Valka server. REST + Dashboard on `:8989`, gRPC on `:50051`.
+Starts MinIO + Valka server. REST + Dashboard on `:8989`, gRPC on `:50051`, MinIO console on `:9001`.
+For production, point `[storage]` at a real bucket and drop the MinIO services.
 
 ### From Source
 
@@ -188,7 +195,12 @@ Layered via [figment](https://github.com/SergioBenitez/Figment): defaults → `v
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VALKA_DATABASE_URL` | — | PostgreSQL connection string |
+| `VALKA_STORAGE__BACKEND` | `local` | `s3`, `local` (directory), or `memory` |
+| `VALKA_STORAGE__PATH` | `./data` | Directory for the `local` backend |
+| `VALKA_STORAGE__BUCKET` | `valka` | Bucket for the `s3` backend |
+| `VALKA_STORAGE__ENDPOINT` | — | Custom S3 endpoint (MinIO, R2). Omit for AWS |
+| `VALKA_NODE_ID` | random | Stable node id; a node replays its own WAL on restart |
+| `VALKA_WAL__FLUSH_INTERVAL_MS` | `50` | Group-commit window (enqueue ack latency) |
 | `VALKA_GRPC_ADDR` | `0.0.0.0:50051` | gRPC listen address |
 | `VALKA_HTTP_ADDR` | `0.0.0.0:8989` | REST/HTTP listen address |
 | `RUST_LOG` | `valka=info,tower_http=info` | Log level filter |
@@ -202,11 +214,12 @@ Layered via [figment](https://github.com/SergioBenitez/Figment): defaults → `v
 - [x] REST API + CLI + Web dashboard
 - [x] Real-time event and log streaming
 - [x] Task signals (send signals to running workers)
-- [x] Multi-node clustering (chitchat gossip + consistent hash ring)
 - [x] Polyglot SDKs — Rust, TypeScript, Go, Python
+- [x] Object-storage WAL: diskless nodes, snapshots, exact replay, fault-injected tests
 
 ### Up Next
 
+- [ ] Multi-node shard ownership: CAS'd assignment, epochs, takeover, worker re-handshake (phase 2)
 - [ ] Task priorities and weighted fair queuing
 - [ ] Cron / recurring task scheduling
 - [ ] Rate limiting per queue

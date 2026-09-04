@@ -1,4 +1,4 @@
-#[cfg(all(test, feature = "integration"))]
+#[cfg(test)]
 mod integration;
 
 #[cfg(test)]

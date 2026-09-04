@@ -190,7 +190,7 @@ impl TaskState {
                 last_heartbeat: r.last_heartbeat,
             })
             .collect();
-        v.sort_by(|a, b| b.attempt_number.cmp(&a.attempt_number));
+        v.sort_by_key(|r| std::cmp::Reverse(r.attempt_number));
         v
     }
 }
@@ -764,7 +764,7 @@ mod tests {
     #[test]
     fn full_lifecycle_and_idempotent_replay() {
         let mut s = ShardState::new(ShardId(0));
-        let mut recs = vec![
+        let mut recs = [
             env(WalRecord::TaskCreated { task: spec("a") }),
             env(WalRecord::TaskDispatched {
                 task_id: "a".into(),

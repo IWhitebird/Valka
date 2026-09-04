@@ -98,6 +98,9 @@ pub struct FailResult {
 
 /// Runnable tasks ordered by priority desc, then creation order.
 type PendingKey = (i32, i64, String);
+/// task_id -> (shard, run_id, lease_until) awaiting a coalesced `LeaseExtended` record.
+type LeaseDirty = HashMap<String, (ShardId, String, DateTime<Utc>)>;
+type LoadedSnapshot = Result<Option<(ShardId, Lsn, ShardSnapshot)>, ServerError>;
 
 struct Inner {
     shards: Vec<Mutex<ShardState>>,
@@ -108,7 +111,7 @@ struct Inner {
     clock: Arc<dyn Clock>,
     timers: Mutex<TimerWheel>,
     pending: Mutex<BTreeMap<String, BTreeSet<PendingKey>>>,
-    lease_dirty: Mutex<HashMap<String, (ShardId, String, DateTime<Utc>)>>,
+    lease_dirty: Mutex<LeaseDirty>,
     events: broadcast::Sender<EngineEvent>,
     sink: RwLock<Arc<dyn TaskSink>>,
     pending_wake: Notify,
@@ -171,23 +174,22 @@ impl Engine {
                 }
             }
         }
-        let loaded: Vec<Result<Option<(ShardId, Lsn, ShardSnapshot)>, ServerError>> =
-            futures::stream::iter(newest.into_iter())
-                .map(|(shard, (lsn, _key))| {
-                    let store = store.clone();
-                    async move {
-                        match snapshot::load_latest::<ShardSnapshot>(&store, shard).await? {
-                            Some((l, snap)) => Ok(Some((shard, l, snap))),
-                            None => {
-                                let _ = lsn;
-                                Ok(None)
-                            }
+        let loaded: Vec<LoadedSnapshot> = futures::stream::iter(newest)
+            .map(|(shard, (lsn, _key))| {
+                let store = store.clone();
+                async move {
+                    match snapshot::load_latest::<ShardSnapshot>(&store, shard).await? {
+                        Some((l, snap)) => Ok(Some((shard, l, snap))),
+                        None => {
+                            let _ = lsn;
+                            Ok(None)
                         }
                     }
-                })
-                .buffer_unordered(64)
-                .collect()
-                .await;
+                }
+            })
+            .buffer_unordered(64)
+            .collect()
+            .await;
         let mut snapshot_count = 0;
         for r in loaded {
             if let Some((shard, lsn, snap)) = r? {
@@ -391,7 +393,7 @@ impl Engine {
                     .tasks
                     .values()
                     .filter(|t| {
-                        !queue.is_some_and(|q| q != t.spec.queue_name)
+                        queue.is_none_or(|q| q == t.spec.queue_name)
                             && !status.is_some_and(|s| s != t.status)
                     })
                     .count()
@@ -695,7 +697,7 @@ impl Engine {
             all.extend(
                 st.dead_letters
                     .values()
-                    .filter(|d| !queue.is_some_and(|q| q != d.queue_name))
+                    .filter(|d| queue.is_none_or(|q| q == d.queue_name))
                     .map(|d| d.view()),
             );
         }
@@ -1338,8 +1340,7 @@ impl Engine {
     }
 
     fn flush_lease_records(&self) {
-        let dirty: HashMap<String, (ShardId, String, DateTime<Utc>)> =
-            std::mem::take(&mut *self.inner.lease_dirty.lock());
+        let dirty: LeaseDirty = std::mem::take(&mut *self.inner.lease_dirty.lock());
         if dirty.is_empty() {
             return;
         }

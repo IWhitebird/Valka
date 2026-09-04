@@ -34,3 +34,5 @@ Thumbs.db
 
 
 experiments/
+# Valka local storage backend (default VALKA_STORAGE__PATH)
+/data/

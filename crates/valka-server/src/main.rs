@@ -5,21 +5,18 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::sync::{broadcast, mpsc, watch};
 use tracing::info;
 
 mod shutdown;
 
 use valka_server::grpc;
 use valka_server::rest;
-use valka_server::server;
+use valka_server::server::Node;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load .env file (if present) before anything reads env vars
     dotenvy::dotenv().ok();
 
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -29,137 +26,29 @@ async fn main() -> Result<()> {
 
     info!("Starting Valka server");
 
-    // Load configuration
     let config_path = std::env::args().nth(1);
     let mut config = valka_core::ServerConfig::load(config_path.as_deref())?;
 
-    // Resolve migration URL: use direct PG connection if configured (bypasses PgBouncer).
-    let migration_url = config
-        .migration_database_url
-        .as_deref()
-        .unwrap_or(&config.database_url);
-
-    // Migrate-only mode: run migrations then exit. Used by Helm pre-install Jobs.
-    if config.migrate_only {
-        info!("Running in migrate-only mode");
-        valka_db::migrations::run_migrations(migration_url).await?;
-        info!("Migrations complete, exiting");
-        return Ok(());
-    }
-
     if config.node_id.is_empty() {
+        // Diskless nodes get a fresh identity each start. Set VALKA_NODE_ID for a
+        // stable identity (recommended in production so the node replays its own WAL).
         config.node_id = uuid::Uuid::now_v7().to_string();
     }
-    let node_id = valka_core::NodeId(config.node_id.clone());
+    info!(node_id = %config.node_id, backend = %config.storage.backend, "Node ID assigned");
 
-    info!(node_id = %node_id, "Node ID assigned");
+    let store = valka_wal::Store::from_config(&config.storage)?;
+    let node = Node::build(&config, store).await?;
 
-    // Create database pool (through PgBouncer in cluster mode)
-    let pool =
-        valka_db::pool::create_pool(&config.database_url, config.database.max_connections).await?;
+    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .expect("Failed to install Prometheus recorder");
 
-    // Run migrations. In cluster mode only the leader node runs this;
-    // follower nodes set skip_migrations=true.
-    if !config.skip_migrations {
-        valka_db::migrations::run_migrations(migration_url).await?;
-    }
-
-    // Recover orphaned DISPATCHING tasks (crash recovery)
-    let recovered = valka_db::queries::tasks::recover_orphaned_dispatching(&pool).await?;
-    if !recovered.is_empty() {
-        info!(
-            count = recovered.len(),
-            "Recovered orphaned DISPATCHING tasks to PENDING"
-        );
-    }
-
-    // Shutdown signal
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-    // Event broadcast channel
-    let (event_tx, _) = broadcast::channel::<valka_proto::TaskEvent>(4096);
-
-    // Log ingestion channel
-    let (log_tx, log_rx) = mpsc::channel::<valka_proto::LogEntry>(10000);
-
-    // Initialize services
-    let matching = valka_matching::MatchingService::new(config.matching.clone());
-
-    // Initialize cluster: single-node if no seed_nodes, clustered otherwise
-    let cluster = Arc::new(if config.gossip.seed_nodes.is_empty() {
-        info!("Starting in single-node mode (no seed_nodes configured)");
-        valka_cluster::ClusterManager::new_single_node(
-            node_id.clone(),
-            config.matching.num_partitions,
-        )
-    } else {
-        info!(
-            seeds = ?config.gossip.seed_nodes,
-            "Starting in clustered mode"
-        );
-        valka_cluster::ClusterManager::new_clustered(
-            node_id.clone(),
-            config.matching.num_partitions,
-            &config.gossip,
-            &config.grpc_addr,
-        )
-        .await?
-    });
-
-    let forwarder = valka_cluster::NodeForwarder::new();
-
-    let dispatcher = valka_dispatcher::DispatcherService::new(
-        matching.clone(),
-        pool.clone(),
-        node_id.clone(),
-        event_tx.clone(),
-        log_tx.clone(),
-    );
-
-    // Start heartbeat checker
-    let (_hb_handle, mut dead_rx) = dispatcher.start_heartbeat_checker(shutdown_rx.clone());
-
-    // Handle dead workers
-    let dispatcher_clone = dispatcher.clone();
-    tokio::spawn(async move {
-        while let Some(worker_id) = dead_rx.recv().await {
-            dispatcher_clone.deregister_worker(&worker_id).await;
-        }
-    });
-
-    // Start scheduler
-    let scheduler_pool = pool.clone();
-    let scheduler_config = config.scheduler.clone();
-    let scheduler_shutdown = shutdown_rx.clone();
-    tokio::spawn(async move {
-        server::run_scheduler(scheduler_pool, scheduler_config, scheduler_shutdown).await;
-    });
-
-    // Start log ingester
-    let log_pool = pool.clone();
-    let log_config = config.log_ingester.clone();
-    let log_shutdown = shutdown_rx.clone();
-    tokio::spawn(async move {
-        server::run_log_ingester(log_pool, log_config, log_rx, log_shutdown).await;
-    });
-
-    // Start TaskReaders for owned partitions
-    let tr_pool = pool.clone();
-    let tr_matching = matching.clone();
-    let tr_config = config.matching.clone();
-    let tr_cluster = cluster.clone();
-    let tr_shutdown = shutdown_rx.clone();
-    tokio::spawn(async move {
-        server::run_task_reader_manager(tr_pool, tr_matching, tr_config, tr_cluster, tr_shutdown)
-            .await;
-    });
-
-    // Start event relay (only in clustered mode)
-    if cluster.is_clustered() {
-        let relay_cluster = cluster.clone();
-        let relay_forwarder = forwarder.clone();
-        let relay_event_rx = event_tx.subscribe();
-        let relay_shutdown = shutdown_rx.clone();
+    // Event relay across nodes (clustered mode only).
+    if node.cluster.is_clustered() {
+        let relay_cluster = node.cluster.clone();
+        let relay_forwarder = node.forwarder.clone();
+        let relay_event_rx = node.event_tx.subscribe();
+        let relay_shutdown = node.shutdown_rx.clone();
         tokio::spawn(async move {
             valka_cluster::event_relay::run_event_relay(
                 relay_cluster,
@@ -171,72 +60,63 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Install metrics exporter
-    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
-        .install_recorder()
-        .expect("Failed to install Prometheus recorder");
-
-    // Start gRPC server
     let grpc_addr = config.grpc_addr.parse()?;
-    let grpc_dispatcher = dispatcher.clone();
-    let grpc_pool = pool.clone();
-    let grpc_event_tx = event_tx.clone();
-    let grpc_matching = matching.clone();
-    let grpc_node_id = node_id.clone();
-    let grpc_cluster = cluster.clone();
-    let grpc_forwarder = forwarder.clone();
-    let grpc_log_tx = log_tx.clone();
-    let grpc_shutdown = shutdown_rx.clone();
-
-    let shutdown_tx_grpc = shutdown_tx.clone();
-    let grpc_handle = tokio::spawn(async move {
-        if let Err(e) = grpc::serve_grpc(
-            grpc_addr,
-            grpc_pool,
-            grpc_dispatcher,
-            grpc_matching,
-            grpc_event_tx,
-            grpc_node_id,
-            grpc_cluster,
-            grpc_forwarder,
-            grpc_log_tx,
-            grpc_shutdown,
-        )
-        .await
-        {
-            tracing::error!(error = %e, "gRPC server failed");
-            let _ = shutdown_tx_grpc.send(true);
+    let shutdown_tx_grpc = node.shutdown_tx.clone();
+    let grpc_handle = tokio::spawn({
+        let (engine, dispatcher, event_tx, node_id, cluster, forwarder, logs, shutdown) = (
+            node.engine.clone(),
+            node.dispatcher.clone(),
+            node.event_tx.clone(),
+            node.node_id.clone(),
+            node.cluster.clone(),
+            node.forwarder.clone(),
+            node.logs.clone(),
+            node.shutdown_rx.clone(),
+        );
+        async move {
+            if let Err(e) = grpc::serve_grpc(
+                grpc_addr, engine, dispatcher, event_tx, node_id, cluster, forwarder, logs,
+                shutdown,
+            )
+            .await
+            {
+                tracing::error!(error = %e, "gRPC server failed");
+                let _ = shutdown_tx_grpc.send(true);
+            }
         }
     });
 
-    // Start REST/HTTP server
     let http_addr = config.http_addr.parse()?;
-    let rest_pool = pool.clone();
-    let rest_event_tx = event_tx.clone();
-    let rest_matching = matching.clone();
-    let rest_dispatcher = dispatcher.clone();
-    let rest_cluster = cluster.clone();
-    let rest_forwarder = forwarder.clone();
-    let rest_shutdown = shutdown_rx.clone();
-
-    let shutdown_tx_rest = shutdown_tx.clone();
-    let http_handle = tokio::spawn(async move {
-        if let Err(e) = rest::serve_rest(
-            http_addr,
-            rest_pool,
-            rest_event_tx,
-            rest_matching,
-            rest_dispatcher,
-            metrics_handle,
-            rest_cluster,
-            rest_forwarder,
+    let shutdown_tx_rest = node.shutdown_tx.clone();
+    let http_handle = tokio::spawn({
+        let (engine, dispatcher, event_tx, cluster, forwarder, logs, shutdown, web_dir) = (
+            node.engine.clone(),
+            node.dispatcher.clone(),
+            node.event_tx.clone(),
+            node.cluster.clone(),
+            node.forwarder.clone(),
+            node.logs.clone(),
+            node.shutdown_rx.clone(),
             config.web_dir.clone(),
-            rest_shutdown,
-        )
-        .await
-        {
-            tracing::error!(error = %e, "REST server failed");
-            let _ = shutdown_tx_rest.send(true);
+        );
+        async move {
+            if let Err(e) = rest::serve_rest(
+                http_addr,
+                engine,
+                event_tx,
+                dispatcher,
+                logs,
+                metrics_handle,
+                cluster,
+                forwarder,
+                web_dir,
+                shutdown,
+            )
+            .await
+            {
+                tracing::error!(error = %e, "REST server failed");
+                let _ = shutdown_tx_rest.send(true);
+            }
         }
     });
 
@@ -246,22 +126,22 @@ async fn main() -> Result<()> {
         "Valka server started"
     );
 
-    // Wait for shutdown signal
     shutdown::wait_for_shutdown().await;
     info!("Shutdown signal received, draining...");
-    let _ = shutdown_tx.send(true);
+    let _ = node.shutdown_tx.send(true);
 
-    // Wait for tasks to complete
-    let _ = tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let _ = grpc_handle.await;
         let _ = http_handle.await;
     })
     .await;
 
-    // Shutdown cluster gossip
-    // Note: We need to unwrap Arc to call shutdown which consumes self.
-    // If other references still exist, we just skip graceful shutdown.
-    if let Ok(cluster) = Arc::try_unwrap(cluster) {
+    // Flush the WAL and snapshot dirty shards so the next start replays little.
+    if let Err(e) = node.engine.shutdown().await {
+        tracing::error!(error = %e, "engine shutdown failed");
+    }
+
+    if let Ok(cluster) = Arc::try_unwrap(node.cluster) {
         cluster.shutdown().await;
     }
 

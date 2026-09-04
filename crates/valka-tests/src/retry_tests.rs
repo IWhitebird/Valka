@@ -1,4 +1,4 @@
-use valka_scheduler::retry::compute_retry_delay;
+use valka_engine::retry::compute_retry_delay;
 
 #[test]
 fn test_exponential_backoff() {

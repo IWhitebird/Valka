@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures::Stream;
 use tokio::sync::{broadcast, mpsc};
@@ -6,65 +7,32 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
-use valka_core::{NodeId, PartitionId};
-use valka_db::DbPool;
-use valka_matching::MatchingService;
-use valka_matching::partition::TaskEnvelope;
+use crate::convert::log_line_to_proto;
+use valka_core::NodeId;
+use valka_engine::{Engine, LogIngester};
 use valka_proto::*;
 
 pub struct InternalServiceImpl {
-    pub pool: DbPool,
-    pub matching: MatchingService,
+    pub engine: Engine,
     pub node_id: NodeId,
     pub event_tx: broadcast::Sender<TaskEvent>,
+    pub logs: Arc<LogIngester>,
 }
 
 #[tonic::async_trait]
 impl internal_service_server::InternalService for InternalServiceImpl {
+    /// Phase 1: a single node owns every shard, so a forwarded task is simply re-offered
+    /// from the local pending index. Phase 2 replaces this with shard-owner routing.
     async fn forward_task(
         &self,
         request: Request<ForwardTaskRequest>,
     ) -> Result<Response<ForwardTaskResponse>, Status> {
         let req = request.into_inner();
-        debug!(
-            task_id = %req.task_id,
-            queue = %req.queue_name,
-            partition = req.partition_id,
-            "Received forwarded task"
-        );
-
-        // Read the full task from PG (task was already persisted by originating node)
-        let task_row = valka_db::queries::tasks::get_task(&self.pool, &req.task_id)
-            .await
-            .map_err(|e| Status::internal(format!("Database error: {e}")))?
-            .ok_or_else(|| {
-                Status::not_found(format!("Forwarded task not found: {}", req.task_id))
-            })?;
-
-        // Build TaskEnvelope from the task row
-        let envelope = TaskEnvelope {
-            task_id: task_row.id.clone(),
-            task_run_id: String::new(),
-            queue_name: task_row.queue_name.clone(),
-            task_name: task_row.task_name.clone(),
-            input: task_row.input.map(|v| v.to_string()),
-            attempt_number: task_row.attempt_count + 1,
-            timeout_seconds: task_row.timeout_seconds,
-            metadata: task_row.metadata.to_string(),
-            priority: task_row.priority,
-        };
-
-        // Try sync match locally (on the owning node)
-        let partition = PartitionId(req.partition_id);
-        let accepted = self
-            .matching
-            .offer_task(&req.queue_name, partition, envelope)
-            .is_ok();
-
+        debug!(task_id = %req.task_id, queue = %req.queue_name, "Received forwarded task");
+        let accepted = self.engine.get_task(&req.task_id).is_some();
         if accepted {
-            debug!(task_id = %req.task_id, "Forwarded task accepted via sync match");
+            self.engine.unoffer(&req.task_id);
         }
-
         Ok(Response::new(ForwardTaskResponse { accepted }))
     }
 
@@ -86,41 +54,15 @@ impl internal_service_server::InternalService for InternalServiceImpl {
         request: Request<RelayLogsRequest>,
     ) -> Result<Response<Self::RelayLogsStream>, Status> {
         let req = request.into_inner();
-        let pool = self.pool.clone();
-
+        let logs = self.logs.clone();
         let (tx, rx) = mpsc::channel(256);
-
         tokio::spawn(async move {
-            match valka_db::queries::task_logs::get_logs_for_run(
-                &pool,
-                &req.task_run_id,
-                10000,
-                None,
-            )
-            .await
-            {
-                Ok(logs) => {
-                    for log in logs {
-                        let entry = LogEntry {
-                            task_run_id: log.task_run_id,
-                            timestamp_ms: log.timestamp_ms,
-                            level: str_to_log_level(&log.level),
-                            message: log.message,
-                            metadata: log.metadata.map(|m| m.to_string()).unwrap_or_default(),
-                        };
-                        if tx.send(Ok(entry)).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(Status::internal(format!("Database error: {e}"))))
-                        .await;
+            for line in logs.read(&req.task_run_id, 10_000).await {
+                if tx.send(Ok(log_line_to_proto(line))).await.is_err() {
+                    break;
                 }
             }
         });
-
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
@@ -129,15 +71,5 @@ impl internal_service_server::InternalService for InternalServiceImpl {
             node_id: self.node_id.0.clone(),
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
         }))
-    }
-}
-
-fn str_to_log_level(s: &str) -> i32 {
-    match s {
-        "DEBUG" => 1,
-        "INFO" => 2,
-        "WARN" => 3,
-        "ERROR" => 4,
-        _ => 0,
     }
 }

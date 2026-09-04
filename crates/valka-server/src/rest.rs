@@ -14,12 +14,12 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
+use crate::convert::log_line_to_json;
 use valka_cluster::{ClusterManager, NodeForwarder};
-use valka_core::{TaskId, partition_for_task};
-use valka_db::DbPool;
+use valka_core::{ServerError, TaskStatus};
 use valka_dispatcher::DispatcherService;
-use valka_matching::MatchingService;
-use valka_matching::partition::TaskEnvelope;
+use valka_engine::state::SignalStatus;
+use valka_engine::{CreateTask, Engine, LogIngester};
 
 // ─── Structured Error Response ──────────────────────────────────────
 
@@ -32,7 +32,29 @@ struct ErrorBody {
 enum ApiError {
     NotFound(String),
     InvalidState(String),
+    BadRequest(String),
+    Conflict(String),
+    Unavailable(String),
     Internal(String),
+}
+
+impl From<ServerError> for ApiError {
+    fn from(e: ServerError) -> Self {
+        match e {
+            ServerError::TaskNotFound(_)
+            | ServerError::WorkerNotFound(_)
+            | ServerError::QueueNotFound(_) => ApiError::NotFound(e.to_string()),
+            ServerError::InvalidStatusTransition { .. }
+            | ServerError::TaskCancelled(_)
+            | ServerError::LeaseExpired(_) => ApiError::InvalidState(e.to_string()),
+            ServerError::IdempotencyConflict(_) => ApiError::Conflict(e.to_string()),
+            ServerError::InvalidArgument(_) => ApiError::BadRequest(e.to_string()),
+            ServerError::NotOwner(_) | ServerError::Unavailable(_) => {
+                ApiError::Unavailable(e.to_string())
+            }
+            ServerError::Storage(_) | ServerError::Internal(_) => ApiError::Internal(e.to_string()),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -40,6 +62,9 @@ impl IntoResponse for ApiError {
         let (status, code, message) = match self {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, "NOT_FOUND", msg),
             ApiError::InvalidState(msg) => (StatusCode::UNPROCESSABLE_ENTITY, "INVALID_STATE", msg),
+            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "BAD_REQUEST", msg),
+            ApiError::Conflict(msg) => (StatusCode::CONFLICT, "CONFLICT", msg),
+            ApiError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE", msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", msg),
         };
         (
@@ -55,36 +80,34 @@ impl IntoResponse for ApiError {
 
 #[derive(Clone)]
 pub struct AppState {
-    pool: DbPool,
+    engine: Engine,
     event_tx: broadcast::Sender<valka_proto::TaskEvent>,
-    matching: MatchingService,
     dispatcher: DispatcherService,
+    logs: Arc<LogIngester>,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     cluster: Arc<ClusterManager>,
+    #[allow(dead_code)]
     forwarder: NodeForwarder,
-    node_id: String,
 }
 
 /// Build the API router (useful for testing with tower::ServiceExt::oneshot)
 pub fn build_api_router(
-    pool: DbPool,
+    engine: Engine,
     event_tx: broadcast::Sender<valka_proto::TaskEvent>,
-    matching: MatchingService,
     dispatcher: DispatcherService,
+    logs: Arc<LogIngester>,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     cluster: Arc<ClusterManager>,
     forwarder: NodeForwarder,
 ) -> Router {
-    let node_id = cluster.node_id().0.clone();
     let state = AppState {
-        pool,
+        engine,
         event_tx,
-        matching,
         dispatcher,
+        logs,
         metrics_handle,
         cluster,
         forwarder,
-        node_id,
     };
 
     let cors = CorsLayer::new()
@@ -109,6 +132,7 @@ pub fn build_api_router(
         .route("/api/v1/workers", get(list_workers))
         .route("/api/v1/dead-letters", get(list_dead_letters))
         .route("/api/v1/events", get(subscribe_events_sse))
+        .route("/api/v1/cluster", get(cluster_info))
         .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
         .with_state(state)
@@ -118,10 +142,10 @@ pub fn build_api_router(
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_rest(
     addr: SocketAddr,
-    pool: DbPool,
+    engine: Engine,
     event_tx: broadcast::Sender<valka_proto::TaskEvent>,
-    matching: MatchingService,
     dispatcher: DispatcherService,
+    logs: Arc<LogIngester>,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     cluster: Arc<ClusterManager>,
     forwarder: NodeForwarder,
@@ -129,19 +153,17 @@ pub async fn serve_rest(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
     let api_routes = build_api_router(
-        pool,
+        engine,
         event_tx,
-        matching,
         dispatcher,
+        logs,
         metrics_handle,
         cluster,
         forwarder,
     );
 
-    // Serve static files with SPA fallback
     let index_path = format!("{}/index.html", &web_dir);
     let spa_fallback = ServeDir::new(&web_dir).not_found_service(ServeFile::new(index_path));
-
     let app = api_routes.fallback_service(spa_fallback);
 
     info!("REST server listening on {addr}");
@@ -203,123 +225,59 @@ async fn create_task(
     State(state): State<AppState>,
     Json(body): Json<CreateTaskBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let task_id = TaskId::new();
-    let partition = partition_for_task(
-        &body.queue_name,
-        &task_id.0,
-        state.matching.config().num_partitions,
-    );
-
-    let scheduled_at = body
-        .scheduled_at
-        .as_ref()
-        .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok());
-
-    let metadata = body.metadata.unwrap_or(serde_json::json!({}));
-
-    let task = valka_db::queries::tasks::create_task(
-        &state.pool,
-        valka_db::queries::tasks::CreateTaskParams {
-            id: task_id.0.clone(),
-            queue_name: body.queue_name.clone(),
-            task_name: body.task_name.clone(),
-            partition_id: partition.0,
-            input: body.input.clone(),
+    let scheduled_at = match body.scheduled_at.as_deref() {
+        None | Some("") => None,
+        Some(s) => Some(
+            s.parse::<chrono::DateTime<chrono::Utc>>()
+                .map_err(|e| ApiError::BadRequest(format!("Invalid scheduled_at: {e}")))?,
+        ),
+    };
+    let task = state
+        .engine
+        .create_task(CreateTask {
+            queue_name: body.queue_name,
+            task_name: body.task_name,
+            input: body.input,
             priority: body.priority,
             max_retries: body.max_retries,
             timeout_seconds: body.timeout_seconds,
-            idempotency_key: body.idempotency_key,
-            metadata: metadata.clone(),
+            idempotency_key: body.idempotency_key.filter(|k| !k.is_empty()),
+            metadata: body.metadata.unwrap_or(serde_json::json!({})),
             scheduled_at,
-        },
-    )
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    valka_core::metrics::record_task_created(&body.queue_name);
-
-    // Emit task created event
-    let event = valka_proto::TaskEvent {
-        event_id: uuid::Uuid::now_v7().to_string(),
-        task_id: task_id.0.clone(),
-        queue_name: body.queue_name.clone(),
-        previous_status: 0,
-        new_status: 1, // PENDING
-        worker_id: String::new(),
-        node_id: state.node_id.clone(),
-        attempt_number: 0,
-        error_message: String::new(),
-        timestamp_ms: chrono::Utc::now().timestamp_millis(),
-    };
-    let _ = state.event_tx.send(event);
-
-    // Check if we own this partition; if not, forward to owner
-    if !state
-        .cluster
-        .owns_partition(&body.queue_name, partition.0)
-        .await
-        && let Some(owner_addr) = state
-            .cluster
-            .get_partition_owner_addr(&body.queue_name, partition.0)
-            .await
-    {
-        let _ = state
-            .forwarder
-            .forward_task(&owner_addr, &task_id.0, &body.queue_name, partition.0)
-            .await;
-        valka_core::metrics::record_task_forwarded(&body.queue_name);
-        return Ok((StatusCode::CREATED, Json(task_row_to_json(task))));
-    }
-    // If owner unknown, fall through to local sync match (safety)
-
-    // Sync match (hot path) — same as gRPC create_task
-    if scheduled_at.is_none() {
-        let envelope = TaskEnvelope {
-            task_id: task_id.0.clone(),
-            task_run_id: String::new(),
-            queue_name: body.queue_name.clone(),
-            task_name: body.task_name.clone(),
-            input: body.input.map(|v| v.to_string()),
-            attempt_number: 1,
-            timeout_seconds: body.timeout_seconds,
-            metadata: metadata.to_string(),
-            priority: body.priority,
-        };
-        let _ = state
-            .matching
-            .offer_task(&body.queue_name, partition, envelope);
-    }
-
-    Ok((StatusCode::CREATED, Json(task_row_to_json(task))))
+        })
+        .await?;
+    Ok((StatusCode::CREATED, Json(task.to_json())))
 }
 
 async fn get_task(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let task = valka_db::queries::tasks::get_task(&state.pool, &task_id)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?
+    let task = state
+        .engine
+        .get_task(&task_id)
         .ok_or_else(|| ApiError::NotFound("Task not found".to_string()))?;
-
-    Ok(Json(task_row_to_json(task)))
+    Ok(Json(task.to_json()))
 }
 
 async fn list_tasks(
     State(state): State<AppState>,
     Query(query): Query<ListTasksQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let tasks = valka_db::queries::tasks::list_tasks(
-        &state.pool,
+    let status = match query.status.as_deref() {
+        None | Some("") => None,
+        Some(s) => Some(
+            TaskStatus::from_str_status(s)
+                .ok_or_else(|| ApiError::BadRequest(format!("Unknown status {s}")))?,
+        ),
+    };
+    let tasks = state.engine.list_tasks(
         query.queue_name.as_deref(),
-        query.status.as_deref(),
-        query.limit,
-        query.offset,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    let result: Vec<serde_json::Value> = tasks.into_iter().map(task_row_to_json).collect();
+        status,
+        query.limit.clamp(1, 1000) as usize,
+        query.offset.max(0) as usize,
+    );
+    let result: Vec<serde_json::Value> = tasks.iter().map(|t| t.to_json()).collect();
     Ok(Json(result))
 }
 
@@ -327,33 +285,20 @@ async fn cancel_task(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // Try cancelling (PENDING, RETRY, RUNNING, DISPATCHING)
-    let task = valka_db::queries::tasks::cancel_task_any(&state.pool, &task_id)
+    let (task, running_on) = state
+        .engine
+        .cancel_task(&task_id, "Cancelled by user")
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?
-        .ok_or_else(|| {
-            ApiError::InvalidState("Task not found or not in cancellable state".to_string())
+        .map_err(|e| match e {
+            ServerError::TaskNotFound(_) | ServerError::InvalidStatusTransition { .. } => {
+                ApiError::InvalidState("Task not found or not in cancellable state".to_string())
+            }
+            other => other.into(),
         })?;
-
-    // If task was RUNNING, forward cancellation to the worker
-    state.dispatcher.cancel_task_on_worker(&task_id).await;
-
-    // Emit cancel event
-    let event = valka_proto::TaskEvent {
-        event_id: uuid::Uuid::now_v7().to_string(),
-        task_id: task_id.clone(),
-        queue_name: task.queue_name.clone(),
-        previous_status: 0,
-        new_status: 8, // CANCELLED
-        worker_id: String::new(),
-        node_id: state.node_id.clone(),
-        attempt_number: 0,
-        error_message: String::new(),
-        timestamp_ms: chrono::Utc::now().timestamp_millis(),
-    };
-    let _ = state.event_tx.send(event);
-
-    Ok(Json(task_row_to_json(task)))
+    if running_on.is_some() {
+        state.dispatcher.cancel_task_on_worker(&task_id).await;
+    }
+    Ok(Json(task.to_json()))
 }
 
 #[derive(Deserialize)]
@@ -368,51 +313,34 @@ async fn send_signal(
     Path(task_id): Path<String>,
     Json(body): Json<SendSignalBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // Validate task exists
-    let task = valka_db::queries::tasks::get_task(&state.pool, &task_id)
+    let signal = state
+        .engine
+        .send_signal(&task_id, &body.signal_name, body.payload)
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?
-        .ok_or_else(|| ApiError::NotFound("Task not found".to_string()))?;
+        .map_err(|e| match e {
+            ServerError::InvalidStatusTransition { from, .. } => {
+                ApiError::InvalidState(format!("Cannot send signal to task in {from} state"))
+            }
+            other => other.into(),
+        })?;
 
-    // Reject if terminal status
-    match task.status.as_str() {
-        "COMPLETED" | "FAILED" | "DEAD_LETTER" | "CANCELLED" => {
-            return Err(ApiError::InvalidState(format!(
-                "Cannot send signal to task in {} state",
-                task.status
-            )));
-        }
-        _ => {}
-    }
-
-    // Insert signal
-    let signal_id = uuid::Uuid::now_v7().to_string();
-    let signal = valka_db::queries::signals::create_signal(
-        &state.pool,
-        &signal_id,
-        &task_id,
-        &body.signal_name,
-        body.payload,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    // Try immediate delivery
     let task_signal = valka_proto::TaskSignal {
         signal_id: signal.id.clone(),
-        task_id: signal.task_id,
-        signal_name: signal.signal_name,
-        payload: signal.payload.map(|v| v.to_string()).unwrap_or_default(),
+        task_id: signal.task_id.clone(),
+        signal_name: signal.signal_name.clone(),
+        payload: signal
+            .payload
+            .clone()
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
         timestamp_ms: signal.created_at.timestamp_millis(),
     };
-
     let delivered = state
         .dispatcher
         .send_signal_to_worker(&task_id, task_signal)
         .await;
-
     if delivered {
-        let _ = valka_db::queries::signals::mark_delivered(&state.pool, &signal.id).await;
+        state.engine.signal_delivered(&signal.id);
     }
 
     Ok((
@@ -435,25 +363,18 @@ async fn list_signals(
     Path(task_id): Path<String>,
     Query(query): Query<ListSignalsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let signals =
-        valka_db::queries::signals::list_signals(&state.pool, &task_id, query.status.as_deref())
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    let result: Vec<serde_json::Value> = signals
-        .into_iter()
-        .map(|s| {
-            serde_json::json!({
-                "id": s.id,
-                "task_id": s.task_id,
-                "signal_name": s.signal_name,
-                "payload": s.payload,
-                "status": s.status,
-                "created_at": s.created_at.to_rfc3339(),
-                "delivered_at": s.delivered_at.map(|t| t.to_rfc3339()),
-                "acknowledged_at": s.acknowledged_at.map(|t| t.to_rfc3339()),
-            })
-        })
+    let status = match query.status.as_deref() {
+        None | Some("") => None,
+        Some(s) => Some(
+            SignalStatus::parse(s)
+                .ok_or_else(|| ApiError::BadRequest(format!("Unknown status {s}")))?,
+        ),
+    };
+    let result: Vec<serde_json::Value> = state
+        .engine
+        .list_signals(&task_id, status)
+        .iter()
+        .map(|s| s.to_json())
         .collect();
     Ok(Json(result))
 }
@@ -462,22 +383,15 @@ async fn delete_task(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let deleted = valka_db::queries::tasks::delete_task(&state.pool, &task_id)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
+    let deleted = state.engine.delete_task(&task_id).await?;
     if !deleted {
         return Err(ApiError::NotFound("Task not found".to_string()));
     }
-
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
 async fn clear_all_tasks(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
-    let count = valka_db::queries::tasks::clear_all_tasks(&state.pool)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
+    let count = state.engine.clear_all_tasks().await?;
     Ok(Json(serde_json::json!({ "deleted_count": count })))
 }
 
@@ -485,11 +399,8 @@ async fn get_task_runs(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let runs = valka_db::queries::task_runs::get_runs_for_task(&state.pool, &task_id)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    let result: Vec<serde_json::Value> = runs.into_iter().map(task_run_to_json).collect();
+    let runs = state.engine.runs_for_task(&task_id).unwrap_or_default();
+    let result: Vec<serde_json::Value> = runs.iter().map(|r| r.to_json()).collect();
     Ok(Json(result))
 }
 
@@ -507,27 +418,24 @@ fn default_log_limit() -> i64 {
 
 async fn get_run_logs(
     State(state): State<AppState>,
-    Path((task_id, run_id)): Path<(String, String)>,
+    Path((_task_id, run_id)): Path<(String, String)>,
     Query(query): Query<LogsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // Verify the run belongs to the task
-    let _ = task_id; // Used for API consistency; logs are queried by run_id
-
-    let logs = valka_db::queries::task_logs::get_logs_for_run(
-        &state.pool,
-        &run_id,
-        query.limit,
-        query.after_id,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    let result: Vec<serde_json::Value> = logs.into_iter().map(task_log_to_json).collect();
+    let after = query.after_id.map(|a| a.max(0) as usize).unwrap_or(0);
+    let limit = query.limit.clamp(1, 10_000) as usize;
+    let lines = state.logs.read(&run_id, after + limit).await;
+    // Log ids are 1-based positions within the run's log, so `after_id` paging works.
+    let result: Vec<serde_json::Value> = lines
+        .iter()
+        .enumerate()
+        .skip(after)
+        .take(limit)
+        .map(|(i, l)| log_line_to_json(l, i + 1))
+        .collect();
     Ok(Json(result))
 }
 
 async fn list_workers(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
-    // Return in-memory connected workers from dispatcher
     let workers: Vec<serde_json::Value> = state
         .dispatcher
         .workers()
@@ -563,31 +471,12 @@ async fn list_dead_letters(
     State(state): State<AppState>,
     Query(query): Query<DeadLetterQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let dls = valka_db::queries::dead_letter::list_dead_letters(
-        &state.pool,
+    let dls = state.engine.list_dead_letters(
         query.queue_name.as_deref(),
-        query.limit,
-        query.offset,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    let result: Vec<serde_json::Value> = dls
-        .into_iter()
-        .map(|dl| {
-            serde_json::json!({
-                "id": dl.id,
-                "task_id": dl.task_id,
-                "queue_name": dl.queue_name,
-                "task_name": dl.task_name,
-                "input": dl.input,
-                "error_message": dl.error_message,
-                "attempt_count": dl.attempt_count,
-                "metadata": dl.metadata,
-                "created_at": dl.created_at.to_rfc3339(),
-            })
-        })
-        .collect();
+        query.limit.clamp(1, 1000) as usize,
+        query.offset.max(0) as usize,
+    );
+    let result: Vec<serde_json::Value> = dls.iter().map(|d| d.to_json()).collect();
     Ok(Json(result))
 }
 
@@ -618,59 +507,24 @@ async fn subscribe_events_sse(
     Sse::new(stream)
 }
 
+async fn cluster_info(State(state): State<AppState>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "node_id": state.cluster.node_id().0,
+        "clustered": state.cluster.is_clustered(),
+        "storage": state.engine.store().backend_label(),
+        "durable_lsn": state.engine.durable_lsn().to_string(),
+        "queues": state.engine.queues(),
+        "poisoned": state.engine.poisoned(),
+    }))
+}
+
 async fn metrics(State(state): State<AppState>) -> String {
     state.metrics_handle.render()
 }
 
-async fn healthz() -> &'static str {
-    "ok"
-}
-
-fn task_row_to_json(row: valka_db::queries::tasks::TaskRow) -> serde_json::Value {
-    serde_json::json!({
-        "id": row.id,
-        "queue_name": row.queue_name,
-        "task_name": row.task_name,
-        "status": row.status,
-        "priority": row.priority,
-        "max_retries": row.max_retries,
-        "attempt_count": row.attempt_count,
-        "timeout_seconds": row.timeout_seconds,
-        "idempotency_key": row.idempotency_key,
-        "input": row.input,
-        "metadata": row.metadata,
-        "output": row.output,
-        "error_message": row.error_message,
-        "scheduled_at": row.scheduled_at.map(|t| t.to_rfc3339()),
-        "created_at": row.created_at.to_rfc3339(),
-        "updated_at": row.updated_at.to_rfc3339(),
-    })
-}
-
-fn task_run_to_json(row: valka_db::queries::task_runs::TaskRunRow) -> serde_json::Value {
-    serde_json::json!({
-        "id": row.id,
-        "task_id": row.task_id,
-        "attempt_number": row.attempt_number,
-        "worker_id": row.worker_id,
-        "assigned_node_id": row.assigned_node_id,
-        "status": row.status,
-        "output": row.output,
-        "error_message": row.error_message,
-        "lease_expires_at": row.lease_expires_at.to_rfc3339(),
-        "started_at": row.started_at.to_rfc3339(),
-        "completed_at": row.completed_at.map(|t| t.to_rfc3339()),
-        "last_heartbeat": row.last_heartbeat.to_rfc3339(),
-    })
-}
-
-fn task_log_to_json(row: valka_db::queries::task_logs::TaskLogRow) -> serde_json::Value {
-    serde_json::json!({
-        "id": row.id,
-        "task_run_id": row.task_run_id,
-        "timestamp_ms": row.timestamp_ms,
-        "level": row.level,
-        "message": row.message,
-        "metadata": row.metadata,
-    })
+async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
+    match state.engine.poisoned() {
+        None => (StatusCode::OK, "ok"),
+        Some(_) => (StatusCode::SERVICE_UNAVAILABLE, "wal writer poisoned"),
+    }
 }

@@ -10,8 +10,22 @@ data:
     http_addr = "0.0.0.0:{{ .Values.service.httpPort }}"
     web_dir = "/usr/share/valka/web"
 
-    [database]
-    max_connections = {{ .Values.config.database.maxConnections }}
+    [storage]
+    backend = "s3"
+    bucket = {{ .Values.storage.bucket | quote }}
+    prefix = {{ .Values.storage.prefix | quote }}
+    {{- if .Values.storage.region }}
+    region = {{ .Values.storage.region | quote }}
+    {{- end }}
+    {{- if .Values.storage.endpoint }}
+    endpoint = {{ .Values.storage.endpoint | quote }}
+    {{- end }}
+    allow_http = {{ .Values.storage.allowHttp }}
+
+    [wal]
+    flush_interval_ms = {{ .Values.config.wal.flushIntervalMs }}
+    snapshot_interval_secs = {{ .Values.config.wal.snapshotIntervalSecs }}
+    completed_retention_secs = {{ .Values.config.wal.completedRetentionSecs }}
 
     [gossip]
     listen_addr = "0.0.0.0:{{ .Values.config.gossip.port }}"
@@ -21,19 +35,21 @@ data:
     {{- $ns := .Release.Namespace -}}
     {{- $port := .Values.config.gossip.port -}}
     {{- $headless := printf "%s-headless" $fullname -}}
+    {{- if gt (int .Values.replicaCount) 1 }}
     {{- range $i := until (int .Values.replicaCount) }}
       {{ printf "%s-%d.%s.%s.svc.cluster.local:%d" $fullname (int $i) $headless $ns (int $port) | quote }},
+    {{- end }}
     {{- end }}
     ]
 
     [matching]
     num_partitions = {{ .Values.config.numPartitions }}
     max_buffer_per_partition = {{ .Values.config.matching.maxBufferPerPartition }}
-    task_reader_batch_size = {{ .Values.config.matching.taskReaderBatchSize }}
+    feeder_batch_size = {{ .Values.config.matching.feederBatchSize }}
 
     [scheduler]
-    lease_timeout_secs = {{ .Values.config.scheduler.leaseTimeoutSecs }}
-    reaper_interval_secs = {{ .Values.config.scheduler.reaperIntervalSecs }}
+    lease_grace_secs = {{ .Values.config.scheduler.leaseGraceSecs }}
+    heartbeat_lease_secs = {{ .Values.config.scheduler.heartbeatLeaseSecs }}
 
     [log_ingester]
     batch_size = {{ .Values.config.logIngester.batchSize }}

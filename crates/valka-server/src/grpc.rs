@@ -8,27 +8,32 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::info;
 
+use crate::convert::{log_line_to_proto, proto_to_status, task_to_proto};
 use crate::internal_grpc::InternalServiceImpl;
 use valka_cluster::{ClusterManager, NodeForwarder};
-use valka_core::{NodeId, TaskId, partition_for_task};
-use valka_db::DbPool;
+use valka_core::{NodeId, ServerError};
 use valka_dispatcher::DispatcherService;
-use valka_matching::MatchingService;
-use valka_matching::partition::TaskEnvelope;
+use valka_engine::{CreateTask, Engine, LogIngester};
 use valka_proto::*;
 
 pub struct ApiServiceImpl {
-    pool: DbPool,
-    matching: MatchingService,
+    engine: Engine,
     dispatcher: DispatcherService,
     event_tx: broadcast::Sender<TaskEvent>,
-    node_id: NodeId,
-    cluster: Arc<ClusterManager>,
-    forwarder: NodeForwarder,
+    logs: Arc<LogIngester>,
 }
 
 pub struct WorkerServiceImpl {
     dispatcher: DispatcherService,
+}
+
+fn parse_json(field: &str, s: &str) -> Result<Option<serde_json::Value>, Status> {
+    if s.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(s)
+        .map(Some)
+        .map_err(|e| Status::invalid_argument(format!("Invalid {field} JSON: {e}")))
 }
 
 #[tonic::async_trait]
@@ -38,29 +43,8 @@ impl api_service_server::ApiService for ApiServiceImpl {
         request: Request<CreateTaskRequest>,
     ) -> Result<Response<CreateTaskResponse>, Status> {
         let req = request.into_inner();
-        let task_id = TaskId::new();
-        let partition = partition_for_task(
-            &req.queue_name,
-            &task_id.0,
-            self.matching.config().num_partitions,
-        );
-
-        let input: Option<serde_json::Value> = if req.input.is_empty() {
-            None
-        } else {
-            Some(
-                serde_json::from_str(&req.input)
-                    .map_err(|e| Status::invalid_argument(format!("Invalid input JSON: {e}")))?,
-            )
-        };
-
-        let metadata: serde_json::Value = if req.metadata.is_empty() {
-            serde_json::json!({})
-        } else {
-            serde_json::from_str(&req.metadata)
-                .map_err(|e| Status::invalid_argument(format!("Invalid metadata JSON: {e}")))?
-        };
-
+        let input = parse_json("input", &req.input)?;
+        let metadata = parse_json("metadata", &req.metadata)?.unwrap_or(serde_json::json!({}));
         let scheduled_at = if req.scheduled_at.is_empty() {
             None
         } else {
@@ -70,109 +54,35 @@ impl api_service_server::ApiService for ApiServiceImpl {
                     .map_err(|e| Status::invalid_argument(format!("Invalid scheduled_at: {e}")))?,
             )
         };
-
-        let max_retries = if req.max_retries == 0 {
-            3
-        } else {
-            req.max_retries
-        };
-        let timeout_seconds = if req.timeout_seconds == 0 {
-            300
-        } else {
-            req.timeout_seconds
-        };
-
-        // Always persist to PG first
-        let task_row = valka_db::queries::tasks::create_task(
-            &self.pool,
-            valka_db::queries::tasks::CreateTaskParams {
-                id: task_id.0.clone(),
-                queue_name: req.queue_name.clone(),
-                task_name: req.task_name.clone(),
-                partition_id: partition.0,
-                input: input.clone(),
+        let task = self
+            .engine
+            .create_task(CreateTask {
+                queue_name: req.queue_name,
+                task_name: req.task_name,
+                input,
                 priority: req.priority,
-                max_retries,
-                timeout_seconds,
+                max_retries: if req.max_retries == 0 {
+                    3
+                } else {
+                    req.max_retries
+                },
+                timeout_seconds: if req.timeout_seconds == 0 {
+                    300
+                } else {
+                    req.timeout_seconds
+                },
                 idempotency_key: if req.idempotency_key.is_empty() {
                     None
                 } else {
-                    Some(req.idempotency_key.clone())
+                    Some(req.idempotency_key)
                 },
-                metadata: metadata.clone(),
+                metadata,
                 scheduled_at,
-            },
-        )
-        .await
-        .map_err(|e| {
-            if let sqlx::Error::Database(ref db_err) = e
-                && db_err.constraint() == Some("idx_tasks_idempotency")
-            {
-                return Status::already_exists("Task with this idempotency key already exists");
-            }
-            Status::internal(format!("Database error: {e}"))
-        })?;
-
-        valka_core::metrics::record_task_created(&req.queue_name);
-
-        // Emit task created event
-        let event = TaskEvent {
-            event_id: uuid::Uuid::now_v7().to_string(),
-            task_id: task_id.0.clone(),
-            queue_name: req.queue_name.clone(),
-            previous_status: 0,
-            new_status: 1, // PENDING
-            worker_id: String::new(),
-            node_id: self.node_id.0.clone(),
-            attempt_number: 0,
-            error_message: String::new(),
-            timestamp_ms: chrono::Utc::now().timestamp_millis(),
-        };
-        let _ = self.event_tx.send(event);
-
-        // Check if we own this partition; if not, forward to owner
-        if !self
-            .cluster
-            .owns_partition(&req.queue_name, partition.0)
+            })
             .await
-            && let Some(owner_addr) = self
-                .cluster
-                .get_partition_owner_addr(&req.queue_name, partition.0)
-                .await
-        {
-            let _ = self
-                .forwarder
-                .forward_task(&owner_addr, &task_id.0, &req.queue_name, partition.0)
-                .await;
-            valka_core::metrics::record_task_forwarded(&req.queue_name);
-            return Ok(Response::new(CreateTaskResponse {
-                task: Some(task_row_to_proto(task_row)),
-            }));
-        }
-        // If owner unknown, fall through to local sync match (safety)
-
-        // Try sync match (hot path)
-        if scheduled_at.is_none() {
-            let envelope = TaskEnvelope {
-                task_id: task_id.0.clone(),
-                task_run_id: String::new(),
-                queue_name: req.queue_name.clone(),
-                task_name: req.task_name.clone(),
-                input: input.map(|v| v.to_string()),
-                attempt_number: 1,
-                timeout_seconds,
-                metadata: metadata.to_string(),
-                priority: req.priority,
-            };
-
-            // Fire and forget the sync match - if it fails, TaskReader will pick it up
-            let _ = self
-                .matching
-                .offer_task(&req.queue_name, partition, envelope);
-        }
-
+            .map_err(Status::from)?;
         Ok(Response::new(CreateTaskResponse {
-            task: Some(task_row_to_proto(task_row)),
+            task: Some(task_to_proto(task)),
         }))
     }
 
@@ -181,13 +91,12 @@ impl api_service_server::ApiService for ApiServiceImpl {
         request: Request<GetTaskRequest>,
     ) -> Result<Response<GetTaskResponse>, Status> {
         let req = request.into_inner();
-        let task = valka_db::queries::tasks::get_task(&self.pool, &req.task_id)
-            .await
-            .map_err(|e| Status::internal(format!("Database error: {e}")))?
+        let task = self
+            .engine
+            .get_task(&req.task_id)
             .ok_or_else(|| Status::not_found(format!("Task not found: {}", req.task_id)))?;
-
         Ok(Response::new(GetTaskResponse {
-            task: Some(task_row_to_proto(task)),
+            task: Some(task_to_proto(task)),
         }))
     }
 
@@ -201,38 +110,27 @@ impl api_service_server::ApiService for ApiServiceImpl {
         } else {
             Some(req.queue_name.as_str())
         };
-
         let status_filter = if req.status == 0 {
             None
         } else {
-            proto_status_to_str(req.status)
+            proto_to_status(req.status)
         };
-
         let (limit, offset) = if let Some(ref p) = req.pagination {
-            let offset: i64 = p.page_token.parse().unwrap_or(0);
-            (p.page_size as i64, offset)
+            let offset: usize = p.page_token.parse().unwrap_or(0);
+            (p.page_size.max(1) as usize, offset)
         } else {
             (50, 0)
         };
-
-        let tasks = valka_db::queries::tasks::list_tasks(
-            &self.pool,
-            queue_name,
-            status_filter,
-            limit,
-            offset,
-        )
-        .await
-        .map_err(|e| Status::internal(format!("Database error: {e}")))?;
-
-        let next_token = if tasks.len() as i64 == limit {
+        let tasks = self
+            .engine
+            .list_tasks(queue_name, status_filter, limit, offset);
+        let next_token = if tasks.len() == limit {
             (offset + limit).to_string()
         } else {
             String::new()
         };
-
         Ok(Response::new(ListTasksResponse {
-            tasks: tasks.into_iter().map(task_row_to_proto).collect(),
+            tasks: tasks.into_iter().map(task_to_proto).collect(),
             next_page_token: next_token,
         }))
     }
@@ -242,36 +140,24 @@ impl api_service_server::ApiService for ApiServiceImpl {
         request: Request<CancelTaskRequest>,
     ) -> Result<Response<CancelTaskResponse>, Status> {
         let req = request.into_inner();
-        let task = valka_db::queries::tasks::cancel_task_any(&self.pool, &req.task_id)
+        let (task, running_on) = self
+            .engine
+            .cancel_task(&req.task_id, "Cancelled by user")
             .await
-            .map_err(|e| Status::internal(format!("Database error: {e}")))?
-            .ok_or_else(|| {
-                Status::failed_precondition(format!(
-                    "Task {} not found or not in cancellable state",
-                    req.task_id
-                ))
+            .map_err(|e| match e {
+                ServerError::TaskNotFound(_) | ServerError::InvalidStatusTransition { .. } => {
+                    Status::failed_precondition(format!(
+                        "Task {} not found or not in cancellable state",
+                        req.task_id
+                    ))
+                }
+                other => Status::from(other),
             })?;
-
-        // Forward cancellation to worker if running
-        self.dispatcher.cancel_task_on_worker(&req.task_id).await;
-
-        // Emit cancel event
-        let event = TaskEvent {
-            event_id: uuid::Uuid::now_v7().to_string(),
-            task_id: req.task_id.clone(),
-            queue_name: task.queue_name.clone(),
-            previous_status: 0,
-            new_status: 8, // CANCELLED
-            worker_id: String::new(),
-            node_id: self.node_id.0.clone(),
-            attempt_number: 0,
-            error_message: String::new(),
-            timestamp_ms: chrono::Utc::now().timestamp_millis(),
-        };
-        let _ = self.event_tx.send(event);
-
+        if running_on.is_some() {
+            self.dispatcher.cancel_task_on_worker(&req.task_id).await;
+        }
         Ok(Response::new(CancelTaskResponse {
-            task: Some(task_row_to_proto(task)),
+            task: Some(task_to_proto(task)),
         }))
     }
 
@@ -280,64 +166,33 @@ impl api_service_server::ApiService for ApiServiceImpl {
         request: Request<SendSignalRequest>,
     ) -> Result<Response<SendSignalResponse>, Status> {
         let req = request.into_inner();
-
-        // Validate task exists
-        let task = valka_db::queries::tasks::get_task(&self.pool, &req.task_id)
+        let payload = parse_json("payload", &req.payload)?;
+        let signal = self
+            .engine
+            .send_signal(&req.task_id, &req.signal_name, payload)
             .await
-            .map_err(|e| Status::internal(format!("Database error: {e}")))?
-            .ok_or_else(|| Status::not_found(format!("Task not found: {}", req.task_id)))?;
-
-        // Reject if terminal status
-        match task.status.as_str() {
-            "COMPLETED" | "FAILED" | "DEAD_LETTER" | "CANCELLED" => {
-                return Err(Status::failed_precondition(format!(
-                    "Cannot send signal to task in {} state",
-                    task.status
-                )));
-            }
-            _ => {}
-        }
-
-        // Validate payload is valid JSON if non-empty
-        let payload: Option<serde_json::Value> = if req.payload.is_empty() {
-            None
-        } else {
-            Some(
-                serde_json::from_str(&req.payload)
-                    .map_err(|e| Status::invalid_argument(format!("Invalid payload JSON: {e}")))?,
-            )
-        };
-
-        // Insert signal
-        let signal_id = uuid::Uuid::now_v7().to_string();
-        let signal = valka_db::queries::signals::create_signal(
-            &self.pool,
-            &signal_id,
-            &req.task_id,
-            &req.signal_name,
-            payload,
-        )
-        .await
-        .map_err(|e| Status::internal(format!("Database error: {e}")))?;
-
-        // Try immediate delivery
-        let task_signal = valka_proto::TaskSignal {
-            signal_id: signal.id.clone(),
-            task_id: signal.task_id,
-            signal_name: signal.signal_name,
-            payload: signal.payload.map(|v| v.to_string()).unwrap_or_default(),
-            timestamp_ms: signal.created_at.timestamp_millis(),
-        };
-
+            .map_err(|e| match e {
+                ServerError::InvalidStatusTransition { from, .. } => Status::failed_precondition(
+                    format!("Cannot send signal to task in {from} state"),
+                ),
+                other => Status::from(other),
+            })?;
         let delivered = self
             .dispatcher
-            .send_signal_to_worker(&req.task_id, task_signal)
+            .send_signal_to_worker(
+                &req.task_id,
+                TaskSignal {
+                    signal_id: signal.id.clone(),
+                    task_id: signal.task_id.clone(),
+                    signal_name: signal.signal_name.clone(),
+                    payload: signal.payload.map(|v| v.to_string()).unwrap_or_default(),
+                    timestamp_ms: signal.created_at.timestamp_millis(),
+                },
+            )
             .await;
-
         if delivered {
-            let _ = valka_db::queries::signals::mark_delivered(&self.pool, &signal.id).await;
+            self.engine.signal_delivered(&signal.id);
         }
-
         Ok(Response::new(SendSignalResponse {
             signal_id: signal.id,
             delivered,
@@ -349,8 +204,9 @@ impl api_service_server::ApiService for ApiServiceImpl {
 
     async fn subscribe_events(
         &self,
-        _request: Request<SubscribeEventsRequest>,
+        request: Request<SubscribeEventsRequest>,
     ) -> Result<Response<Self::SubscribeEventsStream>, Status> {
+        let filter = request.into_inner().queue_name;
         let mut rx = self.event_tx.subscribe();
         let (tx, rx_stream) = mpsc::channel(256);
 
@@ -358,6 +214,9 @@ impl api_service_server::ApiService for ApiServiceImpl {
             loop {
                 match rx.recv().await {
                     Ok(event) => {
+                        if !filter.is_empty() && event.queue_name != filter {
+                            continue;
+                        }
                         if tx.send(Ok(event)).await.is_err() {
                             break;
                         }
@@ -382,33 +241,16 @@ impl api_service_server::ApiService for ApiServiceImpl {
     ) -> Result<Response<Self::SubscribeLogsStream>, Status> {
         let req = request.into_inner();
         let (tx, rx) = mpsc::channel(256);
-
-        // If include_history, fetch from PG first
         if req.include_history {
-            let pool = self.pool.clone();
-            let run_id = req.task_run_id.clone();
-            let tx_clone = tx.clone();
+            let logs = self.logs.clone();
             tokio::spawn(async move {
-                if let Ok(logs) =
-                    valka_db::queries::task_logs::get_logs_for_run(&pool, &run_id, 10000, None)
-                        .await
-                {
-                    for log in logs {
-                        let entry = LogEntry {
-                            task_run_id: log.task_run_id,
-                            timestamp_ms: log.timestamp_ms,
-                            level: str_to_log_level(&log.level),
-                            message: log.message,
-                            metadata: log.metadata.map(|m| m.to_string()).unwrap_or_default(),
-                        };
-                        if tx_clone.send(Ok(entry)).await.is_err() {
-                            break;
-                        }
+                for line in logs.read(&req.task_run_id, 10_000).await {
+                    if tx.send(Ok(log_line_to_proto(line))).await.is_err() {
+                        break;
                     }
                 }
             });
         }
-
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
@@ -438,33 +280,29 @@ impl worker_service_server::WorkerService for WorkerServiceImpl {
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_grpc(
     addr: SocketAddr,
-    pool: DbPool,
+    engine: Engine,
     dispatcher: DispatcherService,
-    matching: MatchingService,
     event_tx: broadcast::Sender<TaskEvent>,
     node_id: NodeId,
-    cluster: Arc<ClusterManager>,
-    forwarder: NodeForwarder,
-    _log_tx: mpsc::Sender<LogEntry>,
+    _cluster: Arc<ClusterManager>,
+    _forwarder: NodeForwarder,
+    logs: Arc<LogIngester>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
     let api_service = ApiServiceImpl {
-        pool: pool.clone(),
-        matching: matching.clone(),
+        engine: engine.clone(),
         dispatcher: dispatcher.clone(),
         event_tx: event_tx.clone(),
-        node_id: node_id.clone(),
-        cluster,
-        forwarder,
+        logs: logs.clone(),
     };
 
     let worker_service = WorkerServiceImpl { dispatcher };
 
     let internal_service = InternalServiceImpl {
-        pool,
-        matching,
+        engine,
         node_id,
         event_tx,
+        logs,
     };
 
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
@@ -496,65 +334,4 @@ pub async fn serve_grpc(
         .await?;
 
     Ok(())
-}
-
-// --- Helper functions ---
-
-fn task_row_to_proto(row: valka_db::queries::tasks::TaskRow) -> TaskMeta {
-    TaskMeta {
-        id: row.id,
-        queue_name: row.queue_name,
-        task_name: row.task_name,
-        status: str_to_task_status(&row.status),
-        priority: row.priority,
-        max_retries: row.max_retries,
-        attempt_count: row.attempt_count,
-        timeout_seconds: row.timeout_seconds,
-        idempotency_key: row.idempotency_key.unwrap_or_default(),
-        input: row.input.map(|v| v.to_string()).unwrap_or_default(),
-        metadata: row.metadata.to_string(),
-        output: row.output.map(|v| v.to_string()).unwrap_or_default(),
-        error_message: row.error_message.unwrap_or_default(),
-        scheduled_at: row.scheduled_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
-        created_at: row.created_at.to_rfc3339(),
-        updated_at: row.updated_at.to_rfc3339(),
-    }
-}
-
-fn str_to_task_status(s: &str) -> i32 {
-    match s {
-        "PENDING" => 1,
-        "DISPATCHING" => 2,
-        "RUNNING" => 3,
-        "COMPLETED" => 4,
-        "FAILED" => 5,
-        "RETRY" => 6,
-        "DEAD_LETTER" => 7,
-        "CANCELLED" => 8,
-        _ => 0,
-    }
-}
-
-fn proto_status_to_str(status: i32) -> Option<&'static str> {
-    match status {
-        1 => Some("PENDING"),
-        2 => Some("DISPATCHING"),
-        3 => Some("RUNNING"),
-        4 => Some("COMPLETED"),
-        5 => Some("FAILED"),
-        6 => Some("RETRY"),
-        7 => Some("DEAD_LETTER"),
-        8 => Some("CANCELLED"),
-        _ => None,
-    }
-}
-
-fn str_to_log_level(s: &str) -> i32 {
-    match s {
-        "DEBUG" => 1,
-        "INFO" => 2,
-        "WARN" => 3,
-        "ERROR" => 4,
-        _ => 0,
-    }
 }

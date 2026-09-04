@@ -66,7 +66,7 @@ fn test_config_defaults() {
     assert_eq!(config.num_partitions, 4);
     assert_eq!(config.branching_factor, 3);
     assert_eq!(config.max_buffer_per_partition, 1000);
-    assert_eq!(config.task_reader_batch_size, 50);
+    assert_eq!(config.feeder_batch_size, 200);
 }
 
 #[test]
@@ -74,9 +74,9 @@ fn test_server_config_defaults() {
     let config = valka_core::ServerConfig::default();
     assert_eq!(config.grpc_addr, "0.0.0.0:50051");
     assert_eq!(config.http_addr, "0.0.0.0:8989");
-    assert!(!config.database_url.is_empty());
-    assert_eq!(config.scheduler.reaper_interval_secs, 10);
-    assert_eq!(config.scheduler.lease_timeout_secs, 60);
+    assert_eq!(config.storage.backend, "local");
+    assert_eq!(config.scheduler.timer_tick_ms, 100);
+    assert_eq!(config.scheduler.lease_grace_secs, 30);
     assert_eq!(config.log_ingester.batch_size, 100);
     assert_eq!(config.log_ingester.flush_interval_ms, 500);
 }

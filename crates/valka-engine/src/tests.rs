@@ -209,7 +209,7 @@ async fn lease_expiry_retries_and_heartbeat_extends() {
     let d = e.dispatch(&t.id, "w").unwrap();
 
     tokio::time::advance(Duration::from_secs(35)).await;
-    e.heartbeat(&[t.id.clone()]); // lease -> now + 60
+    e.heartbeat(std::slice::from_ref(&t.id)); // lease -> now + 60
     settle().await;
     tokio::time::advance(Duration::from_secs(30)).await; // t=65 > original 40
     settle().await;

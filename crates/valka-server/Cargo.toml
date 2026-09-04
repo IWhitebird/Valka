@@ -17,6 +17,8 @@ valka-core = { workspace = true }
 valka-proto = { workspace = true }
 valka-matching = { workspace = true }
 valka-dispatcher = { workspace = true }
+valka-engine = { workspace = true }
+valka-wal = { workspace = true }
 valka-cluster = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }

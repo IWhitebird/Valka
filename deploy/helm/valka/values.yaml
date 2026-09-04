@@ -1,4 +1,6 @@
-replicaCount: 3
+# Phase 1 of the WAL architecture: one node owns every shard. Multi-node shard
+# ownership lands in phase 2 (docs/wal/PLAN.md); keep this at 1 until then.
+replicaCount: 1
 
 image:
   repository: ghcr.io/iwhitebird/valka
@@ -29,54 +31,36 @@ config:
     clusterName: valka
     port: 7280
 
-  database:
-    maxConnections: 5  # per-node, keep low with PgBouncer
+  wal:
+    flushIntervalMs: 50
+    snapshotIntervalSecs: 60
+    completedRetentionSecs: 86400
 
   matching:
     maxBufferPerPartition: 1000
-    taskReaderBatchSize: 50
+    feederBatchSize: 200
 
   scheduler:
-    leaseTimeoutSecs: 60
-    reaperIntervalSecs: 10
+    leaseGraceSecs: 30
+    heartbeatLeaseSecs: 60
 
   logIngester:
     batchSize: 100
     flushIntervalMs: 500
 
-# -- Database connection
-database:
-  # Use an existing Secret instead of creating one
+# -- Object storage: the only durable state.
+storage:
+  bucket: valka
+  prefix: ""
+  region: us-east-1
+  # Custom endpoint for S3-compatible stores (MinIO, R2). Empty = AWS S3.
+  endpoint: ""
+  allowHttp: false
+  # Static credentials. Leave empty to use the pod's IAM role (IRSA) / default chain.
+  accessKeyId: ""
+  secretAccessKey: ""
+  # Use an existing Secret with keys `access-key-id` and `secret-access-key` instead.
   existingSecret: ""
-  secretKey: database-url
-  # Direct URL (stored in a new Secret if existingSecret is empty)
-  url: "postgresql://valka:valka@localhost:5432/valka"
-
-# -- PgBouncer sidecar
-pgbouncer:
-  enabled: true
-  poolMode: transaction
-  maxClientConn: 200
-  defaultPoolSize: 25
-  image:
-    repository: edoburu/pgbouncer
-    tag: "latest"
-  resources:
-    requests:
-      cpu: 50m
-      memory: 64Mi
-    limits:
-      cpu: 200m
-      memory: 128Mi
-
-# -- External PostgreSQL (used by PgBouncer)
-postgresql:
-  host: ""         # required when pgbouncer.enabled
-  port: 5432
-  database: valka
-  username: valka
-  password: ""
-  existingSecret: ""  # Secret with key "password"
 
 # -- Horizontal Pod Autoscaler
 autoscaling:

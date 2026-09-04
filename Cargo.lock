@@ -3047,8 +3047,10 @@ dependencies = [
  "valka-cluster",
  "valka-core",
  "valka-dispatcher",
+ "valka-engine",
  "valka-matching",
  "valka-proto",
+ "valka-wal",
 ]
 
 [[package]]
@@ -3056,6 +3058,7 @@ name = "valka-tests"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "cargo-husky",
  "chrono",
  "dashmap",
@@ -3063,6 +3066,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "metrics-exporter-prometheus",
+ "object_store",
  "serde",
  "serde_json",
  "tokio",
@@ -3070,14 +3074,18 @@ dependencies = [
  "tonic",
  "tower",
  "tower-http",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
  "valka-cluster",
  "valka-core",
  "valka-dispatcher",
+ "valka-engine",
  "valka-matching",
  "valka-proto",
  "valka-sdk",
  "valka-server",
+ "valka-wal",
 ]
 
 [[package]]

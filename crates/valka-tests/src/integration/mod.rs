@@ -1,13 +1,13 @@
+//! Integration tests. Every test runs against an in-memory object store, so the whole
+//! suite needs no external services. The `minio` feature adds tests against a real
+//! S3-compatible endpoint.
+
 mod helpers;
 
-mod db_dead_letter_tests;
-mod db_signals_tests;
-mod db_task_logs_tests;
-mod db_task_runs_tests;
-mod db_tasks_tests;
 mod dispatcher_tests;
+mod e2e_tests;
 mod lifecycle_tests;
 mod rest_api_tests;
-mod scheduler_tests;
 
-mod cluster_tests;
+#[cfg(feature = "minio")]
+mod minio_tests;

@@ -369,9 +369,8 @@ fn test_config_accessor() {
         num_partitions: 8,
         branching_factor: 4,
         max_buffer_per_partition: 500,
-        task_reader_batch_size: 25,
-        task_reader_poll_busy_ms: 5,
-        task_reader_poll_idle_ms: 100,
+        feeder_interval_ms: 5,
+        feeder_batch_size: 25,
     };
     let service = MatchingService::new(config.clone());
     assert_eq!(service.config().num_partitions, 8);

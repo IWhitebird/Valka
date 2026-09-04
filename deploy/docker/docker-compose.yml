@@ -1,27 +1,39 @@
-# Single-node production deployment: PostgreSQL + Valka
-# Copy .env.example to .env and edit before running.
+# Single-node deployment: Valka + an S3-compatible bucket.
+#
+# In production point Valka at a real bucket (AWS S3, R2, GCS-S3, ...) and drop the
+# MinIO services. Copy .env.example to .env and edit before running.
 #
 # Usage:
 #   docker compose up -d
 
 services:
-  postgres:
-    image: postgres:17
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-valka}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-valka}
-      POSTGRES_DB: ${POSTGRES_DB:-valka}
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-minioadmin}
     ports:
-      - "5432:5432"
+      - "9000:9000"
+      - "9001:9001"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - miniodata:/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-valka}"]
+      test: ["CMD", "mc", "ready", "local"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
     restart: unless-stopped
-    shm_size: 128mb
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${S3_ACCESS_KEY_ID:-minioadmin} ${S3_SECRET_ACCESS_KEY:-minioadmin} &&
+      mc mb --ignore-existing local/${S3_BUCKET:-valka}"
 
   valka:
     image: ghcr.io/iwhitebird/valka:latest
@@ -29,10 +41,18 @@ services:
       context: ../../
       dockerfile: Dockerfile
     depends_on:
-      postgres:
-        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     environment:
-      VALKA_DATABASE_URL: postgresql://${POSTGRES_USER:-valka}:${POSTGRES_PASSWORD:-valka}@postgres:5432/${POSTGRES_DB:-valka}
+      # Stable node id so a restarted node replays its own WAL.
+      VALKA_NODE_ID: ${VALKA_NODE_ID:-valka-1}
+      VALKA_STORAGE__BACKEND: s3
+      VALKA_STORAGE__BUCKET: ${S3_BUCKET:-valka}
+      VALKA_STORAGE__ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+      VALKA_STORAGE__REGION: ${S3_REGION:-us-east-1}
+      VALKA_STORAGE__ALLOW_HTTP: ${S3_ALLOW_HTTP:-true}
+      VALKA_STORAGE__ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-minioadmin}
+      VALKA_STORAGE__SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-minioadmin}
       VALKA_GRPC_ADDR: "0.0.0.0:50051"
       VALKA_HTTP_ADDR: "0.0.0.0:8989"
       RUST_LOG: ${RUST_LOG:-valka=info,tower_http=info}
@@ -42,4 +62,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  pgdata:
+  miniodata:

@@ -1,122 +1,204 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::http::StatusCode;
-use chrono::{DateTime, Duration, Utc};
-use sqlx::PgPool;
 use tokio::sync::{broadcast, mpsc};
 use valka_cluster::{ClusterManager, NodeForwarder};
-use valka_core::{MatchingConfig, NodeId, TaskId, partition_for_task};
-use valka_db::queries::task_runs::{CreateTaskRunParams, TaskRunRow};
-use valka_db::queries::tasks::{CreateTaskParams, TaskRow};
+use valka_core::{MatchingConfig, NodeId, TaskStatus, WorkerId};
 use valka_dispatcher::DispatcherService;
-use valka_matching::MatchingService;
+use valka_dispatcher::worker_handle::WorkerHandle;
+use valka_engine::{CreateTask, Engine, EngineConfig, LogIngester, TaskView};
+use valka_matching::{MatchingService, MatchingSink};
+use valka_proto::WorkerResponse;
+use valka_wal::Store;
+use valka_wal::logstore::LogLine;
 
-/// Create a task with sensible defaults. Returns the inserted TaskRow.
-pub async fn create_test_task(pool: &PgPool, queue: &str, name: &str) -> TaskRow {
-    let id = TaskId::new().0;
-    let partition = partition_for_task(queue, &id, 4);
-    valka_db::queries::tasks::create_task(
-        pool,
-        CreateTaskParams {
-            id,
-            queue_name: queue.to_string(),
-            task_name: name.to_string(),
-            partition_id: partition.0,
-            input: Some(serde_json::json!({"key": "value"})),
-            priority: 0,
-            max_retries: 3,
-            timeout_seconds: 300,
-            idempotency_key: None,
-            metadata: serde_json::json!({}),
-            scheduled_at: None,
-        },
-    )
-    .await
-    .expect("create_test_task failed")
+/// A fully wired single node on an in-memory (or provided) store.
+pub struct TestNode {
+    pub store: Store,
+    pub engine: Engine,
+    pub matching: MatchingService,
+    pub dispatcher: DispatcherService,
+    pub logs: Arc<LogIngester>,
+    pub log_tx: mpsc::Sender<LogLine>,
+    pub event_tx: broadcast::Sender<valka_proto::TaskEvent>,
+    pub cluster: Arc<ClusterManager>,
+    pub forwarder: NodeForwarder,
+    pub node_id: NodeId,
 }
 
-/// Create a task with all fields customizable.
-pub async fn create_test_task_full(pool: &PgPool, params: CreateTaskParams) -> TaskRow {
-    valka_db::queries::tasks::create_task(pool, params)
+impl TestNode {
+    pub async fn new() -> Self {
+        Self::on_store(Store::memory(), "test-node").await
+    }
+
+    /// Build (or rebuild after a simulated crash) a node on an existing store.
+    pub async fn on_store(store: Store, node_id: &str) -> Self {
+        let matching = MatchingService::new(MatchingConfig::default());
+        let mut cfg = EngineConfig::for_tests(node_id);
+        cfg.trust_self = false; // exercise the real assignment/ownership path
+        let engine = Engine::open_with(
+            store.clone(),
+            cfg,
+            valka_engine::TokioClock::new(),
+            Arc::new(MatchingSink::new(matching.clone())),
+        )
         .await
-        .expect("create_test_task_full failed")
+        .expect("engine open");
+        let (event_tx, _) = broadcast::channel::<valka_proto::TaskEvent>(1024);
+        valka_server::convert::spawn_event_bridge(&engine, event_tx.clone());
+
+        let (log_tx, log_rx) = mpsc::channel(1024);
+        let logs = LogIngester::new(store.clone(), 100, Duration::from_millis(20));
+        let (_stx, srx) = tokio::sync::watch::channel(false);
+        tokio::spawn(logs.clone().run(log_rx, srx));
+        std::mem::forget(_stx);
+
+        let node = NodeId(node_id.to_string());
+        let dispatcher = DispatcherService::new(
+            matching.clone(),
+            engine.clone(),
+            node.clone(),
+            log_tx.clone(),
+        );
+        let cluster = Arc::new(ClusterManager::new_single_node(
+            node.clone(),
+            matching.config().num_partitions,
+        ));
+        Self {
+            store,
+            engine,
+            matching,
+            dispatcher,
+            logs,
+            log_tx,
+            event_tx,
+            cluster,
+            forwarder: NodeForwarder::new(),
+            node_id: node,
+        }
+    }
+
+    pub fn router(&self) -> Router {
+        let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+            .build_recorder()
+            .handle();
+        valka_server::rest::build_api_router(
+            self.engine.clone(),
+            self.event_tx.clone(),
+            self.dispatcher.clone(),
+            self.logs.clone(),
+            metrics_handle,
+            self.cluster.clone(),
+            self.forwarder.clone(),
+        )
+    }
+
+    /// Create a task straight through the engine.
+    pub async fn create(&self, queue: &str, name: &str) -> TaskView {
+        self.engine
+            .create_task(task_req(queue, name))
+            .await
+            .expect("create task")
+    }
+
+    pub async fn create_with(&self, req: CreateTask) -> TaskView {
+        self.engine.create_task(req).await.expect("create task")
+    }
+
+    /// Move a task to RUNNING via a real dispatch record. Returns the run id.
+    pub fn start(&self, task_id: &str, worker: &str) -> String {
+        self.engine
+            .dispatch(task_id, worker)
+            .expect("dispatch")
+            .run_id
+    }
+
+    pub async fn complete(&self, task_id: &str) -> TaskView {
+        let run = self.start(task_id, "w");
+        self.engine
+            .complete_run(task_id, &run, None)
+            .await
+            .expect("complete")
+    }
+
+    pub async fn fail_terminal(&self, task_id: &str) -> TaskView {
+        let run = self.start(task_id, "w");
+        self.engine
+            .fail_run(task_id, &run, "boom", false)
+            .await
+            .expect("fail");
+        self.engine.get_task(task_id).unwrap()
+    }
+
+    pub async fn dead_letter(&self, task_id: &str) -> TaskView {
+        let t = self.engine.get_task(task_id).unwrap();
+        let mut view = t;
+        while view.status != TaskStatus::DeadLetter {
+            match view.status {
+                TaskStatus::Pending => {
+                    let run = self.start(task_id, "w");
+                    self.engine
+                        .fail_run(task_id, &run, "boom", true)
+                        .await
+                        .expect("fail");
+                }
+                TaskStatus::Retry => {
+                    // promote by advancing paused time past the backoff
+                    tokio::time::advance(Duration::from_secs(4000)).await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                other => panic!("unexpected status {other}"),
+            }
+            view = self.engine.get_task(task_id).unwrap();
+        }
+        view
+    }
+
+    /// Register a fake worker with the dispatcher; returns its id and response stream.
+    pub async fn register_worker(
+        &self,
+        queues: &[&str],
+        concurrency: i32,
+    ) -> (WorkerId, mpsc::Receiver<WorkerResponse>) {
+        let (tx, rx) = mpsc::channel::<WorkerResponse>(64);
+        let id = WorkerId::new();
+        let handle = WorkerHandle::new(
+            id.clone(),
+            "test-worker".to_string(),
+            queues.iter().map(|s| s.to_string()).collect(),
+            concurrency,
+            tx,
+            String::new(),
+        );
+        self.dispatcher.register_worker(handle).await;
+        (id, rx)
+    }
 }
 
-/// Create a task + running task_run. Returns (TaskRow, TaskRunRow).
-pub async fn create_running_task(pool: &PgPool, queue: &str) -> (TaskRow, TaskRunRow) {
-    let task = create_test_task(pool, queue, "running-task").await;
-
-    // Update to RUNNING
-    valka_db::queries::tasks::update_task_status(pool, &task.id, "RUNNING")
-        .await
-        .unwrap();
-
-    let run = valka_db::queries::task_runs::create_task_run(
-        pool,
-        CreateTaskRunParams {
-            id: uuid::Uuid::now_v7().to_string(),
-            task_id: task.id.clone(),
-            attempt_number: 1,
-            worker_id: uuid::Uuid::now_v7().to_string(),
-            assigned_node_id: uuid::Uuid::now_v7().to_string(),
-            lease_expires_at: Utc::now() + Duration::seconds(330),
-        },
-    )
-    .await
-    .expect("create_task_run failed");
-
-    // Re-fetch task to get updated status
-    let task = valka_db::queries::tasks::get_task(pool, &task.id)
-        .await
-        .unwrap()
-        .unwrap();
-
-    (task, run)
+pub fn task_req(queue: &str, name: &str) -> CreateTask {
+    CreateTask {
+        queue_name: queue.to_string(),
+        task_name: name.to_string(),
+        input: Some(serde_json::json!({"key": "value"})),
+        priority: 0,
+        max_retries: 3,
+        timeout_seconds: 300,
+        idempotency_key: None,
+        metadata: serde_json::json!({}),
+        scheduled_at: None,
+    }
 }
 
-/// Build the axum REST router wired to a real PG pool + in-memory services.
-pub fn build_test_router(pool: PgPool) -> Router {
-    let matching = MatchingService::new(MatchingConfig::default());
-    let node_id = NodeId::new();
-    let (event_tx, _) = broadcast::channel::<valka_proto::TaskEvent>(128);
-    let (log_tx, _log_rx) = mpsc::channel::<valka_proto::LogEntry>(128);
-
-    let dispatcher = DispatcherService::new(
-        matching.clone(),
-        pool.clone(),
-        node_id.clone(),
-        event_tx.clone(),
-        log_tx,
-    );
-
-    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
-        .build_recorder()
-        .handle();
-
-    let cluster = Arc::new(ClusterManager::new_single_node(
-        node_id,
-        matching.config().num_partitions as i32,
-    ));
-    let forwarder = NodeForwarder::new();
-
-    valka_server::rest::build_api_router(
-        pool,
-        event_tx,
-        matching,
-        dispatcher,
-        metrics_handle,
-        cluster,
-        forwarder,
-    )
+pub async fn settle() {
+    tokio::time::sleep(Duration::from_millis(60)).await;
 }
 
-/// Convert a serde_json::Value into an axum-compatible request body.
 pub fn json_body(value: serde_json::Value) -> String {
     serde_json::to_string(&value).unwrap()
 }
 
-/// Read the response body as bytes and parse as JSON.
 pub async fn parse_response_json(
     response: axum::http::Response<axum::body::Body>,
 ) -> serde_json::Value {
@@ -126,7 +208,6 @@ pub async fn parse_response_json(
     serde_json::from_slice(&body).unwrap()
 }
 
-/// Assert that a response is a JSON error with the expected status, code, and substring.
 pub async fn assert_error_response(
     response: axum::http::Response<axum::body::Body>,
     expected_status: StatusCode,
@@ -150,62 +231,4 @@ pub async fn assert_error_response(
         error_msg.contains(message_contains),
         "Expected error message to contain '{message_contains}', got '{error_msg}'"
     );
-}
-
-/// Helper to create a CreateTaskParams with defaults.
-pub fn default_task_params(queue: &str, name: &str) -> CreateTaskParams {
-    let id = TaskId::new().0;
-    let partition = partition_for_task(queue, &id, 4);
-    CreateTaskParams {
-        id,
-        queue_name: queue.to_string(),
-        task_name: name.to_string(),
-        partition_id: partition.0,
-        input: Some(serde_json::json!({"key": "value"})),
-        priority: 0,
-        max_retries: 3,
-        timeout_seconds: 300,
-        idempotency_key: None,
-        metadata: serde_json::json!({}),
-        scheduled_at: None,
-    }
-}
-
-/// Create a signal for a task.
-pub async fn create_test_signal(
-    pool: &PgPool,
-    task_id: &str,
-    name: &str,
-) -> valka_db::queries::signals::SignalRow {
-    valka_db::queries::signals::create_signal(
-        pool,
-        &uuid::Uuid::now_v7().to_string(),
-        task_id,
-        name,
-        None,
-    )
-    .await
-    .expect("create_test_signal failed")
-}
-
-/// Shorthand: create a task run for an existing task.
-pub async fn create_test_run(
-    pool: &PgPool,
-    task_id: &str,
-    attempt: i32,
-    lease_expires_at: DateTime<Utc>,
-) -> TaskRunRow {
-    valka_db::queries::task_runs::create_task_run(
-        pool,
-        CreateTaskRunParams {
-            id: uuid::Uuid::now_v7().to_string(),
-            task_id: task_id.to_string(),
-            attempt_number: attempt,
-            worker_id: uuid::Uuid::now_v7().to_string(),
-            assigned_node_id: uuid::Uuid::now_v7().to_string(),
-            lease_expires_at,
-        },
-    )
-    .await
-    .expect("create_test_run failed")
 }

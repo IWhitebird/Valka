@@ -1,11 +1,12 @@
 use chrono::Utc;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use valka_core::{MatchingConfig, NodeId, PartitionId, WorkerId};
-use valka_db::DbPool;
 use valka_dispatcher::DispatcherService;
 use valka_dispatcher::worker_handle::WorkerHandle;
+use valka_engine::{Engine, EngineConfig};
 use valka_matching::MatchingService;
 use valka_proto::WorkerResponse;
+use valka_wal::Store;
 
 fn make_handle_with_id(
     worker_id: WorkerId,
@@ -111,26 +112,23 @@ fn test_worker_handle_connected_at_set() {
 
 // === DispatcherService tests ===
 
-fn make_pool() -> DbPool {
-    // connect_lazy doesn't actually connect — safe for tests that don't hit the DB
-    sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect_lazy("postgresql://fake:fake@localhost:5432/fake")
+async fn make_engine() -> Engine {
+    Engine::open(Store::memory(), EngineConfig::for_tests("unit"))
+        .await
         .unwrap()
 }
 
-fn make_dispatcher() -> DispatcherService {
+async fn make_dispatcher() -> DispatcherService {
     let matching = MatchingService::new(MatchingConfig::default());
-    let pool = make_pool();
+    let engine = make_engine().await;
     let node_id = NodeId::new();
-    let (event_tx, _) = broadcast::channel(64);
     let (log_tx, _) = mpsc::channel(64);
-    DispatcherService::new(matching, pool, node_id, event_tx, log_tx)
+    DispatcherService::new(matching, engine, node_id, log_tx)
 }
 
 #[tokio::test]
 async fn test_dispatcher_register_deregister() {
-    let dispatcher = make_dispatcher();
+    let dispatcher = make_dispatcher().await;
     let worker_id = WorkerId::new();
     let (handle, _rx) = make_handle_with_id(worker_id.clone(), 2);
 
@@ -143,7 +141,7 @@ async fn test_dispatcher_register_deregister() {
 
 #[tokio::test]
 async fn test_dispatcher_multiple_workers() {
-    let dispatcher = make_dispatcher();
+    let dispatcher = make_dispatcher().await;
 
     for _ in 0..3 {
         let (handle, _rx) = make_handle_with_id(WorkerId::new(), 1);
@@ -154,47 +152,39 @@ async fn test_dispatcher_multiple_workers() {
 }
 
 #[tokio::test]
-async fn test_dispatcher_emit_event() {
-    let matching = MatchingService::new(MatchingConfig::default());
-    let pool = make_pool();
-    let node_id = NodeId::new();
-    let (event_tx, _) = broadcast::channel(64);
-    let (log_tx, _) = mpsc::channel(64);
-    let dispatcher = DispatcherService::new(matching, pool, node_id, event_tx, log_tx);
-
-    // Subscribe before emitting
-    let mut event_rx = dispatcher.event_tx().subscribe();
-
-    // We can't call emit_event directly (private), but we can verify event_tx works
-    let event = valka_proto::TaskEvent {
-        event_id: "test-event".to_string(),
-        task_id: "task-1".to_string(),
-        queue_name: "demo".to_string(),
-        previous_status: 0,
-        new_status: 3,
-        worker_id: String::new(),
-        node_id: String::new(),
-        attempt_number: 0,
-        error_message: String::new(),
-        timestamp_ms: 0,
-    };
-    dispatcher.event_tx().send(event.clone()).unwrap();
-
-    let received = event_rx.recv().await.unwrap();
-    assert_eq!(received.task_id, "task-1");
-    assert_eq!(received.new_status, 3);
+async fn test_engine_events_flow_through_dispatcher_engine() {
+    let dispatcher = make_dispatcher().await;
+    let mut rx = dispatcher.engine().subscribe();
+    let task = dispatcher
+        .engine()
+        .create_task(valka_engine::CreateTask {
+            queue_name: "demo".into(),
+            task_name: "t".into(),
+            input: None,
+            priority: 0,
+            max_retries: 3,
+            timeout_seconds: 30,
+            idempotency_key: None,
+            metadata: serde_json::json!({}),
+            scheduled_at: None,
+        })
+        .await
+        .unwrap();
+    let ev = rx.recv().await.unwrap();
+    assert_eq!(ev.task_id, task.id);
+    assert_eq!(ev.new, Some(valka_core::TaskStatus::Pending));
 }
 
 #[tokio::test]
 async fn test_dispatcher_cancel_nonexistent_task() {
-    let dispatcher = make_dispatcher();
+    let dispatcher = make_dispatcher().await;
     let result = dispatcher.cancel_task_on_worker("nonexistent-task").await;
     assert!(!result, "Should return false when no worker has the task");
 }
 
 #[tokio::test]
 async fn test_dispatcher_cancel_active_task() {
-    let dispatcher = make_dispatcher();
+    let dispatcher = make_dispatcher().await;
     let worker_id = WorkerId::new();
     let (mut handle, mut rx) = make_handle_with_id(worker_id.clone(), 2);
     handle.assign_task("task-to-cancel".to_string());
@@ -218,7 +208,7 @@ async fn test_dispatcher_cancel_active_task() {
 
 #[tokio::test]
 async fn test_dispatcher_send_signal_to_active_task() {
-    let dispatcher = make_dispatcher();
+    let dispatcher = make_dispatcher().await;
     let worker_id = WorkerId::new();
     let (mut handle, mut rx) = make_handle_with_id(worker_id.clone(), 2);
     handle.assign_task("task-signaled".to_string());
@@ -254,7 +244,7 @@ async fn test_dispatcher_send_signal_to_active_task() {
 
 #[tokio::test]
 async fn test_dispatcher_send_signal_no_worker() {
-    let dispatcher = make_dispatcher();
+    let dispatcher = make_dispatcher().await;
 
     let signal = valka_proto::TaskSignal {
         signal_id: "sig-orphan".to_string(),
@@ -272,7 +262,7 @@ async fn test_dispatcher_send_signal_no_worker() {
 
 #[tokio::test]
 async fn test_dispatcher_send_signal_wrong_task() {
-    let dispatcher = make_dispatcher();
+    let dispatcher = make_dispatcher().await;
     let worker_id = WorkerId::new();
     let (mut handle, _rx) = make_handle_with_id(worker_id.clone(), 2);
     handle.assign_task("task-A".to_string());
@@ -315,7 +305,7 @@ fn test_worker_assign_beyond_capacity() {
 
 #[tokio::test]
 async fn test_handle_task_result_empty_output() {
-    let dispatcher = make_dispatcher();
+    let dispatcher = make_dispatcher().await;
     let worker_id = WorkerId::new();
     let (mut handle, _rx) = make_handle_with_id(worker_id.clone(), 2);
     handle.assign_task("task-empty".to_string());
@@ -343,7 +333,7 @@ async fn test_handle_task_result_empty_output() {
 
 #[tokio::test]
 async fn test_send_signal_worker_channel_closed() {
-    let dispatcher = make_dispatcher();
+    let dispatcher = make_dispatcher().await;
     let worker_id = WorkerId::new();
     let (mut handle, rx) = make_handle_with_id(worker_id.clone(), 2);
     handle.assign_task("task-orphan".to_string());
@@ -370,7 +360,7 @@ async fn test_send_signal_worker_channel_closed() {
 
 #[tokio::test]
 async fn test_cancel_worker_channel_closed() {
-    let dispatcher = make_dispatcher();
+    let dispatcher = make_dispatcher().await;
     let worker_id = WorkerId::new();
     let (mut handle, rx) = make_handle_with_id(worker_id.clone(), 2);
     handle.assign_task("task-cancel-closed".to_string());
@@ -386,7 +376,7 @@ async fn test_cancel_worker_channel_closed() {
 
 #[tokio::test]
 async fn test_register_same_worker_id_twice() {
-    let dispatcher = make_dispatcher();
+    let dispatcher = make_dispatcher().await;
     let worker_id = WorkerId::new();
 
     let (h1, _rx1) = make_handle_with_id(worker_id.clone(), 1);
@@ -404,7 +394,7 @@ async fn test_register_same_worker_id_twice() {
 
 #[tokio::test]
 async fn test_deregister_nonexistent_worker() {
-    let dispatcher = make_dispatcher();
+    let dispatcher = make_dispatcher().await;
     // Should not panic
     dispatcher.deregister_worker(&WorkerId::new()).await;
     assert_eq!(dispatcher.workers().len(), 0);
@@ -412,7 +402,7 @@ async fn test_deregister_nonexistent_worker() {
 
 #[tokio::test]
 async fn test_dispatcher_clone_shares_workers() {
-    let dispatcher_a = make_dispatcher();
+    let dispatcher_a = make_dispatcher().await;
     let dispatcher_b = dispatcher_a.clone();
 
     let (handle, _rx) = make_handle_with_id(WorkerId::new(), 1);
@@ -429,11 +419,10 @@ async fn test_dispatcher_clone_shares_workers() {
 #[tokio::test]
 async fn test_deregister_clears_matching_service() {
     let matching = MatchingService::new(MatchingConfig::default());
-    let pool = make_pool();
+    let engine = make_engine().await;
     let node_id = NodeId::new();
-    let (event_tx, _) = broadcast::channel(64);
     let (log_tx, _) = mpsc::channel(64);
-    let dispatcher = DispatcherService::new(matching.clone(), pool, node_id, event_tx, log_tx);
+    let dispatcher = DispatcherService::new(matching.clone(), engine, node_id, log_tx);
 
     let worker_id = WorkerId::new();
     let (handle, _rx) = make_handle_with_id(worker_id.clone(), 2);
