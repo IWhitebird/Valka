@@ -47,7 +47,7 @@ bytes = "1.10"
 zstd = "0.13"
 crc32fast = "1.4"
 async-trait = "0.1"
-rand = "0.9"
+rand = "0.10"
 parking_lot = "0.12"
 xxhash-rust = { version = "0.8", features = ["xxh3", "xxh64"] }
 

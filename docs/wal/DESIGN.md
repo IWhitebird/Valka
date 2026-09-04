@@ -177,8 +177,12 @@ state (their history remains in the WAL/snapshots in the bucket).
   shards (clients retry to new owner) and stop writing those shards.
 - Takeover: gossip marks node dead → peer CASes assignment (epoch+1 for those shards) →
   loads snapshots → lists dead node's segments → replays with epoch filter → serves.
-- Segment file names carry the epoch so a zombie's late PUT (old epoch) is ignored by
-  readers.
+- Segment PUTs are create-if-absent (`If-None-Match: *`). On takeover the new owner
+  **seals** the old epoch by writing an empty segment at `(old_epoch, last_seen_seq + 1)`
+  before it starts its own epoch. A zombie's late PUT for that position then fails, and
+  any position beyond it is never read because replay stops at the first gap. Without
+  sealing, a late zombie segment would sort before the new epoch on the next recovery
+  and be replayed even though nothing in it was ever acknowledged.
 
 ## 13. Test strategy
 

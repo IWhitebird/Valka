@@ -327,6 +327,9 @@ async fn flush(
     }
 }
 
+/// Segments are written create-if-absent: a segment position is written exactly once, so
+/// a late PUT from a fenced-out writer can never overwrite a sealed position (phase 2).
+/// `AlreadyExists` after a retry means our own earlier attempt landed but its ack was lost.
 async fn put_with_retry(
     store: &Store,
     key: &str,
@@ -336,8 +339,14 @@ async fn put_with_retry(
     let mut attempt = 0u32;
     let mut delay = Duration::from_millis(20);
     loop {
-        match store.put(key, bytes.clone()).await {
-            Ok(_) => return Ok(()),
+        match store.put_create(key, bytes.clone()).await {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if attempt > 0 => return Ok(()),
+            Ok(None) => {
+                return Err(WalError::NotDurable(format!(
+                    "{key}: segment already exists (another writer holds this log)"
+                )));
+            }
             Err(e) if attempt < retries => {
                 attempt += 1;
                 warn!(key, attempt, error = %e, "segment PUT failed, retrying");

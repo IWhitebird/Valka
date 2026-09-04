@@ -466,7 +466,7 @@ async fn feeder_drains_pending_when_sink_frees_up() {
 /// that every acknowledged operation is reflected and nothing else is.
 #[tokio::test(start_paused = true)]
 async fn crash_replay_property_under_faults() {
-    use rand::{Rng, SeedableRng, rngs::StdRng};
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
     for seed in 0..12u64 {
         let backing: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
@@ -562,4 +562,219 @@ async fn crash_replay_property_under_faults() {
         let _ = Utc::now();
         let _: Arc<FaultConfig> = faults;
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ownership_loss_poisons_writer_and_fails_acks() {
+    // The zombie case: process A still runs while a replacement process for the same
+    // node id claims the assignment at a higher epoch. A's next commit must be refused:
+    // no ack, writer poisoned, later writes fail fast. B replays A's log and serves.
+    let store = Store::memory();
+    let mut cfg = EngineConfig::for_tests("a");
+    cfg.trust_self = false;
+    let a = Engine::open(store.clone(), cfg.clone()).await.unwrap();
+    let first = a.create_task(create("q")).await.unwrap();
+
+    let b = Engine::open(store.clone(), cfg).await.unwrap();
+    assert_eq!(b.durable_lsn().epoch, 2);
+    assert_eq!(b.get_task(&first.id).unwrap().status, TaskStatus::Pending);
+
+    let err = a.create_task(create("q")).await.unwrap_err();
+    assert!(
+        matches!(err, valka_core::ServerError::Unavailable(_)),
+        "{err}"
+    );
+    assert!(a.poisoned().is_some());
+    assert!(a.create_task(create("q")).await.is_err());
+    // B is unaffected and keeps serving.
+    b.create_task(create("q")).await.unwrap();
+    b.sync().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_creates_are_batched_and_all_durable() {
+    let store = Store::memory();
+    let e = open(&store).await;
+    let mut handles = Vec::new();
+    for i in 0..500u32 {
+        let e = e.clone();
+        handles.push(tokio::spawn(async move {
+            e.create_task(create(&format!("q{}", i % 5)))
+                .await
+                .unwrap()
+                .id
+        }));
+    }
+    let ids: Vec<String> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(ids.len(), 500);
+    assert_eq!(e.list_tasks(None, None, 1000, 0).len(), 500);
+    for q in 0..5 {
+        assert_eq!(e.pending_count(&format!("q{q}")), 100);
+    }
+    e.sync().await.unwrap();
+    let segs = reader::list_segments(&store, "node-a", None).await.unwrap();
+    assert!(
+        segs.len() < 50,
+        "group commit must batch: 500 records landed in {} segments",
+        segs.len()
+    );
+    let recs = reader::read_all(&store, "node-a", None).await.unwrap();
+    assert_eq!(
+        recs.iter()
+            .filter(|(_, r)| r.record.kind() == "task_created")
+            .count(),
+        500
+    );
+
+    // And a fresh node sees exactly the same thing.
+    drop(e);
+    let e2 = open(&store).await;
+    assert_eq!(e2.list_tasks(None, None, 1000, 0).len(), 500);
+}
+
+#[tokio::test(start_paused = true)]
+async fn snapshot_during_concurrent_writes_loses_nothing() {
+    // Writers keep appending while snapshot rounds run; recovery must reflect every ack.
+    let store = Store::memory();
+    let e = open(&store).await;
+    let writer = {
+        let e = e.clone();
+        tokio::spawn(async move {
+            let mut ids = Vec::new();
+            for i in 0..200 {
+                let t = e.create_task(create("q")).await.unwrap();
+                if i % 3 == 0 {
+                    let d = e.dispatch(&t.id, "w").unwrap();
+                    e.complete_run(&t.id, &d.run_id, Some(serde_json::json!(i)))
+                        .await
+                        .unwrap();
+                }
+                ids.push(t.id);
+            }
+            ids
+        })
+    };
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(7)).await;
+        e.snapshot_now().await;
+    }
+    let ids = writer.await.unwrap();
+    let expected: Vec<TaskStatus> = ids
+        .iter()
+        .map(|id| e.get_task(id).unwrap().status)
+        .collect();
+    e.sync().await.unwrap();
+    drop(e);
+
+    let e2 = open(&store).await;
+    for (id, status) in ids.iter().zip(expected) {
+        let got = e2.get_task(id).unwrap_or_else(|| panic!("task {id} lost"));
+        assert_eq!(got.status, status, "task {id}");
+    }
+    assert_eq!(e2.list_tasks(None, None, 1000, 0).len(), 200);
+    // Runs survived too.
+    let completed: Vec<_> = ids
+        .iter()
+        .filter(|id| e2.get_task(id).unwrap().status == TaskStatus::Completed)
+        .collect();
+    assert_eq!(completed.len(), 67);
+    for id in completed {
+        assert_eq!(e2.runs_for_task(id).unwrap().len(), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn corrupt_segment_fails_recovery_cleanly() {
+    let store = Store::memory();
+    {
+        let e = open(&store).await;
+        e.create_task(create("q")).await.unwrap();
+        e.sync().await.unwrap();
+    }
+    let (_, key) = reader::list_segments(&store, "node-a", None)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let (bytes, _) = store.get(&key).await.unwrap().unwrap();
+    let mut bad = bytes.to_vec();
+    let last = bad.len() - 1;
+    bad[last] ^= 0xFF;
+    store.put(&key, bytes::Bytes::from(bad)).await.unwrap();
+
+    let err = Engine::open(store.clone(), EngineConfig::for_tests("node-a"))
+        .await
+        .err()
+        .expect("must fail");
+    assert!(matches!(err, valka_core::ServerError::Storage(_)), "{err}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn idempotency_and_retention_survive_restart() {
+    let store = Store::memory();
+    let clock = TokioClock::new();
+    let (done_id, live_id);
+    {
+        let e = Engine::open_with(
+            store.clone(),
+            EngineConfig::for_tests("node-a"),
+            clock.clone(),
+            Arc::new(crate::sink::NoopSink),
+        )
+        .await
+        .unwrap();
+        let mut req = create("q");
+        req.idempotency_key = Some("order-1".into());
+        let d = e.create_task(req.clone()).await.unwrap();
+        let run = e.dispatch(&d.id, "w").unwrap();
+        e.complete_run(&d.id, &run.run_id, None).await.unwrap();
+        done_id = d.id;
+        live_id = e.create_task(create("q")).await.unwrap().id;
+        e.sync().await.unwrap();
+    }
+    // Past retention, the terminal task is evicted on recovery; the live one is kept.
+    tokio::time::advance(Duration::from_secs(25 * 3600)).await;
+    let e2 = Engine::open_with(
+        store.clone(),
+        EngineConfig::for_tests("node-a"),
+        clock,
+        Arc::new(crate::sink::NoopSink),
+    )
+    .await
+    .unwrap();
+    assert!(e2.get_task(&done_id).is_none(), "evicted terminal task");
+    assert_eq!(e2.get_task(&live_id).unwrap().status, TaskStatus::Pending);
+    // The key is free again once its task is gone (24h idempotency window).
+    let mut req = create("q");
+    req.idempotency_key = Some("order-1".into());
+    e2.create_task(req).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn lost_put_ack_retry_hits_create_conflict_and_succeeds() {
+    let (store, faults) = faulty_over(Arc::new(object_store::memory::InMemory::new()), 9);
+    let e = Engine::open_with(
+        store.clone(),
+        EngineConfig::for_tests("node-a"),
+        TokioClock::new(),
+        Arc::new(crate::sink::NoopSink),
+    )
+    .await
+    .unwrap();
+    faults.set_lost_put_ack_rate(1000);
+    // Every PUT "fails" after landing; the retry sees AlreadyExists and treats it as success.
+    let t = e.create_task(create("q")).await.unwrap();
+    faults.set_lost_put_ack_rate(0);
+    e.sync().await.unwrap();
+    let recs = reader::read_all(&store, "node-a", None).await.unwrap();
+    assert_eq!(
+        recs.iter()
+            .filter(|(_, r)| r.record.task_id() == Some(t.id.as_str()))
+            .count(),
+        1
+    );
 }

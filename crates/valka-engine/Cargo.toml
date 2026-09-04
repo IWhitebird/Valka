@@ -22,3 +22,4 @@ xxhash-rust = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 rand = { workspace = true }
 object_store = { workspace = true }
+bytes = { workspace = true }
