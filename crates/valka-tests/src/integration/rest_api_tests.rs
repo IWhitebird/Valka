@@ -717,9 +717,9 @@ async fn test_rest_healthz_and_cluster() {
             .unwrap(),
     )
     .await;
-    assert_eq!(body["node_id"], "test-node");
+    assert_eq!(body["this_node"], "test-node");
     assert_eq!(body["clustered"], false);
-    assert!(body["poisoned"].is_null());
+    assert_eq!(body["health"]["status"], "ok");
 }
 
 // ─── signals ────────────────────────────────────────────────────────

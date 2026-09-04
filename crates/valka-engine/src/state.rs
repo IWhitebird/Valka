@@ -243,6 +243,8 @@ pub struct Transition {
 pub struct ShardSnapshot {
     pub shard: ShardId,
     pub shard_seq: u64,
+    #[serde(default)]
+    pub taken_at: Option<DateTime<Utc>>,
     pub tasks: Vec<TaskState>,
     pub signals: Vec<SignalState>,
     pub dead_letters: Vec<DeadLetterEntry>,
@@ -268,6 +270,8 @@ pub struct ShardState {
     /// LSN of the segment holding this shard's oldest record not yet covered by a
     /// snapshot. Segments below the minimum over all dirty shards can be truncated.
     pub dirty_since_lsn: Option<Lsn>,
+    /// When the newest snapshot was taken.
+    pub snapshot_at: Option<DateTime<Utc>>,
 }
 
 impl ShardState {
@@ -283,6 +287,7 @@ impl ShardState {
             snapshot_seq: 0,
             snapshot_lsn: Lsn::ZERO,
             dirty_since_lsn: None,
+            snapshot_at: None,
         }
     }
 
@@ -291,6 +296,7 @@ impl ShardState {
         s.shard_seq = snap.shard_seq;
         s.snapshot_seq = snap.shard_seq;
         s.snapshot_lsn = lsn;
+        s.snapshot_at = snap.taken_at;
         for t in snap.tasks {
             if let Some(k) = &t.spec.idempotency_key {
                 s.idempotency.insert(k.clone(), t.spec.id.clone());
@@ -306,10 +312,11 @@ impl ShardState {
         s
     }
 
-    pub fn to_snapshot(&self) -> ShardSnapshot {
+    pub fn to_snapshot(&self, taken_at: DateTime<Utc>) -> ShardSnapshot {
         ShardSnapshot {
             shard: self.shard,
             shard_seq: self.shard_seq,
+            taken_at: Some(taken_at),
             tasks: self.tasks.values().cloned().collect(),
             signals: self.signals.values().cloned().collect(),
             dead_letters: self.dead_letters.values().cloned().collect(),

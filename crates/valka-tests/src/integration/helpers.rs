@@ -91,6 +91,7 @@ impl TestNode {
             self.logs.clone(),
             metrics_handle,
             self.cluster.clone(),
+            valka_server::cluster::NodeInfo::new("127.0.0.1:50051", "127.0.0.1:8989", 5),
         )
     }
 

@@ -27,6 +27,15 @@ pub enum CasOutcome {
     Conflict,
 }
 
+/// Aggregate over the objects under a prefix.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrefixStats {
+    pub objects: usize,
+    pub bytes: u64,
+    pub oldest: Option<chrono::DateTime<chrono::Utc>>,
+    pub newest: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Outcome of a conditional read.
 #[derive(Debug)]
 pub enum Conditional {
@@ -263,6 +272,24 @@ impl Store {
             .await?;
         items.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(items)
+    }
+
+    /// Count, size and age range of everything under `prefix`. One LIST.
+    pub async fn stats(&self, prefix: &str) -> Result<PrefixStats, WalError> {
+        let mut out = PrefixStats::default();
+        for (_, meta) in self.list(prefix).await? {
+            out.objects += 1;
+            out.bytes += meta.size;
+            out.oldest = Some(
+                out.oldest
+                    .map_or(meta.last_modified, |o| o.min(meta.last_modified)),
+            );
+            out.newest = Some(
+                out.newest
+                    .map_or(meta.last_modified, |n| n.max(meta.last_modified)),
+            );
+        }
+        Ok(out)
     }
 
     pub async fn delete(&self, key: &str) -> Result<(), WalError> {

@@ -108,12 +108,15 @@ impl Engine {
                     st.snapshot_seq,
                     st.snapshot_lsn,
                     st.dirty_since_lsn,
+                    st.snapshot_at,
                 );
-                let snap = st.to_snapshot();
+                let taken_at = self.inner.clock.now();
+                let snap = st.to_snapshot(taken_at);
                 st.records_since_snapshot = 0;
                 st.snapshot_seq = st.shard_seq;
                 st.snapshot_lsn = lsn;
                 st.dirty_since_lsn = None;
+                st.snapshot_at = Some(taken_at);
                 (snap, lsn, prev)
             };
             // The snapshot claims to cover records in segments < lsn; those records must
@@ -144,12 +147,14 @@ impl Engine {
                     st.snapshot_seq = prev.1;
                     st.snapshot_lsn = prev.2;
                     st.dirty_since_lsn = prev.3.or(Some(lsn));
+                    st.snapshot_at = prev.4;
                 }
             }
         }
         if written == 0 {
             return;
         }
+        *self.inner.last_snapshot_round.lock() = Some(self.inner.clock.now());
         // Truncate: segments below every dirty shard's first uncovered record, and below
         // the durable watermark, are covered by snapshots.
         let durable = self.inner.writer.durable_lsn();

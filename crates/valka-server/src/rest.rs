@@ -14,6 +14,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
+use crate::cluster::{self, NodeInfo, StorageCache};
 use crate::convert::log_line_to_json;
 use valka_cluster::ClusterManager;
 use valka_core::{ServerError, TaskStatus};
@@ -29,7 +30,7 @@ struct ErrorBody {
     code: String,
 }
 
-enum ApiError {
+pub enum ApiError {
     NotFound(String),
     InvalidState(String),
     BadRequest(String),
@@ -57,6 +58,12 @@ impl From<ServerError> for ApiError {
     }
 }
 
+impl From<valka_wal::WalError> for ApiError {
+    fn from(e: valka_wal::WalError) -> Self {
+        ServerError::from(e).into()
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let (status, code, message) = match self {
@@ -80,12 +87,14 @@ impl IntoResponse for ApiError {
 
 #[derive(Clone)]
 pub struct AppState {
-    engine: Engine,
-    event_tx: broadcast::Sender<valka_proto::TaskEvent>,
-    dispatcher: DispatcherService,
-    logs: Arc<LogIngester>,
-    metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
-    cluster: Arc<ClusterManager>,
+    pub(crate) engine: Engine,
+    pub(crate) event_tx: broadcast::Sender<valka_proto::TaskEvent>,
+    pub(crate) dispatcher: DispatcherService,
+    pub(crate) logs: Arc<LogIngester>,
+    pub(crate) metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    pub(crate) cluster: Arc<ClusterManager>,
+    pub(crate) node_info: NodeInfo,
+    pub(crate) storage_cache: Arc<StorageCache>,
 }
 
 /// Build the API router (useful for testing with tower::ServiceExt::oneshot)
@@ -96,6 +105,7 @@ pub fn build_api_router(
     logs: Arc<LogIngester>,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     cluster: Arc<ClusterManager>,
+    node_info: NodeInfo,
 ) -> Router {
     let state = AppState {
         engine,
@@ -104,6 +114,8 @@ pub fn build_api_router(
         logs,
         metrics_handle,
         cluster,
+        node_info,
+        storage_cache: cluster::new_storage_cache(),
     };
 
     let cors = CorsLayer::new()
@@ -128,7 +140,11 @@ pub fn build_api_router(
         .route("/api/v1/workers", get(list_workers))
         .route("/api/v1/dead-letters", get(list_dead_letters))
         .route("/api/v1/events", get(subscribe_events_sse))
-        .route("/api/v1/cluster", get(cluster_info))
+        .route("/api/v1/cluster", get(cluster::cluster_overview))
+        .route("/api/v1/cluster/shards", get(cluster::list_shards))
+        .route("/api/v1/cluster/shards/{shard}", get(cluster::get_shard))
+        .route("/api/v1/cluster/storage", get(cluster::storage))
+        .route("/api/v1/cluster/snapshot", post(cluster::snapshot_now))
         .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
         .with_state(state)
@@ -144,10 +160,19 @@ pub async fn serve_rest(
     logs: Arc<LogIngester>,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     cluster: Arc<ClusterManager>,
+    node_info: NodeInfo,
     web_dir: String,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
-    let api_routes = build_api_router(engine, event_tx, dispatcher, logs, metrics_handle, cluster);
+    let api_routes = build_api_router(
+        engine,
+        event_tx,
+        dispatcher,
+        logs,
+        metrics_handle,
+        cluster,
+        node_info,
+    );
 
     let index_path = format!("{}/index.html", &web_dir);
     let spa_fallback = ServeDir::new(&web_dir).not_found_service(ServeFile::new(index_path));
@@ -492,17 +517,6 @@ async fn subscribe_events_sse(
     };
 
     Sse::new(stream)
-}
-
-async fn cluster_info(State(state): State<AppState>) -> impl IntoResponse {
-    Json(serde_json::json!({
-        "node_id": state.cluster.node_id().0,
-        "clustered": state.cluster.is_clustered(),
-        "storage": state.engine.store().backend_label(),
-        "durable_lsn": state.engine.durable_lsn().to_string(),
-        "queues": state.engine.queues(),
-        "poisoned": state.engine.poisoned(),
-    }))
 }
 
 async fn metrics(State(state): State<AppState>) -> String {

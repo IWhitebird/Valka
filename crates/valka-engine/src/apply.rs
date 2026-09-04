@@ -571,7 +571,7 @@ mod tests {
             signal_name: "ping".into(),
             payload: None,
         }));
-        let snap = s.to_snapshot();
+        let snap = s.to_snapshot(Utc::now());
         let json = serde_json::to_string(&snap).unwrap();
         let back: ShardSnapshot = serde_json::from_str(&json).unwrap();
         let r = ShardState::from_snapshot(back, Lsn::new(1, 4));

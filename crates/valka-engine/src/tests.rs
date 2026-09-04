@@ -775,3 +775,65 @@ async fn lost_put_ack_retry_hits_create_conflict_and_succeeds() {
         1
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn node_and_shard_stats_reflect_state() {
+    let store = Store::memory();
+    let e = open(&store).await;
+    let a = e.create_task(create("q1")).await.unwrap();
+    let b = e.create_task(create("q2")).await.unwrap();
+    let run = e.dispatch(&a.id, "w").unwrap();
+    e.sync().await.unwrap();
+
+    let s = e.stats();
+    assert_eq!(s.node_id, "node-a");
+    assert_eq!(s.shards_owned, 4096);
+    assert_eq!(s.tasks.total, 2);
+    assert_eq!(s.tasks.pending, 1);
+    assert_eq!(s.tasks.running, 1);
+    assert_eq!(s.queues, vec!["q1".to_string(), "q2".to_string()]);
+    assert_eq!(s.wal.unflushed_records, 0);
+    assert!(s.wal.oldest_unacked_ms.is_none());
+    assert!(s.wal.poisoned.is_none());
+    assert!(s.snapshots.dirty_shards >= 1);
+    assert!(s.snapshots.last_round_at.is_none());
+    assert_eq!(s.snapshots.shards_with_snapshot, 0);
+
+    let rows = e.shard_stats();
+    assert_eq!(rows.len(), 4096);
+    let with_tasks: Vec<_> = rows.iter().filter(|r| r.tasks > 0).collect();
+    assert!(!with_tasks.is_empty() && with_tasks.len() <= 2);
+    assert!(
+        with_tasks
+            .iter()
+            .all(|r| r.owner.as_deref() == Some("node-a") && r.records_since_snapshot > 0)
+    );
+
+    let shard_a = valka_core::shard_of_task_id(&a.id).unwrap();
+    let d = e.shard_detail(shard_a).unwrap();
+    assert_eq!(d.stats.shard, shard_a.0);
+    assert_eq!(d.queues["q1"].running, 1);
+    assert!(e.shard_detail(valka_core::ShardId(4096)).is_none());
+
+    e.snapshot_now().await;
+    let s = e.stats();
+    assert_eq!(s.snapshots.dirty_shards, 0);
+    assert!(s.snapshots.last_round_at.is_some());
+    let d = e.shard_detail(shard_a).unwrap();
+    assert!(d.stats.snapshot_at.is_some());
+    assert_eq!(d.stats.records_since_snapshot, 0);
+    assert!(d.stats.snapshot_lsn.is_some());
+
+    // snapshot_at survives a restart via the snapshot payload
+    e.complete_run(&a.id, &run.run_id, None).await.unwrap();
+    e.sync().await.unwrap();
+    drop(e);
+    let e2 = open(&store).await;
+    let d = e2.shard_detail(shard_a).unwrap();
+    assert!(d.stats.snapshot_at.is_some());
+    assert_eq!(
+        d.stats.records_since_snapshot, 1,
+        "the completion replayed on top of the snapshot"
+    );
+    let _ = b;
+}

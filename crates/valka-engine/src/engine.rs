@@ -111,6 +111,8 @@ pub(crate) struct Inner {
     pub(crate) sink: RwLock<Arc<dyn TaskSink>>,
     pub(crate) pending_wake: Notify,
     pub(crate) shutdown: watch::Sender<bool>,
+    pub(crate) started_at: DateTime<Utc>,
+    pub(crate) last_snapshot_round: Mutex<Option<DateTime<Utc>>>,
 }
 
 #[derive(Clone)]
@@ -226,6 +228,7 @@ impl Engine {
 
         let (events, _) = broadcast::channel(4096);
         let (shutdown, _) = watch::channel(false);
+        let clock_now = clock.now();
         let inner = Arc::new(Inner {
             shards: shards.into_iter().map(Mutex::new).collect(),
             writer,
@@ -240,6 +243,8 @@ impl Engine {
             sink: RwLock::new(sink),
             pending_wake: Notify::new(),
             shutdown,
+            started_at: clock_now,
+            last_snapshot_round: Mutex::new(None),
         });
         let engine = Engine { inner };
         engine.rebuild_indexes();

@@ -73,10 +73,18 @@ struct Pending {
 
 struct InFlight {
     lsn: Lsn,
+    record_count: u64,
     shards: Vec<valka_core::ShardId>,
     acks: Vec<oneshot::Sender<Result<Lsn, WalError>>>,
     put: JoinHandle<Result<(), WalError>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Records appended but not yet acknowledged, and when the current backlog started.
+#[derive(Default)]
+struct Backlog {
+    records: u64,
+    since: Option<tokio::time::Instant>,
 }
 
 /// Cloneable handle. Dropping the last handle shuts the writer down after draining.
@@ -88,6 +96,7 @@ pub struct WalWriter {
     epoch: u32,
     /// Set when the committer gave up on a segment; the engine must restart.
     poisoned: Arc<Mutex<Option<String>>>,
+    backlog: Arc<Mutex<Backlog>>,
 }
 
 impl WalWriter {
@@ -116,11 +125,13 @@ impl WalWriter {
             next_lsn.clone(),
             cfg.clone(),
         ));
+        let backlog = Arc::new(Mutex::new(Backlog::default()));
         tokio::spawn(committer(
             flight_rx,
             durable_tx,
             ownership,
             poisoned.clone(),
+            backlog.clone(),
         ));
 
         Self {
@@ -129,6 +140,7 @@ impl WalWriter {
             next_lsn,
             epoch: start_lsn.epoch,
             poisoned,
+            backlog,
         }
     }
 
@@ -138,6 +150,13 @@ impl WalWriter {
         if let Some(reason) = self.poisoned.lock().clone() {
             let _ = ack_tx.send(Err(WalError::NotDurable(reason)));
             return Durable(ack_rx);
+        }
+        {
+            let mut b = self.backlog.lock();
+            if b.records == 0 && !records.is_empty() {
+                b.since = Some(tokio::time::Instant::now());
+            }
+            b.records += records.len() as u64;
         }
         if self
             .tx
@@ -150,6 +169,22 @@ impl WalWriter {
             // Collector gone; ack_rx will observe the dropped sender.
         }
         Durable(ack_rx)
+    }
+
+    /// Records appended but not yet acknowledged as durable.
+    pub fn unflushed_records(&self) -> u64 {
+        self.backlog.lock().records
+    }
+
+    /// Age of the oldest unacknowledged write. Approximate: measured from when the
+    /// backlog last went from empty to non-empty.
+    pub fn oldest_unacked(&self) -> Option<Duration> {
+        let b = self.backlog.lock();
+        if b.records == 0 {
+            None
+        } else {
+            b.since.map(|s| s.elapsed())
+        }
     }
 
     /// Highest LSN whose acks have been released. Never regresses.
@@ -297,6 +332,7 @@ async fn flush(
     let mut shards: Vec<valka_core::ShardId> = records.iter().map(|r| r.shard).collect();
     shards.sort_unstable();
     shards.dedup();
+    let record_count = records.len() as u64;
 
     let bytes = match segment::encode(lsn, node_id, &records, cfg.compress) {
         Ok(b) => b,
@@ -315,6 +351,7 @@ async fn flush(
     if flight_tx
         .send(InFlight {
             lsn,
+            record_count,
             shards,
             acks,
             put,
@@ -358,11 +395,20 @@ async fn put_with_retry(
     }
 }
 
+fn settle_backlog(backlog: &Mutex<Backlog>, records: u64) {
+    let mut b = backlog.lock();
+    b.records = b.records.saturating_sub(records);
+    if b.records == 0 {
+        b.since = None;
+    }
+}
+
 async fn committer(
     mut rx: mpsc::Receiver<InFlight>,
     durable_tx: watch::Sender<Lsn>,
     ownership: Arc<dyn OwnershipCheck>,
     poisoned: Arc<Mutex<Option<String>>>,
+    backlog: Arc<Mutex<Backlog>>,
 ) {
     while let Some(f) = rx.recv().await {
         let result = match f.put.await {
@@ -383,6 +429,7 @@ async fn committer(
             Err(e) => Err(e),
         };
 
+        settle_backlog(&backlog, f.record_count);
         match result {
             Ok(()) => {
                 for a in f.acks {
@@ -399,6 +446,7 @@ async fn committer(
                 }
                 // Fail everything behind us too: durable LSN must stay a prefix.
                 while let Some(g) = rx.recv().await {
+                    settle_backlog(&backlog, g.record_count);
                     g.put.abort();
                     for a in g.acks {
                         let _ = a.send(Err(WalError::NotDurable(msg.clone())));
@@ -517,6 +565,29 @@ mod tests {
         for w in seqs.windows(2) {
             assert_eq!(w[1], w[0] + 1);
         }
+    }
+
+    #[tokio::test]
+    async fn backlog_counters_track_unacked_records() {
+        let (store, faults) = faulty_memory_store(5);
+        let w = WalWriter::start(
+            store.clone(),
+            "n".into(),
+            Lsn::new(1, 1),
+            cfg(),
+            Arc::new(SingleNodeOwnership),
+        );
+        assert_eq!(w.unflushed_records(), 0);
+        assert!(w.oldest_unacked().is_none());
+        // Slow PUTs: the records stay in the backlog until the segment lands.
+        faults.set_latency(Duration::from_millis(300));
+        let d = w.append(vec![rec(1), rec(2)]);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(w.unflushed_records(), 2);
+        assert!(w.oldest_unacked().unwrap() >= Duration::from_millis(50));
+        d.wait().await.unwrap();
+        assert_eq!(w.unflushed_records(), 0);
+        assert!(w.oldest_unacked().is_none());
     }
 
     #[tokio::test]

@@ -16,6 +16,7 @@ pub mod retry;
 mod signals;
 pub mod sink;
 pub mod state;
+pub mod stats;
 mod tasks;
 pub mod timers;
 pub mod view;
@@ -25,6 +26,7 @@ pub use clock::{Clock, TokioClock};
 pub use engine::{CreateTask, DispatchInfo, Engine, EngineConfig, EngineEvent, FailResult};
 pub use ingest::LogIngester;
 pub use sink::{DispatchableTask, NoopSink, OfferOutcome, TaskSink};
+pub use stats::{NodeStats, ShardDetail, ShardStats, TaskCounts};
 pub use view::{DeadLetterView, RunView, SignalView, TaskView};
 
 #[cfg(test)]

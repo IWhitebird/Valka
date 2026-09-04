@@ -95,6 +95,11 @@ async fn main() -> Result<()> {
             node.shutdown_rx.clone(),
             config.web_dir.clone(),
         );
+        let node_info = valka_server::cluster::NodeInfo::new(
+            &config.grpc_addr,
+            &config.http_addr,
+            config.wal.flush_interval_ms,
+        );
         async move {
             if let Err(e) = rest::serve_rest(
                 http_addr,
@@ -104,6 +109,7 @@ async fn main() -> Result<()> {
                 logs,
                 metrics_handle,
                 cluster,
+                node_info,
                 web_dir,
                 shutdown,
             )
