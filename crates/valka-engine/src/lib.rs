@@ -5,16 +5,21 @@
 //! durability, then acknowledge. Reads are served from RAM. Recovery rebuilds RAM from
 //! snapshots plus WAL replay. See `docs/wal/DESIGN.md`.
 
+pub mod apply;
 pub mod clock;
 pub mod engine;
 pub mod ingest;
 mod loops;
+mod pending;
 mod recovery;
 pub mod retry;
+mod signals;
 pub mod sink;
 pub mod state;
+mod tasks;
 pub mod timers;
 pub mod view;
+mod write_path;
 
 pub use clock::{Clock, TokioClock};
 pub use engine::{CreateTask, DispatchInfo, Engine, EngineConfig, EngineEvent, FailResult};

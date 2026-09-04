@@ -7,10 +7,11 @@ use tracing::{debug, warn};
 use valka_core::{ServerError, TaskStatus, shard_of_task_id};
 use valka_wal::{Envelope, WalRecord};
 
-use crate::engine::{Engine, LeaseDirty, decide_outcome};
+use crate::engine::{Engine, LeaseDirty};
 use crate::sink::OfferOutcome;
 use crate::state::RunStatus;
 use crate::timers::TimerKind;
+use crate::write_path::decide_outcome;
 
 impl Engine {
     pub(crate) fn spawn_loops(&self) {

@@ -6,9 +6,10 @@ use tracing::{debug, error, info, warn};
 use valka_core::{ShardId, TaskStatus};
 use valka_wal::{Lsn, reader, snapshot};
 
-use crate::engine::{Engine, pending_key};
+use crate::engine::Engine;
 use crate::state::RunStatus;
 use crate::timers::TimerKind;
+use crate::write_path::pending_key;
 
 impl Engine {
     /// After recovery: pending index, timers, retention.
