@@ -1,5 +1,6 @@
 import { useTasks } from "@/hooks/use-tasks";
 import { useEvents } from "@/hooks/use-events";
+import { ClusterStrip } from "@/components/dashboard/cluster-strip";
 import { StatsCards } from "@/components/dashboard/stats-cards";
 import { QueueOverview } from "@/components/dashboard/queue-overview";
 import { EventStream } from "@/components/events/event-stream";
@@ -18,6 +19,8 @@ export function DashboardPage() {
       </div>
 
       <StatsCards tasks={tasks} isLoading={isLoading} />
+
+      <ClusterStrip />
 
       <div className="grid gap-6 lg:grid-cols-2">
         <QueueOverview tasks={tasks} isLoading={isLoading} />

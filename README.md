@@ -169,7 +169,7 @@ Valka ships with a built-in React dashboard at the root path.
 cd web && npm install && npm run dev  # Dev server on :5173
 ```
 
-Pages: Dashboard, Tasks, Task Detail (runs, logs, signals), Workers, Events, Dead Letters.
+Pages: Dashboard, Tasks, Task Detail (runs, logs, signals), Workers, Cluster (nodes, WAL health, shard map, storage), Events, Dead Letters.
 
 ## Deployment
 

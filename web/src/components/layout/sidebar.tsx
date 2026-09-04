@@ -5,6 +5,7 @@ import {
   Users,
   Activity,
   AlertTriangle,
+  Server,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
@@ -14,6 +15,7 @@ const navigation = [
   { name: "Dashboard", href: "/", icon: LayoutDashboard },
   { name: "Tasks", href: "/tasks", icon: ListTodo },
   { name: "Workers", href: "/workers", icon: Users },
+  { name: "Cluster", href: "/cluster", icon: Server },
   { name: "Events", href: "/events", icon: Activity },
   { name: "Dead Letters", href: "/dead-letters", icon: AlertTriangle },
 ];

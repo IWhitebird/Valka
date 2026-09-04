@@ -1,6 +1,13 @@
 # Cluster management UI — plan
 
-Status: **proposal**. Companion to `DESIGN.md` (architecture) and `PLAN.md` (phases).
+Status: **"buildable now" column shipped** (single-node observability); phase 2 items pending
+the ownership protocol. Companion to `DESIGN.md` (architecture) and `PLAN.md` (phases).
+
+Shipped: `GET /api/v1/cluster`, `/cluster/shards[?node&dirty&min_tasks]`, `/cluster/shards/:id`,
+`/cluster/storage`, `POST /cluster/snapshot`; UI routes `/cluster`, `/cluster/nodes/:id`,
+`/cluster/shards`, `/cluster/storage`; dashboard cluster strip; Node column on Workers and
+task runs; Shard row on task detail. Tests: 5 REST integration tests, engine stats test,
+writer backlog test, 20 web unit/component tests (vitest + Testing Library).
 
 ## 0. Why this matters more now
 

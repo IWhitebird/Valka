@@ -1,3 +1,4 @@
+import { Link } from "react-router-dom";
 import { Activity } from "lucide-react";
 import type { TaskRun } from "@/api/types";
 import { cn, truncateId, formatDate } from "@/lib/utils";
@@ -70,6 +71,9 @@ export function TaskRunsTable({
               Worker
             </TableHead>
             <TableHead className="px-4 text-xs uppercase tracking-wider text-muted-foreground">
+              Node
+            </TableHead>
+            <TableHead className="px-4 text-xs uppercase tracking-wider text-muted-foreground">
               Started
             </TableHead>
             <TableHead className="px-4 text-xs uppercase tracking-wider text-muted-foreground">
@@ -103,6 +107,19 @@ export function TaskRunsTable({
                 </TableCell>
                 <TableCell className="px-4 font-mono text-xs text-muted-foreground">
                   {run.worker_id ? truncateId(run.worker_id) : "--"}
+                </TableCell>
+                <TableCell className="px-4 font-mono text-xs">
+                  {run.assigned_node_id ? (
+                    <Link
+                      to={`/cluster/nodes/${encodeURIComponent(run.assigned_node_id)}`}
+                      className="text-primary hover:underline"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      {run.assigned_node_id}
+                    </Link>
+                  ) : (
+                    "--"
+                  )}
                 </TableCell>
                 <TableCell className="px-4 text-xs text-muted-foreground">
                   {formatDate(run.started_at)}

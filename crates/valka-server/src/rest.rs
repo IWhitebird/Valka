@@ -456,6 +456,7 @@ async fn list_workers(State(state): State<AppState>) -> Result<impl IntoResponse
             let h = entry.value();
             serde_json::json!({
                 "id": h.worker_id.0,
+                "node_id": state.dispatcher.node_id().0,
                 "name": h.worker_name,
                 "queues": h.queues,
                 "concurrency": h.concurrency,

@@ -53,6 +53,7 @@ export interface TaskLog {
 
 export interface Worker {
   id: string;
+  node_id?: string;
   name: string;
   queues: string[];
   concurrency: number;
@@ -138,4 +139,115 @@ export interface SendSignalRequest {
 export interface SendSignalResponse {
   signal_id: string;
   delivered: boolean;
+}
+
+// ─── Cluster ────────────────────────────────────────────────────────
+
+export interface TaskCounts {
+  pending: number;
+  running: number;
+  retry: number;
+  completed: number;
+  failed: number;
+  dead_letter: number;
+  cancelled: number;
+  total: number;
+}
+
+export interface WalStats {
+  epoch: number;
+  durable_lsn: string;
+  next_lsn: string;
+  unflushed_records: number;
+  oldest_unacked_ms: number | null;
+  poisoned: string | null;
+}
+
+export interface SnapshotStats {
+  last_round_at: string | null;
+  dirty_shards: number;
+  oldest_dirty_lsn: string | null;
+  shards_with_snapshot: number;
+}
+
+export type NodeStatus = "alive" | "poisoned" | "suspect" | "dead" | "draining";
+
+export interface ClusterNode {
+  node_id: string;
+  epoch: number;
+  status: NodeStatus;
+  grpc_addr: string;
+  http_addr: string;
+  version: string;
+  started_at: string;
+  storage_backend: string;
+  shards_owned: number;
+  shards_with_tasks: number;
+  tasks: TaskCounts;
+  queues: string[];
+  workers_connected: number;
+  wal: WalStats;
+  snapshots: SnapshotStats;
+}
+
+export interface ClusterHealth {
+  status: "ok" | "degraded" | "critical";
+  unowned_shards: number;
+  poisoned_nodes: string[];
+  suspect_nodes: string[];
+}
+
+export interface ClusterOverview {
+  cluster_id: string;
+  this_node: string;
+  clustered: boolean;
+  num_shards: number;
+  health: ClusterHealth;
+  nodes: ClusterNode[];
+}
+
+export interface ShardStats {
+  shard: number;
+  owner: string | null;
+  epoch: number;
+  tasks: number;
+  pending: number;
+  running: number;
+  retry: number;
+  signals: number;
+  dead_letters: number;
+  shard_seq: number;
+  snapshot_seq: number;
+  snapshot_lsn: string | null;
+  snapshot_at: string | null;
+  records_since_snapshot: number;
+  dirty_since_lsn: string | null;
+}
+
+export interface ShardDetail extends ShardStats {
+  queues: Record<string, TaskCounts>;
+}
+
+export interface ListShardsParams {
+  node?: string;
+  dirty?: boolean;
+  min_tasks?: number;
+}
+
+export interface StorageStats {
+  backend: string;
+  wal: {
+    segments: number;
+    bytes: number;
+    oldest_age_secs: number | null;
+    newest_age_secs: number | null;
+  };
+  snapshots: { count: number; bytes: number; oldest_age_secs: number | null };
+  logs: { chunks: number; bytes: number };
+  estimate: {
+    flush_interval_ms: number;
+    max_puts_per_day: number;
+    max_usd_per_day: number;
+  };
+  computed_at: string;
 }

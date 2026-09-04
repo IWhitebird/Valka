@@ -17,6 +17,12 @@ Phase 1 test inventory: valka-wal 21, valka-engine 22 (incl. crash/replay proper
 under injected faults), valka-tests 244 (unit + REST + lifecycle + dispatcher + real gRPC
 end-to-end with the Rust SDK, incl. server crash/restart), MinIO-gated 2.
 
+## Cluster UI (phase 1 half) — shipped
+
+- [x] Cluster read API: node stats, shard map, storage stats, snapshot trigger.
+- [x] Dashboard: Cluster / Node / Shards (4096-cell heatmap) / Storage pages, cluster strip,
+      Node columns, Shard row. See `CLUSTER_UI.md` for the phase 2 half.
+
 ## Phase 2 — cluster
 
 - [ ] Assignment CAS + epochs, flush-time ownership verification.

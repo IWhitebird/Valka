@@ -163,4 +163,6 @@ Production: `npm run build` produces `web/dist/`, served by axum fallback.
 
 Stack: React 19, TypeScript, Vite, Tailwind CSS, Radix UI, TanStack React Query.
 
-Pages: Dashboard, Tasks, Task Detail (with runs, logs, signals tabs), Workers, Events, Dead Letters.
+Pages: Dashboard, Tasks, Task Detail (with runs, logs, signals tabs), Workers, Cluster (overview, node detail, 4096-shard heatmap, storage), Events, Dead Letters.
+
+Web tests: `cd web && npm test` (vitest + Testing Library; helpers in `src/lib`, components in `src/components/cluster`).

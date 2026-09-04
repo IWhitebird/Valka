@@ -1,3 +1,5 @@
+import { shardOfTaskId } from "@/lib/cluster";
+import { Link } from "react-router-dom";
 import {
   XCircle,
   Clock,
@@ -6,6 +8,7 @@ import {
   Timer,
   Key,
   Calendar,
+  Grid2x2,
 } from "lucide-react";
 import type { Task } from "@/api/types";
 import { formatDate } from "@/lib/utils";
@@ -59,6 +62,7 @@ function JsonBlock({ label, data }: { label: string; data: unknown }) {
 }
 
 export function TaskDetailPanel({ task }: TaskDetailPanelProps) {
+  const shard = shardOfTaskId(task.id);
   const cancelTask = useCancelTask();
 
   const canCancel =
@@ -115,6 +119,19 @@ export function TaskDetailPanel({ task }: TaskDetailPanelProps) {
               icon={Key}
               label="Idempotency Key"
               value={task.idempotency_key || "--"}
+            />
+            <DetailRow
+              icon={Grid2x2}
+              label="Shard"
+              value={
+                shard === null ? (
+                  "--"
+                ) : (
+                  <Link to="/cluster/shards" className="font-mono text-primary hover:underline">
+                    {shard}
+                  </Link>
+                )
+              }
             />
             <DetailRow
               icon={Clock}

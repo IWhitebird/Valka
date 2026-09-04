@@ -1,3 +1,4 @@
+import { Link } from "react-router-dom";
 import type { Worker } from "@/api/types";
 import { cn, formatRelative, truncateId } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
@@ -42,6 +43,9 @@ function LoadingSkeleton() {
               Worker
             </TableHead>
             <TableHead className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+              Node
+            </TableHead>
+            <TableHead className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
               Status
             </TableHead>
             <TableHead className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
@@ -69,6 +73,9 @@ function LoadingSkeleton() {
                   <Skeleton className="h-4 w-28" />
                   <Skeleton className="h-3 w-16" />
                 </div>
+              </TableCell>
+              <TableCell>
+                <Skeleton className="h-4 w-20" />
               </TableCell>
               <TableCell>
                 <Skeleton className="h-4 w-20" />
@@ -126,6 +133,9 @@ export function WorkerTable({ workers, isLoading }: WorkerTableProps) {
               Worker
             </TableHead>
             <TableHead className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+              Node
+            </TableHead>
+            <TableHead className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
               Status
             </TableHead>
             <TableHead className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
@@ -155,6 +165,18 @@ export function WorkerTable({ workers, isLoading }: WorkerTableProps) {
                     {truncateId(worker.id)}
                   </p>
                 </div>
+              </TableCell>
+              <TableCell>
+                {worker.node_id ? (
+                  <Link
+                    to={`/cluster/nodes/${encodeURIComponent(worker.node_id)}`}
+                    className="font-mono text-xs text-primary hover:underline"
+                  >
+                    {worker.node_id}
+                  </Link>
+                ) : (
+                  <span className="text-xs text-muted-foreground">--</span>
+                )}
               </TableCell>
               <TableCell>
                 <span className="inline-flex items-center gap-2 text-sm">
