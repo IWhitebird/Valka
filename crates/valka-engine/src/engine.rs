@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Notify, broadcast, watch};
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 use valka_core::{SchedulerConfig, ServerError, ShardId, TaskStatus, WalConfig, shard_of_task_id};
 use valka_wal::lsn::keys;
 use valka_wal::ownership::{Ownership, OwnershipCheck};
@@ -97,30 +97,30 @@ pub struct FailResult {
 }
 
 /// Runnable tasks ordered by priority desc, then creation order.
-type PendingKey = (i32, i64, String);
+pub(crate) type PendingKey = (i32, i64, String);
 /// task_id -> (shard, run_id, lease_until) awaiting a coalesced `LeaseExtended` record.
-type LeaseDirty = HashMap<String, (ShardId, String, DateTime<Utc>)>;
+pub(crate) type LeaseDirty = HashMap<String, (ShardId, String, DateTime<Utc>)>;
 type LoadedSnapshot = Result<Option<(ShardId, Lsn, ShardSnapshot)>, ServerError>;
 
-struct Inner {
-    shards: Vec<Mutex<ShardState>>,
-    writer: WalWriter,
-    store: Store,
-    ownership: Option<Arc<Ownership>>,
-    cfg: EngineConfig,
-    clock: Arc<dyn Clock>,
-    timers: Mutex<TimerWheel>,
-    pending: Mutex<BTreeMap<String, BTreeSet<PendingKey>>>,
-    lease_dirty: Mutex<LeaseDirty>,
-    events: broadcast::Sender<EngineEvent>,
-    sink: RwLock<Arc<dyn TaskSink>>,
-    pending_wake: Notify,
-    shutdown: watch::Sender<bool>,
+pub(crate) struct Inner {
+    pub(crate) shards: Vec<Mutex<ShardState>>,
+    pub(crate) writer: WalWriter,
+    pub(crate) store: Store,
+    pub(crate) ownership: Option<Arc<Ownership>>,
+    pub(crate) cfg: EngineConfig,
+    pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) timers: Mutex<TimerWheel>,
+    pub(crate) pending: Mutex<BTreeMap<String, BTreeSet<PendingKey>>>,
+    pub(crate) lease_dirty: Mutex<LeaseDirty>,
+    pub(crate) events: broadcast::Sender<EngineEvent>,
+    pub(crate) sink: RwLock<Arc<dyn TaskSink>>,
+    pub(crate) pending_wake: Notify,
+    pub(crate) shutdown: watch::Sender<bool>,
 }
 
 #[derive(Clone)]
 pub struct Engine {
-    inner: Arc<Inner>,
+    pub(crate) inner: Arc<Inner>,
 }
 
 impl Engine {
@@ -154,37 +154,23 @@ impl Engine {
         let started = std::time::Instant::now();
         let mut shards: Vec<ShardState> = ShardId::all().map(ShardState::new).collect();
         let all_snaps = store.list("snapshots/").await?;
-        let mut newest: HashMap<ShardId, (Lsn, String)> = HashMap::new();
-        for (key, _) in all_snaps {
-            let Some(lsn) = keys::snapshot_lsn(&key) else {
-                continue;
-            };
-            let Some(shard) = key
-                .strip_prefix("snapshots/")
-                .and_then(|r| r.split('/').next())
-                .and_then(|s| s.parse::<u16>().ok())
-                .map(ShardId)
-            else {
-                continue;
-            };
-            match newest.get(&shard) {
-                Some((l, _)) if *l >= lsn => {}
-                _ => {
-                    newest.insert(shard, (lsn, key));
-                }
-            }
-        }
-        let loaded: Vec<LoadedSnapshot> = futures::stream::iter(newest)
-            .map(|(shard, (lsn, _key))| {
+        let snapshotted: BTreeSet<ShardId> = all_snaps
+            .iter()
+            .filter(|(key, _)| keys::snapshot_lsn(key).is_some())
+            .filter_map(|(key, _)| {
+                key.strip_prefix("snapshots/")
+                    .and_then(|r| r.split('/').next())
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .map(ShardId)
+            })
+            .collect();
+        let loaded: Vec<LoadedSnapshot> = futures::stream::iter(snapshotted)
+            .map(|shard| {
                 let store = store.clone();
                 async move {
-                    match snapshot::load_latest::<ShardSnapshot>(&store, shard).await? {
-                        Some((l, snap)) => Ok(Some((shard, l, snap))),
-                        None => {
-                            let _ = lsn;
-                            Ok(None)
-                        }
-                    }
+                    Ok(snapshot::load_latest::<ShardSnapshot>(&store, shard)
+                        .await?
+                        .map(|(lsn, snap)| (shard, lsn, snap)))
                 }
             })
             .buffer_unordered(64)
@@ -434,7 +420,9 @@ impl Engine {
         durable.wait().await?;
         self.after_durable(&transitions);
         let worker = transitions.first().and_then(|t| t.worker_id.clone());
-        Ok((view.expect("task exists"), worker))
+        let view =
+            view.ok_or_else(|| ServerError::Internal("task vanished after cancel".into()))?;
+        Ok((view, worker))
     }
 
     pub async fn delete_task(&self, task_id: &str) -> Result<bool, ServerError> {
@@ -603,7 +591,7 @@ impl Engine {
         )?;
         durable.wait().await?;
         self.after_durable(&transitions);
-        Ok(view.expect("task exists"))
+        view.ok_or_else(|| ServerError::Internal("task vanished after completion".into()))
     }
 
     pub async fn fail_run(
@@ -942,7 +930,7 @@ impl Engine {
 
     /// Validate + build a record under the shard lock, apply it, append it. Returns the
     /// durability future, the transitions, and whatever `after` reads from the new state.
-    fn mutate<R, V>(
+    pub(crate) fn mutate<R, V>(
         &self,
         shard: ShardId,
         build: impl FnOnce(&ShardState) -> Result<(WalRecord, R), ServerError>,
@@ -964,7 +952,7 @@ impl Engine {
         Ok((durable, transitions, ret, view))
     }
 
-    fn drop_from_pending(&self, transitions: &[Transition]) {
+    pub(crate) fn drop_from_pending(&self, transitions: &[Transition]) {
         let leaving: Vec<&Transition> = transitions
             .iter()
             .filter(|t| t.from == Some(TaskStatus::Pending) && t.to != Some(TaskStatus::Pending))
@@ -983,7 +971,7 @@ impl Engine {
         }
     }
 
-    fn arm_timers_for(&self, transitions: &[Transition]) {
+    pub(crate) fn arm_timers_for(&self, transitions: &[Transition]) {
         for tr in transitions {
             if tr.to == Some(TaskStatus::Retry) {
                 let Some(shard) = shard_of_task_id(&tr.task_id) else {
@@ -1006,7 +994,7 @@ impl Engine {
         }
     }
 
-    fn spawn_after_durable(&self, durable: Durable, transitions: Vec<Transition>) {
+    pub(crate) fn spawn_after_durable(&self, durable: Durable, transitions: Vec<Transition>) {
         let me = self.clone();
         tokio::spawn(async move {
             match durable.wait().await {
@@ -1018,7 +1006,7 @@ impl Engine {
 
     /// Runs once records are durable: publish events, index newly runnable tasks, offer
     /// them to the sink, arm timers.
-    fn after_durable(&self, transitions: &[Transition]) {
+    pub(crate) fn after_durable(&self, transitions: &[Transition]) {
         let now = self.inner.clock.now();
         for tr in transitions {
             let _ = self.inner.events.send(EngineEvent {
@@ -1052,7 +1040,7 @@ impl Engine {
 
     /// A task just became PENDING: if due, try the sink (hot path); otherwise arm its
     /// promote timer.
-    fn index_or_offer(&self, task_id: &str) {
+    pub(crate) fn index_or_offer(&self, task_id: &str) {
         let Some(shard) = shard_of_task_id(task_id) else {
             return;
         };
@@ -1111,395 +1099,11 @@ impl Engine {
             }
         }
     }
-
-    /// After recovery: pending index, timers, retention.
-    fn rebuild_indexes(&self) {
-        let now = self.inner.clock.now();
-        let grace = ChronoDuration::seconds(self.inner.cfg.scheduler.recovery_grace_secs);
-        let retention = ChronoDuration::seconds(self.inner.cfg.wal.completed_retention_secs as i64);
-        let mut pending = self.inner.pending.lock();
-        let mut timers = self.inner.timers.lock();
-        let mut running = 0usize;
-        let mut runnable = 0usize;
-        let mut evicted = 0usize;
-        for m in &self.inner.shards {
-            let mut st = m.lock();
-            evicted += st.evict_terminal_before(now - retention);
-            for t in st.tasks.values_mut() {
-                t.offered = false;
-                match t.status {
-                    TaskStatus::Pending if t.due => {
-                        pending
-                            .entry(t.spec.queue_name.clone())
-                            .or_default()
-                            .insert(pending_key(t));
-                        runnable += 1;
-                    }
-                    TaskStatus::Pending | TaskStatus::Retry => {
-                        let at = t.next_attempt_at.unwrap_or(now);
-                        timers.schedule(
-                            at,
-                            TimerKind::Promote {
-                                task_id: t.spec.id.clone(),
-                            },
-                        );
-                    }
-                    TaskStatus::Running => {
-                        let task_id = t.spec.id.clone();
-                        if let Some(run) = t.current_run_mut()
-                            && run.status == RunStatus::Running
-                        {
-                            run.lease_until = run.lease_until.max(now + grace);
-                            timers.schedule(
-                                run.lease_until,
-                                TimerKind::LeaseExpiry {
-                                    task_id,
-                                    run_id: run.id.clone(),
-                                },
-                            );
-                            running += 1;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        timers.schedule(now + ChronoDuration::seconds(60), TimerKind::Evict);
-        info!(runnable, running, evicted, "indexes rebuilt");
-        drop(pending);
-        self.inner.pending_wake.notify_one();
-    }
-
-    fn spawn_loops(&self) {
-        let me = self.clone();
-        tokio::spawn(async move { me.ticker().await });
-        let me = self.clone();
-        tokio::spawn(async move { me.feeder().await });
-        let me = self.clone();
-        tokio::spawn(async move { me.snapshotter().await });
-    }
-
-    async fn ticker(self) {
-        let mut shutdown = self.inner.shutdown.subscribe();
-        let mut tick = tokio::time::interval(Duration::from_millis(
-            self.inner.cfg.scheduler.timer_tick_ms.max(1),
-        ));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                _ = shutdown.changed() => { if *shutdown.borrow() { return; } }
-                _ = tick.tick() => {
-                    self.fire_due_timers();
-                    self.flush_lease_records();
-                }
-            }
-        }
-    }
-
-    fn fire_due_timers(&self) {
-        let now = self.inner.clock.now();
-        let due = self.inner.timers.lock().due(now);
-        for kind in due {
-            match kind {
-                TimerKind::Promote { task_id } => self.promote(&task_id, now),
-                TimerKind::LeaseExpiry { task_id, run_id } => {
-                    self.expire_lease(&task_id, &run_id, now)
-                }
-                TimerKind::Evict => {
-                    let retention =
-                        ChronoDuration::seconds(self.inner.cfg.wal.completed_retention_secs as i64);
-                    let mut n = 0;
-                    for m in &self.inner.shards {
-                        n += m.lock().evict_terminal_before(now - retention);
-                    }
-                    if n > 0 {
-                        debug!(evicted = n, "retention sweep");
-                    }
-                    self.inner
-                        .timers
-                        .lock()
-                        .schedule(now + ChronoDuration::seconds(60), TimerKind::Evict);
-                }
-            }
-        }
-    }
-
-    fn promote(&self, task_id: &str, now: DateTime<Utc>) {
-        let Some(shard) = shard_of_task_id(task_id) else {
-            return;
-        };
-        let res = self.mutate(
-            shard,
-            |st| {
-                let t = st
-                    .tasks
-                    .get(task_id)
-                    .ok_or_else(|| ServerError::TaskNotFound(task_id.into()))?;
-                let waiting = matches!(t.status, TaskStatus::Retry)
-                    || (t.status == TaskStatus::Pending && !t.due);
-                if !waiting {
-                    return Err(ServerError::Internal("not waiting".into()));
-                }
-                if let Some(at) = t.next_attempt_at
-                    && at > now
-                {
-                    return Err(ServerError::Internal(format!(
-                        "rearm:{}",
-                        at.timestamp_millis()
-                    )));
-                }
-                Ok((
-                    WalRecord::TaskPromoted {
-                        task_id: task_id.into(),
-                    },
-                    (),
-                ))
-            },
-            |_| (),
-        );
-        match res {
-            Ok((d, tr, _, _)) => self.spawn_after_durable(d, tr),
-            Err(ServerError::Internal(m)) if m.starts_with("rearm:") => {
-                let ms: i64 = m[6..].parse().unwrap_or(0);
-                if let Some(at) = DateTime::from_timestamp_millis(ms) {
-                    self.inner.timers.lock().schedule(
-                        at,
-                        TimerKind::Promote {
-                            task_id: task_id.into(),
-                        },
-                    );
-                }
-            }
-            Err(_) => {}
-        }
-    }
-
-    fn expire_lease(&self, task_id: &str, run_id: &str, now: DateTime<Utc>) {
-        let Some(shard) = shard_of_task_id(task_id) else {
-            return;
-        };
-        let sched = self.inner.cfg.scheduler.clone();
-        let res = self.mutate(
-            shard,
-            |st| {
-                let t = st
-                    .tasks
-                    .get(task_id)
-                    .ok_or_else(|| ServerError::TaskNotFound(task_id.into()))?;
-                if t.status != TaskStatus::Running {
-                    return Err(ServerError::Internal("not running".into()));
-                }
-                let run = t
-                    .runs
-                    .iter()
-                    .find(|r| r.id == run_id)
-                    .ok_or_else(|| ServerError::Internal("no run".into()))?;
-                if run.status != RunStatus::Running {
-                    return Err(ServerError::Internal("run finished".into()));
-                }
-                if run.lease_until > now {
-                    return Err(ServerError::Internal(format!(
-                        "rearm:{}",
-                        run.lease_until.timestamp_millis()
-                    )));
-                }
-                let outcome =
-                    decide_outcome(t.attempt_count, t.spec.max_retries, true, now, &sched);
-                Ok((
-                    WalRecord::LeaseExpired {
-                        task_id: task_id.into(),
-                        run_id: run_id.into(),
-                        error: "Lease expired".into(),
-                        outcome,
-                    },
-                    (),
-                ))
-            },
-            |_| (),
-        );
-        match res {
-            Ok((d, tr, _, _)) => {
-                warn!(task_id, run_id, "lease expired");
-                self.arm_timers_for(&tr);
-                self.spawn_after_durable(d, tr);
-            }
-            Err(ServerError::Internal(m)) if m.starts_with("rearm:") => {
-                let ms: i64 = m[6..].parse().unwrap_or(0);
-                if let Some(at) = DateTime::from_timestamp_millis(ms) {
-                    self.inner.timers.lock().schedule(
-                        at,
-                        TimerKind::LeaseExpiry {
-                            task_id: task_id.into(),
-                            run_id: run_id.into(),
-                        },
-                    );
-                }
-            }
-            Err(_) => {}
-        }
-    }
-
-    fn flush_lease_records(&self) {
-        let dirty: LeaseDirty = std::mem::take(&mut *self.inner.lease_dirty.lock());
-        if dirty.is_empty() {
-            return;
-        }
-        let mut envs = Vec::with_capacity(dirty.len());
-        for (task_id, (shard, run_id, lease_until)) in dirty {
-            let mut st = self.inner.shards[shard.0 as usize].lock();
-            let mut env = Envelope::with_ts(
-                shard,
-                self.inner.clock.now(),
-                WalRecord::LeaseExtended {
-                    task_id,
-                    run_id,
-                    lease_until,
-                },
-            );
-            let was_clean = st.records_since_snapshot == 0;
-            st.apply(&mut env);
-            if was_clean {
-                st.dirty_since_lsn = Some(self.inner.writer.next_lsn());
-            }
-            envs.push(env);
-        }
-        drop(self.inner.writer.append(envs));
-    }
-
-    async fn feeder(self) {
-        let mut shutdown = self.inner.shutdown.subscribe();
-        let interval = self.inner.cfg.feeder_interval;
-        loop {
-            tokio::select! {
-                _ = shutdown.changed() => { if *shutdown.borrow() { return; } }
-                _ = self.inner.pending_wake.notified() => {}
-                _ = tokio::time::sleep(interval) => {}
-            }
-            let queues: Vec<String> = self.inner.pending.lock().keys().cloned().collect();
-            if queues.is_empty() {
-                continue;
-            }
-            let sink = self.inner.sink.read().clone();
-            for q in queues {
-                let cap = sink.capacity(&q).min(self.inner.cfg.feeder_batch_size);
-                if cap == 0 {
-                    continue;
-                }
-                for task in self.take_pending(&q, cap) {
-                    let id = task.task_id.clone();
-                    if sink.offer(task) == OfferOutcome::Rejected {
-                        self.unoffer(&id);
-                        break;
-                    }
-                    valka_core::metrics::record_async_match();
-                }
-                valka_core::metrics::set_pending_tasks(&q, self.pending_count(&q) as f64);
-            }
-        }
-    }
-
-    async fn snapshotter(self) {
-        let mut shutdown = self.inner.shutdown.subscribe();
-        let interval = Duration::from_secs(self.inner.cfg.wal.snapshot_interval_secs.max(1));
-        loop {
-            tokio::select! {
-                _ = shutdown.changed() => { if *shutdown.borrow() { return; } }
-                _ = tokio::time::sleep(interval) => {}
-            }
-            self.snapshot_dirty_shards(false).await;
-        }
-    }
-
-    /// Snapshot every shard with uncovered records (or, when `force`, every dirty shard
-    /// regardless of the record threshold), then prune snapshots and truncate segments.
-    async fn snapshot_dirty_shards(&self, force: bool) {
-        let threshold = self.inner.cfg.wal.snapshot_after_records;
-        let mut written = 0usize;
-        for (i, m) in self.inner.shards.iter().enumerate() {
-            let (snap, lsn, prev) = {
-                let mut st = m.lock();
-                if st.records_since_snapshot == 0 {
-                    continue;
-                }
-                if !force
-                    && st.records_since_snapshot < threshold
-                    && st
-                        .dirty_since_lsn
-                        .is_some_and(|d| d > self.inner.writer.durable_lsn())
-                {
-                    // Not enough records yet and nothing durable to cover: wait.
-                    continue;
-                }
-                let lsn = self.inner.writer.next_lsn();
-                let prev = (
-                    st.records_since_snapshot,
-                    st.snapshot_seq,
-                    st.snapshot_lsn,
-                    st.dirty_since_lsn,
-                );
-                let snap = st.to_snapshot();
-                st.records_since_snapshot = 0;
-                st.snapshot_seq = st.shard_seq;
-                st.snapshot_lsn = lsn;
-                st.dirty_since_lsn = None;
-                (snap, lsn, prev)
-            };
-            // The snapshot claims to cover records in segments < lsn; those records must
-            // be durable before the snapshot may be relied upon for truncation. Wait.
-            if self.inner.writer.durable_lsn() < Lsn::new(lsn.epoch, lsn.seq.saturating_sub(1))
-                && let Err(e) = self.inner.writer.sync().await
-            {
-                warn!(error = %e, "sync before snapshot failed");
-            }
-            let shard = ShardId(i as u16);
-            match snapshot::write(&self.inner.store, shard, lsn, &snap).await {
-                Ok(()) => {
-                    written += 1;
-                    if let Err(e) = snapshot::prune(
-                        &self.inner.store,
-                        shard,
-                        self.inner.cfg.wal.snapshots_to_keep.max(1),
-                    )
-                    .await
-                    {
-                        warn!(%shard, error = %e, "snapshot prune failed");
-                    }
-                }
-                Err(e) => {
-                    error!(%shard, error = %e, "snapshot write failed; keeping WAL");
-                    let mut st = m.lock();
-                    st.records_since_snapshot += prev.0;
-                    st.snapshot_seq = prev.1;
-                    st.snapshot_lsn = prev.2;
-                    st.dirty_since_lsn = prev.3.or(Some(lsn));
-                }
-            }
-        }
-        if written == 0 {
-            return;
-        }
-        // Truncate: segments below every dirty shard's first uncovered record, and below
-        // the durable watermark, are covered by snapshots.
-        let durable = self.inner.writer.durable_lsn();
-        let mut bound = Lsn::new(durable.epoch, durable.seq + 1);
-        for m in &self.inner.shards {
-            if let Some(d) = m.lock().dirty_since_lsn {
-                bound = bound.min(d);
-            }
-        }
-        match reader::truncate_before(&self.inner.store, &self.inner.cfg.node_id, bound).await {
-            Ok(n) if n > 0 => {
-                info!(snapshots = written, truncated = n, %bound, "snapshot round complete")
-            }
-            Ok(_) => debug!(snapshots = written, "snapshot round complete"),
-            Err(e) => warn!(error = %e, "segment truncation failed"),
-        }
-    }
 }
 
 // ───────────────────────── helpers ─────────────────────────
 
-fn pending_key(t: &crate::state::TaskState) -> PendingKey {
+pub(crate) fn pending_key(t: &crate::state::TaskState) -> PendingKey {
     (
         -t.spec.priority,
         t.spec.created_at.timestamp_millis(),
@@ -1507,7 +1111,7 @@ fn pending_key(t: &crate::state::TaskState) -> PendingKey {
     )
 }
 
-fn dispatchable(t: &crate::state::TaskState, attempt: i32) -> DispatchableTask {
+pub(crate) fn dispatchable(t: &crate::state::TaskState, attempt: i32) -> DispatchableTask {
     DispatchableTask {
         task_id: t.spec.id.clone(),
         queue_name: t.spec.queue_name.clone(),
@@ -1537,7 +1141,7 @@ fn ensure_running(t: &crate::state::TaskState, run_id: &str) -> Result<(), Serve
     }
 }
 
-fn decide_outcome(
+pub(crate) fn decide_outcome(
     attempt: i32,
     max_retries: i32,
     retryable: bool,

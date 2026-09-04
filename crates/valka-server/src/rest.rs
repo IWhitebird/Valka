@@ -15,7 +15,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
 use crate::convert::log_line_to_json;
-use valka_cluster::{ClusterManager, NodeForwarder};
+use valka_cluster::ClusterManager;
 use valka_core::{ServerError, TaskStatus};
 use valka_dispatcher::DispatcherService;
 use valka_engine::state::SignalStatus;
@@ -86,8 +86,6 @@ pub struct AppState {
     logs: Arc<LogIngester>,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     cluster: Arc<ClusterManager>,
-    #[allow(dead_code)]
-    forwarder: NodeForwarder,
 }
 
 /// Build the API router (useful for testing with tower::ServiceExt::oneshot)
@@ -98,7 +96,6 @@ pub fn build_api_router(
     logs: Arc<LogIngester>,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     cluster: Arc<ClusterManager>,
-    forwarder: NodeForwarder,
 ) -> Router {
     let state = AppState {
         engine,
@@ -107,7 +104,6 @@ pub fn build_api_router(
         logs,
         metrics_handle,
         cluster,
-        forwarder,
     };
 
     let cors = CorsLayer::new()
@@ -148,19 +144,10 @@ pub async fn serve_rest(
     logs: Arc<LogIngester>,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     cluster: Arc<ClusterManager>,
-    forwarder: NodeForwarder,
     web_dir: String,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
-    let api_routes = build_api_router(
-        engine,
-        event_tx,
-        dispatcher,
-        logs,
-        metrics_handle,
-        cluster,
-        forwarder,
-    );
+    let api_routes = build_api_router(engine, event_tx, dispatcher, logs, metrics_handle, cluster);
 
     let index_path = format!("{}/index.html", &web_dir);
     let spa_fallback = ServeDir::new(&web_dir).not_found_service(ServeFile::new(index_path));

@@ -4,7 +4,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::http::StatusCode;
 use tokio::sync::{broadcast, mpsc};
-use valka_cluster::{ClusterManager, NodeForwarder};
+use valka_cluster::ClusterManager;
 use valka_core::{MatchingConfig, NodeId, TaskStatus, WorkerId};
 use valka_dispatcher::DispatcherService;
 use valka_dispatcher::worker_handle::WorkerHandle;
@@ -24,8 +24,9 @@ pub struct TestNode {
     pub log_tx: mpsc::Sender<LogLine>,
     pub event_tx: broadcast::Sender<valka_proto::TaskEvent>,
     pub cluster: Arc<ClusterManager>,
-    pub forwarder: NodeForwarder,
     pub node_id: NodeId,
+    /// Keeps the log ingester's shutdown channel open for the life of the node.
+    _ingester_shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 impl TestNode {
@@ -51,9 +52,8 @@ impl TestNode {
 
         let (log_tx, log_rx) = mpsc::channel(1024);
         let logs = LogIngester::new(store.clone(), 100, Duration::from_millis(20));
-        let (_stx, srx) = tokio::sync::watch::channel(false);
+        let (ingester_shutdown, srx) = tokio::sync::watch::channel(false);
         tokio::spawn(logs.clone().run(log_rx, srx));
-        std::mem::forget(_stx);
 
         let node = NodeId(node_id.to_string());
         let dispatcher = DispatcherService::new(
@@ -75,8 +75,8 @@ impl TestNode {
             log_tx,
             event_tx,
             cluster,
-            forwarder: NodeForwarder::new(),
             node_id: node,
+            _ingester_shutdown: ingester_shutdown,
         }
     }
 
@@ -91,7 +91,6 @@ impl TestNode {
             self.logs.clone(),
             metrics_handle,
             self.cluster.clone(),
-            self.forwarder.clone(),
         )
     }
 

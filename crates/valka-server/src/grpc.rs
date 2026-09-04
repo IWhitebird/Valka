@@ -10,7 +10,6 @@ use tracing::info;
 
 use crate::convert::{log_line_to_proto, proto_to_status, task_to_proto};
 use crate::internal_grpc::InternalServiceImpl;
-use valka_cluster::{ClusterManager, NodeForwarder};
 use valka_core::{NodeId, ServerError};
 use valka_dispatcher::DispatcherService;
 use valka_engine::{CreateTask, Engine, LogIngester};
@@ -277,15 +276,12 @@ impl worker_service_server::WorkerService for WorkerServiceImpl {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn serve_grpc(
     addr: SocketAddr,
     engine: Engine,
     dispatcher: DispatcherService,
     event_tx: broadcast::Sender<TaskEvent>,
     node_id: NodeId,
-    _cluster: Arc<ClusterManager>,
-    _forwarder: NodeForwarder,
     logs: Arc<LogIngester>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {

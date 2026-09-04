@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use tower::ServiceExt;
 use valka_core::TaskStatus;
 
@@ -1029,5 +1029,4 @@ async fn test_rest_state_survives_restart() {
     )
     .await;
     assert_eq!(list.as_array().unwrap().len(), 1);
-    let _ = Utc::now();
 }

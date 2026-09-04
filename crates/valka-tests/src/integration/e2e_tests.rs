@@ -27,21 +27,17 @@ async fn start_server(store: Store, node_id: &str, port: u16) -> RunningServer {
     let node = TestNode::on_store(store, node_id).await;
     let (shutdown, rx) = watch::channel(false);
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let (engine, dispatcher, event_tx, nid, cluster, forwarder, logs) = (
+    let (engine, dispatcher, event_tx, nid, logs) = (
         node.engine.clone(),
         node.dispatcher.clone(),
         node.event_tx.clone(),
         node.node_id.clone(),
-        node.cluster.clone(),
-        node.forwarder.clone(),
         node.logs.clone(),
     );
     let handle = tokio::spawn(async move {
-        valka_server::grpc::serve_grpc(
-            addr, engine, dispatcher, event_tx, nid, cluster, forwarder, logs, rx,
-        )
-        .await
-        .expect("grpc server");
+        valka_server::grpc::serve_grpc(addr, engine, dispatcher, event_tx, nid, logs, rx)
+            .await
+            .expect("grpc server");
     });
     // Wait for the port to accept connections.
     for _ in 0..50 {

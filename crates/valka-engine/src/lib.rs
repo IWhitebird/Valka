@@ -8,6 +8,8 @@
 pub mod clock;
 pub mod engine;
 pub mod ingest;
+mod loops;
+mod recovery;
 pub mod retry;
 pub mod sink;
 pub mod state;

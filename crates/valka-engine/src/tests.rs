@@ -1,10 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
 use parking_lot::Mutex;
 use valka_core::TaskStatus;
-use valka_wal::fault::{FaultConfig, faulty_over};
+use valka_wal::fault::faulty_over;
 use valka_wal::{FailureOutcome, Store, reader};
 
 use crate::clock::{Clock, TokioClock};
@@ -559,8 +558,6 @@ async fn crash_replay_property_under_faults() {
                 .unwrap_or_else(|| panic!("seed {seed}: task {id} lost"));
             assert_eq!(got.status, *status, "seed {seed}: task {id}");
         }
-        let _ = Utc::now();
-        let _: Arc<FaultConfig> = faults;
     }
 }
 

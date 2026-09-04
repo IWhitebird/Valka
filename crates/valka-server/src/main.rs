@@ -63,20 +63,17 @@ async fn main() -> Result<()> {
     let grpc_addr = config.grpc_addr.parse()?;
     let shutdown_tx_grpc = node.shutdown_tx.clone();
     let grpc_handle = tokio::spawn({
-        let (engine, dispatcher, event_tx, node_id, cluster, forwarder, logs, shutdown) = (
+        let (engine, dispatcher, event_tx, node_id, logs, shutdown) = (
             node.engine.clone(),
             node.dispatcher.clone(),
             node.event_tx.clone(),
             node.node_id.clone(),
-            node.cluster.clone(),
-            node.forwarder.clone(),
             node.logs.clone(),
             node.shutdown_rx.clone(),
         );
         async move {
             if let Err(e) = grpc::serve_grpc(
-                grpc_addr, engine, dispatcher, event_tx, node_id, cluster, forwarder, logs,
-                shutdown,
+                grpc_addr, engine, dispatcher, event_tx, node_id, logs, shutdown,
             )
             .await
             {
@@ -89,12 +86,11 @@ async fn main() -> Result<()> {
     let http_addr = config.http_addr.parse()?;
     let shutdown_tx_rest = node.shutdown_tx.clone();
     let http_handle = tokio::spawn({
-        let (engine, dispatcher, event_tx, cluster, forwarder, logs, shutdown, web_dir) = (
+        let (engine, dispatcher, event_tx, cluster, logs, shutdown, web_dir) = (
             node.engine.clone(),
             node.dispatcher.clone(),
             node.event_tx.clone(),
             node.cluster.clone(),
-            node.forwarder.clone(),
             node.logs.clone(),
             node.shutdown_rx.clone(),
             config.web_dir.clone(),
@@ -108,7 +104,6 @@ async fn main() -> Result<()> {
                 logs,
                 metrics_handle,
                 cluster,
-                forwarder,
                 web_dir,
                 shutdown,
             )
