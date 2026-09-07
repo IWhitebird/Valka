@@ -146,7 +146,7 @@ Integration tests build a `TestNode` (engine + dispatcher + REST router) on an i
 
 ## Coding Conventions
 
-- Edition 2024, resolver "3", rust-version "1.88"
+- Edition 2024, resolver "3", rust-version "1.89"
 - `rustfmt.toml`: max_width=100, use_field_init_shorthand=true
 - Error handling: `thiserror` for library errors, `anyhow` in binaries
 - Async: all async code uses tokio runtime

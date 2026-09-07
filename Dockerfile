@@ -8,7 +8,7 @@ COPY web/ ./
 RUN bun run build
 
 # Stage 2: Build Rust binaries
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.89-bookworm AS builder
 
 WORKDIR /app
 
@@ -37,9 +37,16 @@ COPY --from=builder /tmp/valka-server /usr/local/bin/valka-server
 COPY --from=builder /tmp/valka /usr/local/bin/valka
 COPY --from=web-builder /app/web/dist /usr/share/valka/web
 
-RUN useradd --system --uid 1001 --no-create-home valka
+RUN useradd --system --uid 1001 --no-create-home valka \
+    && mkdir -p /var/lib/valka && chown valka:valka /var/lib/valka
 
-ENV VALKA_WEB_DIR=/usr/share/valka/web
+# Default to the local backend under a writable, mountable directory. Production points
+# VALKA_STORAGE__BACKEND=s3 at a bucket instead (see docker-compose.yml).
+WORKDIR /var/lib/valka
+VOLUME ["/var/lib/valka"]
+ENV VALKA_WEB_DIR=/usr/share/valka/web \
+    VALKA_STORAGE__BACKEND=local \
+    VALKA_STORAGE__PATH=/var/lib/valka/data
 
 EXPOSE 50051 8989 7280/udp
 
