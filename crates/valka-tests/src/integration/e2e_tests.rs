@@ -430,3 +430,82 @@ async fn e2e_graceful_worker_shutdown_delivers_in_flight_results() {
     let _ = server.shutdown.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), server.handle).await;
 }
+
+#[tokio::test]
+async fn e2e_task_outliving_a_restart_still_logs_and_checkpoints() {
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let store = Store::wrap(backing, "", true, "shared-memory");
+    let port = free_port().await;
+    let server = start_server(store.clone(), "outlive", port).await;
+
+    let release = Arc::new(tokio::sync::Notify::new());
+    let gate = release.clone();
+    let worker = ValkaWorker::builder()
+        .name("outlive-worker")
+        .server_addr(&server.addr)
+        .queues(&["q"])
+        .handler(move |ctx| {
+            let gate = gate.clone();
+            async move {
+                gate.notified().await;
+                ctx.log("after restart").await;
+                ctx.checkpoint("after-restart", &1)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({}))
+            }
+        })
+        .build()
+        .await
+        .unwrap();
+    let stop = worker.shutdown_handle();
+    let worker_task = tokio::spawn(worker.run());
+
+    let mut client = ValkaClient::connect(&server.addr).await.unwrap();
+    let id = client.create_task("q", "t", None).await.unwrap().id;
+    wait_status(&mut client, &id, 3, Duration::from_secs(10)).await;
+    server.node.engine.sync().await.unwrap();
+    let _ = server.shutdown.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), server.handle).await;
+    drop(server.node);
+    drop(client);
+
+    let server = start_server(store, "outlive", port).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while server.node.dispatcher.workers().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "worker never reconnected"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    release.notify_one();
+
+    let mut client = ValkaClient::connect(&server.addr).await.unwrap();
+    let t = wait_status(&mut client, &id, 4, Duration::from_secs(15)).await;
+    assert_eq!(t.attempt_count, 1);
+    let steps: Vec<String> = server
+        .node
+        .engine
+        .checkpoints_for_task(&id)
+        .unwrap()
+        .into_iter()
+        .map(|c| c.step)
+        .collect();
+    assert_eq!(steps, vec!["after-restart"]);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let run = &server.node.engine.runs_for_task(&id).unwrap()[0].id;
+    let lines = server.node.logs.read(run, 10).await;
+    assert_eq!(
+        lines.len(),
+        1,
+        "the log written after the reconnect reached the server"
+    );
+    assert_eq!(lines[0].message, "after restart");
+
+    stop.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker_task).await;
+    let _ = server.shutdown.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), server.handle).await;
+}

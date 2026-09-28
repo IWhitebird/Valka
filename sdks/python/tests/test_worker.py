@@ -80,7 +80,7 @@ def test_server_shutdown_means_reconnect_not_exit():
         response = worker_pb2.WorkerResponse(
             server_shutdown=worker_pb2.ServerShutdown(reason="restart")
         )
-        await w._handle_response(response, stub=None)
+        await w._handle_response(response)
         assert w._server_stopping
         assert not w._shutting_down
 
@@ -98,7 +98,7 @@ def test_assignment_never_blocks_the_receive_loop_at_capacity():
         w = make_worker(handler, concurrency=1)
         for task_id in ("a", "b"):
             assignment = worker_pb2.TaskAssignment(task_id=task_id, task_run_id=task_id + "-run")
-            await asyncio.wait_for(w._handle_task_assignment(assignment, stub=None), 0.1)
+            await asyncio.wait_for(w._handle_task_assignment(assignment), 0.1)
         assert set(w._active_tasks) == {"a", "b"}
         gate.set()
         await asyncio.gather(*w._active_tasks.values())
@@ -115,3 +115,20 @@ def test_graceful_shutdown_tells_the_server_and_closes_the_session():
         assert w._stream.closed
 
     asyncio.run(run())
+
+
+def test_checkpoint_without_a_session_fails_fast():
+    async def handler(ctx):
+        await ctx.checkpoint("step", 1)
+
+    async def run():
+        w = make_worker(handler)
+        assignment = worker_pb2.TaskAssignment(task_id="t", task_run_id="t-run")
+        await w._handle_task_assignment(assignment)
+        await asyncio.gather(*w._active_tasks.values())
+        (res,) = [r.task_result for r in sent(w, "task_result")]
+        assert not res.success
+        assert "not connected" in res.error_message
+
+    asyncio.run(run())
+

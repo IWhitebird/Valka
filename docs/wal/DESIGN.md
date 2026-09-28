@@ -264,6 +264,8 @@ once durable, like `RunCompleted`.
   (Go also on every heartbeat tick), and keep heartbeating the task meanwhile so its lease
   does not expire. A handler that finishes while the server is down therefore still gets
   its result recorded once the server is back, without re-running the task.
+- **Everything a running task sends follows the current connection:** results, logs,
+  signal acks and checkpoints. A task that outlives a reconnect keeps reporting.
 - **Slots never block the receive loop.** A handler takes its concurrency slot inside its
   own task, so acks, signals and cancellations keep flowing at full capacity.
 - **Worker drain.** `GracefulShutdown` means "stop sending me tasks": the server removes the

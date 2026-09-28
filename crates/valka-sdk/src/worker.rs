@@ -302,8 +302,7 @@ impl ValkaWorker {
                     match msg {
                         Some(Ok(response)) => match response.response {
                             Some(worker_response::Response::TaskAssignment(assignment)) => {
-                                self.start_task(assignment, request_tx.clone(), client.clone())
-                                    .await;
+                                self.start_task(assignment, client.clone()).await;
                             }
                             Some(worker_response::Response::TaskCancellation(cancel)) => {
                                 info!(task_id = %cancel.task_id, "Task cancelled by server");
@@ -360,12 +359,7 @@ impl ValkaWorker {
 
     /// Run the handler without ever blocking the receive loop: the slot is taken inside
     /// the spawned task, so cancels, signals and acks keep flowing at full capacity.
-    async fn start_task(
-        &self,
-        assignment: TaskAssignment,
-        request_tx: mpsc::Sender<WorkerRequest>,
-        rpc: WorkerServiceClient<Channel>,
-    ) {
+    async fn start_task(&self, assignment: TaskAssignment, rpc: WorkerServiceClient<Channel>) {
         let task_id = assignment.task_id.clone();
         self.session.running.lock().await.insert(task_id.clone());
         let (sig_tx, sig_rx) = mpsc::channel::<TaskSignal>(64);
@@ -374,6 +368,16 @@ impl ValkaWorker {
             .lock()
             .await
             .insert(task_id.clone(), sig_tx);
+
+        // Logs and signal acks follow whichever connection is current, so a task that
+        // outlives a reconnect keeps reporting.
+        let (request_tx, mut requests) = mpsc::channel::<WorkerRequest>(256);
+        let forward = self.session.clone();
+        tokio::spawn(async move {
+            while let Some(request) = requests.recv().await {
+                forward.send(request).await;
+            }
+        });
 
         let slots = self.slots.clone();
         let handler = self.handler.clone();

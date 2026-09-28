@@ -35,6 +35,8 @@ type ValkaWorker struct {
 	activeTasks    sync.Map
 	signalChannels sync.Map // task_id -> chan *pb.TaskSignal
 	unacked        sync.Map // task_run_id -> *pb.TaskResult, kept until APPLIED or STALE
+	clientMu       sync.RWMutex
+	client         pb.WorkerServiceClient // current session's client, nil between sessions
 	wg             sync.WaitGroup
 	shuttingDown   bool
 	shutdownMu     sync.Mutex
@@ -203,6 +205,25 @@ func (w *ValkaWorker) unackedCount() int {
 	return n
 }
 
+func (w *ValkaWorker) setClient(c pb.WorkerServiceClient) {
+	w.clientMu.Lock()
+	defer w.clientMu.Unlock()
+	w.client = c
+}
+
+// checkpoint goes through the current session, so a task that outlives a reconnect can
+// still checkpoint.
+func (w *ValkaWorker) checkpoint(ctx context.Context, req *pb.CheckpointRequest) error {
+	w.clientMu.RLock()
+	c := w.client
+	w.clientMu.RUnlock()
+	if c == nil {
+		return NewConnectionError("not connected to the server", nil)
+	}
+	_, err := c.Checkpoint(ctx, req)
+	return err
+}
+
 func (w *ValkaWorker) handleResultAck(ack *pb.ResultAck) {
 	switch ack.Status {
 	case pb.ResultStatus_RESULT_STATUS_APPLIED, pb.ResultStatus_RESULT_STATUS_STALE:
@@ -234,6 +255,8 @@ func (w *ValkaWorker) session(ctx context.Context) error {
 	defer conn.Close()
 
 	client := pb.NewWorkerServiceClient(conn)
+	w.setClient(client)
+	defer w.setClient(nil)
 	streamCtx, closeStream := context.WithCancel(ctx)
 	defer closeStream()
 	go func() {
@@ -285,7 +308,7 @@ func (w *ValkaWorker) session(ctx context.Context) error {
 		if err != nil {
 			return NewConnectionError("stream receive error", err)
 		}
-		if stopping := w.handleResponse(ctx, resp, client); stopping {
+		if stopping := w.handleResponse(ctx, resp); stopping {
 			return NewConnectionError("server shutting down", nil)
 		}
 	}
@@ -343,10 +366,10 @@ func (w *ValkaWorker) heartbeatLoop(ctx context.Context) {
 }
 
 // handleResponse reports whether the server is shutting down (the worker then reconnects).
-func (w *ValkaWorker) handleResponse(ctx context.Context, resp *pb.WorkerResponse, client pb.WorkerServiceClient) bool {
+func (w *ValkaWorker) handleResponse(ctx context.Context, resp *pb.WorkerResponse) bool {
 	switch msg := resp.Response.(type) {
 	case *pb.WorkerResponse_TaskAssignment:
-		w.handleTaskAssignment(ctx, msg.TaskAssignment, client)
+		w.handleTaskAssignment(ctx, msg.TaskAssignment)
 	case *pb.WorkerResponse_TaskCancellation:
 		w.handleTaskCancellation(msg.TaskCancellation)
 	case *pb.WorkerResponse_TaskSignal:
@@ -377,7 +400,7 @@ func (w *ValkaWorker) handleTaskSignal(signal *pb.TaskSignal) {
 	}
 }
 
-func (w *ValkaWorker) handleTaskAssignment(ctx context.Context, assignment *pb.TaskAssignment, client pb.WorkerServiceClient) {
+func (w *ValkaWorker) handleTaskAssignment(ctx context.Context, assignment *pb.TaskAssignment) {
 	w.wg.Add(1)
 
 	taskCtx, taskCancel := context.WithCancel(ctx)
@@ -398,7 +421,7 @@ func (w *ValkaWorker) handleTaskAssignment(ctx context.Context, assignment *pb.T
 			w.wg.Done()
 		}()
 
-		w.executeTask(taskCtx, taskCancel, assignment, sigCh, client)
+		w.executeTask(taskCtx, taskCancel, assignment, sigCh)
 	}()
 }
 
@@ -409,7 +432,7 @@ func (w *ValkaWorker) handleTaskCancellation(cancellation *pb.TaskCancellation) 
 	}
 }
 
-func (w *ValkaWorker) executeTask(ctx context.Context, cancel context.CancelFunc, assignment *pb.TaskAssignment, sigCh chan *pb.TaskSignal, client pb.WorkerServiceClient) {
+func (w *ValkaWorker) executeTask(ctx context.Context, cancel context.CancelFunc, assignment *pb.TaskAssignment, sigCh chan *pb.TaskSignal) {
 	defer cancel()
 
 	tctx := &TaskContext{
@@ -431,13 +454,12 @@ func (w *ValkaWorker) executeTask(ctx context.Context, cancel context.CancelFunc
 		cancel:   cancel,
 		signalCh: sigCh,
 		checkpointFn: func(ctx context.Context, step, output string) error {
-			_, err := client.Checkpoint(ctx, &pb.CheckpointRequest{
+			return w.checkpoint(ctx, &pb.CheckpointRequest{
 				TaskId:    assignment.TaskId,
 				TaskRunId: assignment.TaskRunId,
 				Step:      step,
 				Output:    output,
 			})
-			return err
 		},
 		checkpoints: make(map[string]string, len(assignment.Checkpoints)),
 	}

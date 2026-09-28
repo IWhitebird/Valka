@@ -81,6 +81,7 @@ export class ValkaWorker {
   private readonly unacked = new Map<string, TaskResult>();
   private readonly taskContexts = new Map<string, TaskContext>();
   private outbound: ((msg: DeepPartial<WorkerRequest>) => void) | null = null;
+  private checkpointRpc: ((request: CheckpointRequest) => Promise<unknown>) | null = null;
   private activeCount = 0;
   private readonly slotWaiters: Array<() => void> = [];
 
@@ -205,6 +206,9 @@ export class ValkaWorker {
     // Register this connection before resending: a result delivered concurrently is
     // then either in the resend below or sent on this connection.
     this.outbound = send;
+    // ts-proto's Exact<> generic on fromPartial collapses nice-grpc's inferred request type
+    // to an index signature of `never`; the runtime type is correct.
+    this.checkpointRpc = (request) => client.checkpoint(request as never);
     for (const result of this.unacked.values()) {
       send({ taskResult: result });
     }
@@ -245,6 +249,7 @@ export class ValkaWorker {
 
     const cleanup = () => {
       this.outbound = null;
+      this.checkpointRpc = null;
       clearInterval(heartbeatInterval);
       process.removeListener("SIGINT", shutdownHandler);
       process.removeListener("SIGTERM", shutdownHandler);
@@ -268,18 +273,21 @@ export class ValkaWorker {
               assignment.attemptNumber,
               assignment.input,
               assignment.metadata,
-              send,
+              (msg) => this.outbound?.(msg),
               assignment.checkpoints,
               async (step, output) => {
-                const request = CheckpointRequest.fromPartial({
-                  taskId: assignment.taskId,
-                  taskRunId: assignment.taskRunId,
-                  step,
-                  output,
-                });
-                // ts-proto's Exact<> generic on fromPartial collapses nice-grpc's inferred
-                // request type to an index signature of `never`; the runtime type is correct.
-                await client.checkpoint(request as never);
+                const rpc = this.checkpointRpc;
+                if (!rpc) {
+                  throw new ConnectionError("not connected to the server");
+                }
+                await rpc(
+                  CheckpointRequest.fromPartial({
+                    taskId: assignment.taskId,
+                    taskRunId: assignment.taskRunId,
+                    step,
+                    output,
+                  }),
+                );
               },
             );
             this.taskContexts.set(assignment.taskId, ctx);

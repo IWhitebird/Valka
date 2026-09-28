@@ -67,6 +67,7 @@ class ValkaWorker:
         # task_run_id -> TaskResult, kept until the server answers APPLIED or STALE.
         self._unacked: dict[str, Any] = {}
         self._server_stopping = False
+        self._stub: Any = None
         self._shutting_down = False
         self._shutdown_event = asyncio.Event()
         self._stream: grpc.aio.StreamStreamCall | None = None  # type: ignore[type-arg]
@@ -165,8 +166,8 @@ class ValkaWorker:
         )
 
         try:
-            stub = worker_pb2_grpc.WorkerServiceStub(channel)
-            self._stream = stub.Session()
+            self._stub = worker_pb2_grpc.WorkerServiceStub(channel)
+            self._stream = self._stub.Session()
 
             # Send hello
             meta_str = json.dumps(self._metadata) if self._metadata else ""
@@ -198,7 +199,7 @@ class ValkaWorker:
             self._server_stopping = False
             try:
                 async for response in self._stream:
-                    await self._handle_response(response, stub)
+                    await self._handle_response(response)
                     if self._server_stopping:
                         break
             finally:
@@ -210,6 +211,7 @@ class ValkaWorker:
         finally:
             await channel.close()
             self._stream = None
+            self._stub = None
         if self._server_stopping and not self._shutting_down:
             raise ConnectionError("server shutting down")
 
@@ -232,10 +234,10 @@ class ValkaWorker:
             except Exception:
                 break
 
-    async def _handle_response(self, response: Any, stub: Any) -> None:
+    async def _handle_response(self, response: Any) -> None:
         kind = response.WhichOneof("response")
         if kind == "task_assignment":
-            await self._handle_task_assignment(response.task_assignment, stub)
+            await self._handle_task_assignment(response.task_assignment)
         elif kind == "task_signal":
             self._handle_task_signal(response.task_signal)
         elif kind == "task_cancellation":
@@ -284,8 +286,8 @@ class ValkaWorker:
         except Exception:
             logger.debug("Result send failed; the next session resends", exc_info=True)
 
-    async def _handle_task_assignment(self, assignment: Any, stub: Any) -> None:
-        task = asyncio.create_task(self._execute_task(assignment, stub))
+    async def _handle_task_assignment(self, assignment: Any) -> None:
+        task = asyncio.create_task(self._execute_task(assignment))
         self._active_tasks[assignment.task_id] = task
         task.add_done_callback(lambda _t: self._task_done(assignment.task_id))
 
@@ -298,10 +300,15 @@ class ValkaWorker:
         self._active_tasks.pop(task_id, None)
         self._task_contexts.pop(task_id, None)
 
-    async def _execute_task(self, assignment: Any, stub: Any) -> None:
+    async def _execute_task(self, assignment: Any) -> None:
         from valka._proto.valka.v1 import worker_pb2
 
         async def checkpoint(step: str, output: str) -> None:
+            # Through the current session, so a task that outlives a reconnect can still
+            # checkpoint.
+            stub = self._stub
+            if stub is None:
+                raise ConnectionError("not connected to the server")
             await stub.Checkpoint(
                 worker_pb2.CheckpointRequest(
                     task_id=assignment.task_id,
