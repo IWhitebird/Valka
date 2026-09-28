@@ -1039,3 +1039,68 @@ async fn checkpoints_survive_crash_via_snapshot_and_wal_tail() {
     assert_eq!(d.checkpoints.len(), 2);
     assert_eq!(d.checkpoints[1].output, serde_json::json!(2));
 }
+
+#[tokio::test(start_paused = true)]
+async fn snapshot_never_captures_records_that_failed_to_become_durable() {
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let (store, faults) = faulty_over(backing, 7);
+    let mut cfg = EngineConfig::for_tests("node-a");
+    cfg.wal.put_retries = 0;
+    let e = Engine::open_with(
+        store.clone(),
+        cfg,
+        TokioClock::new(),
+        Arc::new(crate::sink::NoopSink),
+    )
+    .await
+    .unwrap();
+    let kept = e.create_task(create("q")).await.unwrap();
+
+    faults.set_puts_down(true);
+    assert!(e.create_task(create("q")).await.is_err());
+    faults.set_puts_down(false);
+
+    e.snapshot_now().await;
+    assert!(
+        store.list("snapshots/").await.unwrap().is_empty(),
+        "a snapshot was written although the WAL could not be synced"
+    );
+    drop(e);
+
+    let e2 = open(&store).await;
+    let tasks = e2.list_tasks(None, None, 10, 0);
+    assert_eq!(tasks.len(), 1, "only the acked task survives a restart");
+    assert_eq!(tasks[0].id, kept.id);
+}
+
+#[tokio::test(start_paused = true)]
+async fn snapshot_round_spanning_many_batches_covers_every_dirty_shard() {
+    let store = Store::memory();
+    let mut ids = Vec::new();
+    {
+        let e = open(&store).await;
+        for _ in 0..300 {
+            ids.push(e.create_task(create("q")).await.unwrap().id);
+        }
+        let dirty = e.shard_stats().iter().filter(|s| s.tasks > 0).count();
+        assert!(
+            dirty > 128,
+            "tasks should span several snapshot batches, got {dirty}"
+        );
+        e.snapshot_now().await;
+        let snaps = store.list("snapshots/").await.unwrap().len();
+        assert_eq!(snaps, dirty, "one snapshot per dirty shard");
+        let segs = reader::list_segments(&store, "node-a", None).await.unwrap();
+        assert!(
+            segs.len() <= 1,
+            "covered segments truncated, got {}",
+            segs.len()
+        );
+    }
+    let e2 = open(&store).await;
+    assert_eq!(e2.list_tasks(None, None, 1000, 0).len(), 300);
+    for id in &ids {
+        assert!(e2.get_task(id).is_some());
+    }
+}

@@ -1,13 +1,13 @@
 //! Post-replay index rebuild and the snapshot / truncation round.
 
-use chrono::Duration as ChronoDuration;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use valka_core::{ShardId, TaskStatus};
 use valka_wal::{Lsn, reader, snapshot};
 
 use crate::engine::Engine;
-use crate::state::RunStatus;
+use crate::state::{RunStatus, ShardSnapshot, ShardState};
 use crate::timers::TimerKind;
 use crate::write_path::pending_key;
 
@@ -87,8 +87,9 @@ impl Engine {
     pub(crate) async fn snapshot_dirty_shards(&self, force: bool) {
         let threshold = self.inner.cfg.wal.snapshot_after_records;
         let mut written = 0usize;
+        let mut batch = Vec::with_capacity(SNAPSHOT_BATCH);
         for (i, m) in self.inner.shards.iter().enumerate() {
-            let (snap, lsn, prev) = {
+            {
                 let mut st = m.lock();
                 if st.records_since_snapshot == 0 {
                     continue;
@@ -99,17 +100,10 @@ impl Engine {
                         .dirty_since_lsn
                         .is_some_and(|d| d > self.inner.writer.durable_lsn())
                 {
-                    // Not enough records yet and nothing durable to cover: wait.
                     continue;
                 }
                 let lsn = self.inner.writer.next_lsn();
-                let prev = (
-                    st.records_since_snapshot,
-                    st.snapshot_seq,
-                    st.snapshot_lsn,
-                    st.dirty_since_lsn,
-                    st.snapshot_at,
-                );
+                let prev = Bookkeeping::of(&st);
                 let taken_at = self.inner.clock.now();
                 let snap = st.to_snapshot(taken_at);
                 st.records_since_snapshot = 0;
@@ -117,39 +111,19 @@ impl Engine {
                 st.snapshot_lsn = lsn;
                 st.dirty_since_lsn = None;
                 st.snapshot_at = Some(taken_at);
-                (snap, lsn, prev)
-            };
-            // The snapshot claims to cover records in segments < lsn; those records must
-            // be durable before the snapshot may be relied upon for truncation. Wait.
-            if self.inner.writer.durable_lsn() < Lsn::new(lsn.epoch, lsn.seq.saturating_sub(1))
-                && let Err(e) = self.inner.writer.sync().await
-            {
-                warn!(error = %e, "sync before snapshot failed");
+                batch.push(Captured {
+                    shard: ShardId(i as u16),
+                    lsn,
+                    snap,
+                    prev,
+                });
             }
-            let shard = ShardId(i as u16);
-            match snapshot::write(&self.inner.store, shard, lsn, &snap).await {
-                Ok(()) => {
-                    written += 1;
-                    if let Err(e) = snapshot::prune(
-                        &self.inner.store,
-                        shard,
-                        self.inner.cfg.wal.snapshots_to_keep.max(1),
-                    )
-                    .await
-                    {
-                        warn!(%shard, error = %e, "snapshot prune failed");
-                    }
-                }
-                Err(e) => {
-                    error!(%shard, error = %e, "snapshot write failed; keeping WAL");
-                    let mut st = m.lock();
-                    st.records_since_snapshot += prev.0;
-                    st.snapshot_seq = prev.1;
-                    st.snapshot_lsn = prev.2;
-                    st.dirty_since_lsn = prev.3.or(Some(lsn));
-                    st.snapshot_at = prev.4;
-                }
+            if batch.len() == SNAPSHOT_BATCH {
+                written += self.write_snapshot_batch(std::mem::take(&mut batch)).await;
             }
+        }
+        if !batch.is_empty() {
+            written += self.write_snapshot_batch(batch).await;
         }
         if written == 0 {
             return;
@@ -170,6 +144,79 @@ impl Engine {
             }
             Ok(_) => debug!(snapshots = written, "snapshot round complete"),
             Err(e) => warn!(error = %e, "segment truncation failed"),
+        }
+    }
+
+    /// Every record a captured state reflects was appended before its capture, so one sync
+    /// after capturing covers them all. If that sync fails, nothing in the batch may be
+    /// written: a snapshot would outlive records that never became durable.
+    async fn write_snapshot_batch(&self, batch: Vec<Captured>) -> usize {
+        if let Err(e) = self.inner.writer.sync().await {
+            error!(error = %e, shards = batch.len(), "WAL not durable; snapshot batch aborted");
+            for c in &batch {
+                self.restore_bookkeeping(c);
+            }
+            return 0;
+        }
+        let mut written = 0;
+        for c in batch {
+            match snapshot::write(&self.inner.store, c.shard, c.lsn, &c.snap).await {
+                Ok(()) => {
+                    written += 1;
+                    if let Err(e) = snapshot::prune(
+                        &self.inner.store,
+                        c.shard,
+                        self.inner.cfg.wal.snapshots_to_keep.max(1),
+                    )
+                    .await
+                    {
+                        warn!(shard = %c.shard, error = %e, "snapshot prune failed");
+                    }
+                }
+                Err(e) => {
+                    error!(shard = %c.shard, error = %e, "snapshot write failed; keeping WAL");
+                    self.restore_bookkeeping(&c);
+                }
+            }
+        }
+        written
+    }
+
+    fn restore_bookkeeping(&self, c: &Captured) {
+        let mut st = self.inner.shards[c.shard.0 as usize].lock();
+        st.records_since_snapshot += c.prev.records_since_snapshot;
+        st.snapshot_seq = c.prev.snapshot_seq;
+        st.snapshot_lsn = c.prev.snapshot_lsn;
+        st.dirty_since_lsn = c.prev.dirty_since_lsn.or(Some(c.lsn));
+        st.snapshot_at = c.prev.snapshot_at;
+    }
+}
+
+const SNAPSHOT_BATCH: usize = 64;
+
+struct Captured {
+    shard: ShardId,
+    lsn: Lsn,
+    snap: ShardSnapshot,
+    prev: Bookkeeping,
+}
+
+struct Bookkeeping {
+    records_since_snapshot: u64,
+    snapshot_seq: u64,
+    snapshot_lsn: Lsn,
+    dirty_since_lsn: Option<Lsn>,
+    snapshot_at: Option<DateTime<Utc>>,
+}
+
+impl Bookkeeping {
+    fn of(st: &ShardState) -> Self {
+        Self {
+            records_since_snapshot: st.records_since_snapshot,
+            snapshot_seq: st.snapshot_seq,
+            snapshot_lsn: st.snapshot_lsn,
+            dirty_since_lsn: st.dirty_since_lsn,
+            snapshot_at: st.snapshot_at,
         }
     }
 }
