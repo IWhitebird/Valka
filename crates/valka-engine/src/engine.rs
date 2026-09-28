@@ -6,6 +6,7 @@ use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 use tokio::sync::{Notify, broadcast, watch};
 use tracing::info;
@@ -115,6 +116,8 @@ pub(crate) struct Inner {
     pub(crate) shutdown: watch::Sender<bool>,
     pub(crate) started_at: DateTime<Utc>,
     pub(crate) last_snapshot_round: Mutex<Option<DateTime<Utc>>>,
+    /// Writer bytes committed when the last full snapshot round started.
+    pub(crate) log_mark: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -247,6 +250,7 @@ impl Engine {
             shutdown,
             started_at: clock_now,
             last_snapshot_round: Mutex::new(None),
+            log_mark: AtomicU64::new(0),
         });
         let engine = Engine { inner };
         engine.rebuild_indexes();

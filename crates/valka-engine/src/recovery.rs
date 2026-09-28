@@ -1,6 +1,7 @@
 //! Post-replay index rebuild and the snapshot / truncation round.
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use valka_core::{ShardId, TaskStatus};
@@ -73,18 +74,41 @@ impl Engine {
     pub(crate) async fn snapshotter(self) {
         let mut shutdown = self.inner.shutdown.subscribe();
         let interval = Duration::from_secs(self.inner.cfg.wal.snapshot_interval_secs.max(1));
+        let tick = interval.min(Duration::from_secs(1));
+        let mut last_round = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 _ = shutdown.changed() => { if *shutdown.borrow() { return; } }
-                _ = tokio::time::sleep(interval) => {}
+                _ = tokio::time::sleep(tick) => {}
             }
-            self.snapshot_dirty_shards(false).await;
+            if self.over_log_budget() {
+                self.snapshot_dirty_shards(true).await;
+                last_round = tokio::time::Instant::now();
+            } else if last_round.elapsed() >= interval {
+                self.snapshot_dirty_shards(false).await;
+                last_round = tokio::time::Instant::now();
+            }
         }
+    }
+
+    fn over_log_budget(&self) -> bool {
+        let budget = self.inner.cfg.wal.log_budget_bytes;
+        let since = self
+            .inner
+            .writer
+            .bytes_committed()
+            .saturating_sub(self.inner.log_mark.load(Ordering::SeqCst));
+        budget > 0 && since >= budget
     }
 
     /// Snapshot every shard with uncovered records (or, when `force`, every dirty shard
     /// regardless of the record threshold), then prune snapshots and truncate segments.
     pub(crate) async fn snapshot_dirty_shards(&self, force: bool) {
+        if force {
+            self.inner
+                .log_mark
+                .store(self.inner.writer.bytes_committed(), Ordering::SeqCst);
+        }
         let threshold = self.inner.cfg.wal.snapshot_after_records;
         let mut written = 0usize;
         let mut batch = Vec::with_capacity(SNAPSHOT_BATCH);

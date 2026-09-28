@@ -74,6 +74,7 @@ struct Pending {
 struct InFlight {
     lsn: Lsn,
     record_count: u64,
+    bytes: u64,
     shards: Vec<valka_core::ShardId>,
     acks: Vec<oneshot::Sender<Result<Lsn, WalError>>>,
     put: JoinHandle<Result<(), WalError>>,
@@ -97,6 +98,7 @@ pub struct WalWriter {
     /// Set when the committer gave up on a segment; the engine must restart.
     poisoned: Arc<watch::Sender<Option<String>>>,
     backlog: Arc<Mutex<Backlog>>,
+    bytes_committed: Arc<AtomicU64>,
 }
 
 impl WalWriter {
@@ -126,12 +128,14 @@ impl WalWriter {
             cfg.clone(),
         ));
         let backlog = Arc::new(Mutex::new(Backlog::default()));
+        let bytes_committed = Arc::new(AtomicU64::new(0));
         tokio::spawn(committer(
             flight_rx,
             durable_tx,
             ownership,
             poisoned.clone(),
             backlog.clone(),
+            bytes_committed.clone(),
         ));
 
         Self {
@@ -141,6 +145,7 @@ impl WalWriter {
             epoch: start_lsn.epoch,
             poisoned,
             backlog,
+            bytes_committed,
         }
     }
 
@@ -185,6 +190,11 @@ impl WalWriter {
         } else {
             b.since.map(|s| s.elapsed())
         }
+    }
+
+    /// Total bytes of segments committed by this writer since it started.
+    pub fn bytes_committed(&self) -> u64 {
+        self.bytes_committed.load(Ordering::SeqCst)
     }
 
     /// Highest LSN whose acks have been released. Never regresses.
@@ -348,6 +358,7 @@ async fn flush(
             return;
         }
     };
+    let size = bytes.len() as u64;
     let key = keys::segment(node_id, lsn);
     let store2 = store.clone();
     let retries = cfg.put_retries;
@@ -357,6 +368,7 @@ async fn flush(
         .send(InFlight {
             lsn,
             record_count,
+            bytes: size,
             shards,
             acks,
             put,
@@ -425,6 +437,7 @@ async fn committer(
     ownership: Arc<dyn OwnershipCheck>,
     poisoned: Arc<watch::Sender<Option<String>>>,
     backlog: Arc<Mutex<Backlog>>,
+    bytes_committed: Arc<AtomicU64>,
 ) {
     while let Some(f) = rx.recv().await {
         let result = match f.put.await {
@@ -448,6 +461,7 @@ async fn committer(
         settle_backlog(&backlog, f.record_count);
         match result {
             Ok(()) => {
+                bytes_committed.fetch_add(f.bytes, Ordering::SeqCst);
                 for a in f.acks {
                     let _ = a.send(Ok(f.lsn));
                 }

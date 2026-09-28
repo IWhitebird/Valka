@@ -51,12 +51,15 @@ flush_interval_ms = 50
 max_batch_bytes = 4194304
 # Segment PUTs in flight concurrently.
 max_inflight_segments = 4
-# PUT retries before acks fail with UNAVAILABLE (the node then needs a restart).
+# PUT retries before acks fail with UNAVAILABLE (the node then exits and restarts).
 put_retries = 8
 # Snapshot dirty shards at least this often; segments below every snapshot are deleted.
 snapshot_interval_secs = 60
 # ...or as soon as a shard has this many unsnapshotted records.
 snapshot_after_records = 50000
+# ...or, for every dirty shard, once this many WAL bytes were written since the last
+# full round. Bounds restart replay time. 0 disables.
+log_budget_bytes = 67108864
 # Snapshots kept per shard.
 snapshots_to_keep = 2
 # Terminal tasks (COMPLETED/FAILED/CANCELLED/DEAD_LETTER) leave RAM after this.

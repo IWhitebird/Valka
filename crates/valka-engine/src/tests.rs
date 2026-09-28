@@ -1104,3 +1104,58 @@ async fn snapshot_round_spanning_many_batches_covers_every_dirty_shard() {
         assert!(e2.get_task(id).is_some());
     }
 }
+
+fn incompressible(len: usize) -> String {
+    let mut out = String::with_capacity(len);
+    while out.len() < len {
+        out.push_str(&uuid::Uuid::now_v7().simple().to_string());
+    }
+    out
+}
+
+#[tokio::test(start_paused = true)]
+async fn log_budget_forces_a_snapshot_round_before_the_interval() {
+    let store = Store::memory();
+    let mut cfg = EngineConfig::for_tests("node-a");
+    cfg.wal.log_budget_bytes = 8 * 1024;
+    cfg.wal.snapshot_after_records = u64::MAX;
+    let e = Engine::open(store.clone(), cfg).await.unwrap();
+    for _ in 0..20 {
+        let mut req = create("q");
+        req.input = Some(serde_json::json!({"blob": incompressible(2048)}));
+        e.create_task(req).await.unwrap();
+    }
+    assert!(store.list("snapshots/").await.unwrap().is_empty());
+
+    tokio::time::advance(Duration::from_millis(1500)).await;
+    settle().await;
+    assert!(
+        !store.list("snapshots/").await.unwrap().is_empty(),
+        "the budget, not the hour-long interval, triggered the round"
+    );
+    let segs = reader::list_segments(&store, "node-a", None).await.unwrap();
+    assert!(
+        segs.len() <= 1,
+        "covered segments truncated, got {}",
+        segs.len()
+    );
+
+    let e2 = open(&store).await;
+    assert_eq!(e2.list_tasks(None, None, 100, 0).len(), 20);
+}
+
+#[tokio::test(start_paused = true)]
+async fn zero_log_budget_leaves_rounds_to_the_interval() {
+    let store = Store::memory();
+    let mut cfg = EngineConfig::for_tests("node-a");
+    cfg.wal.log_budget_bytes = 0;
+    let e = Engine::open(store.clone(), cfg).await.unwrap();
+    for _ in 0..20 {
+        let mut req = create("q");
+        req.input = Some(serde_json::json!({"blob": incompressible(2048)}));
+        e.create_task(req).await.unwrap();
+    }
+    tokio::time::advance(Duration::from_secs(5)).await;
+    settle().await;
+    assert!(store.list("snapshots/").await.unwrap().is_empty());
+}

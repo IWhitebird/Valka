@@ -54,6 +54,9 @@ pub struct WalConfig {
     pub snapshot_interval_secs: u64,
     /// Snapshot a shard once it has this many records since its last snapshot.
     pub snapshot_after_records: u64,
+    /// Snapshot every dirty shard once this many WAL bytes have been committed since the
+    /// last full round. Bounds restart replay (and, with many nodes, takeover). 0 disables.
+    pub log_budget_bytes: u64,
     /// Snapshots older than the newest N per shard are deleted.
     pub snapshots_to_keep: usize,
     /// Terminal tasks (COMPLETED/FAILED/CANCELLED/DEAD_LETTER) are dropped from RAM after this.
@@ -141,6 +144,7 @@ impl Default for WalConfig {
             put_retries: 8,
             snapshot_interval_secs: 60,
             snapshot_after_records: 50_000,
+            log_budget_bytes: 64 * 1024 * 1024,
             snapshots_to_keep: 2,
             completed_retention_secs: 24 * 3600,
         }
