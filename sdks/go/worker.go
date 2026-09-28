@@ -34,6 +34,7 @@ type ValkaWorker struct {
 	semaphore      chan struct{}
 	activeTasks    sync.Map
 	signalChannels sync.Map // task_id -> chan *pb.TaskSignal
+	unacked        sync.Map // task_run_id -> *pb.TaskResult, kept until APPLIED or STALE
 	wg             sync.WaitGroup
 	shuttingDown   bool
 	shutdownMu     sync.Mutex
@@ -140,7 +141,8 @@ func (w *ValkaWorker) Shutdown() {
 		},
 	}
 
-	// Wait up to 30s for active tasks to drain
+	// Wait up to 30s for active tasks to drain; the session keeps receiving meanwhile, so
+	// their results can still be acknowledged.
 	done := make(chan struct{})
 	go func() {
 		w.wg.Wait()
@@ -154,7 +156,67 @@ func (w *ValkaWorker) Shutdown() {
 		log.Println("[valka] Drain timeout, forcing shutdown")
 	}
 
+	deadline := time.Now().Add(shutdownAckWait)
+	for w.unackedCount() > 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+
 	close(w.shutdownCh)
+}
+
+const (
+	resultRetryDelay = time.Second
+	shutdownAckWait  = 5 * time.Second
+)
+
+func resultRequest(result *pb.TaskResult) *pb.WorkerRequest {
+	return &pb.WorkerRequest{Request: &pb.WorkerRequest_TaskResult{TaskResult: result}}
+}
+
+func (w *ValkaWorker) trySend(req *pb.WorkerRequest) {
+	select {
+	case w.sendCh <- req:
+	default:
+	}
+}
+
+// deliver keeps the result until the server answers APPLIED or STALE. Unacked results
+// are resent when a session starts and on every heartbeat tick.
+func (w *ValkaWorker) deliver(result *pb.TaskResult) {
+	w.unacked.Store(result.TaskRunId, result)
+	w.trySend(resultRequest(result))
+}
+
+func (w *ValkaWorker) resendUnacked() {
+	w.unacked.Range(func(_, v interface{}) bool {
+		w.trySend(resultRequest(v.(*pb.TaskResult)))
+		return true
+	})
+}
+
+func (w *ValkaWorker) unackedCount() int {
+	n := 0
+	w.unacked.Range(func(_, _ interface{}) bool {
+		n++
+		return true
+	})
+	return n
+}
+
+func (w *ValkaWorker) handleResultAck(ack *pb.ResultAck) {
+	switch ack.Status {
+	case pb.ResultStatus_RESULT_STATUS_APPLIED, pb.ResultStatus_RESULT_STATUS_STALE:
+		if ack.Status == pb.ResultStatus_RESULT_STATUS_STALE {
+			log.Printf("[valka] Result for task %s not recorded: the run already ended another way", ack.TaskId)
+		}
+		w.unacked.Delete(ack.TaskRunId)
+	default:
+		time.AfterFunc(resultRetryDelay, func() {
+			if r, ok := w.unacked.Load(ack.TaskRunId); ok {
+				w.trySend(resultRequest(r.(*pb.TaskResult)))
+			}
+		})
+	}
 }
 
 func (w *ValkaWorker) session(ctx context.Context) error {
@@ -172,7 +234,16 @@ func (w *ValkaWorker) session(ctx context.Context) error {
 	defer conn.Close()
 
 	client := pb.NewWorkerServiceClient(conn)
-	stream, err := client.Session(ctx)
+	streamCtx, closeStream := context.WithCancel(ctx)
+	defer closeStream()
+	go func() {
+		select {
+		case <-w.shutdownCh:
+			closeStream()
+		case <-streamCtx.Done():
+		}
+	}()
+	stream, err := client.Session(streamCtx)
 	if err != nil {
 		return NewConnectionError("failed to open session", err)
 	}
@@ -207,22 +278,16 @@ func (w *ValkaWorker) session(ctx context.Context) error {
 
 	go w.senderLoop(senderCtx, stream)
 	go w.heartbeatLoop(senderCtx)
+	w.resendUnacked()
 
-	// Receive loop
 	for {
 		resp, err := stream.Recv()
 		if err != nil {
 			return NewConnectionError("stream receive error", err)
 		}
-
-		w.shutdownMu.Lock()
-		done := w.shuttingDown
-		w.shutdownMu.Unlock()
-		if done {
-			return nil
+		if stopping := w.handleResponse(ctx, resp, client); stopping {
+			return NewConnectionError("server shutting down", nil)
 		}
-
-		w.handleResponse(ctx, resp, client)
 	}
 }
 
@@ -259,6 +324,11 @@ func (w *ValkaWorker) heartbeatLoop(ctx context.Context) {
 				activeIDs = append(activeIDs, key.(string))
 				return true
 			})
+			w.unacked.Range(func(_, v interface{}) bool {
+				activeIDs = append(activeIDs, v.(*pb.TaskResult).TaskId)
+				return true
+			})
+			w.resendUnacked()
 
 			w.sendCh <- &pb.WorkerRequest{
 				Request: &pb.WorkerRequest_Heartbeat{
@@ -272,7 +342,8 @@ func (w *ValkaWorker) heartbeatLoop(ctx context.Context) {
 	}
 }
 
-func (w *ValkaWorker) handleResponse(ctx context.Context, resp *pb.WorkerResponse, client pb.WorkerServiceClient) {
+// handleResponse reports whether the server is shutting down (the worker then reconnects).
+func (w *ValkaWorker) handleResponse(ctx context.Context, resp *pb.WorkerResponse, client pb.WorkerServiceClient) bool {
 	switch msg := resp.Response.(type) {
 	case *pb.WorkerResponse_TaskAssignment:
 		w.handleTaskAssignment(ctx, msg.TaskAssignment, client)
@@ -280,12 +351,15 @@ func (w *ValkaWorker) handleResponse(ctx context.Context, resp *pb.WorkerRespons
 		w.handleTaskCancellation(msg.TaskCancellation)
 	case *pb.WorkerResponse_TaskSignal:
 		w.handleTaskSignal(msg.TaskSignal)
+	case *pb.WorkerResponse_ResultAck:
+		w.handleResultAck(msg.ResultAck)
 	case *pb.WorkerResponse_ServerShutdown:
 		log.Printf("[valka] Server shutdown: %s", msg.ServerShutdown.Reason)
-		go w.Shutdown()
+		return true
 	case *pb.WorkerResponse_HeartbeatAck:
 		// no-op
 	}
+	return false
 }
 
 func (w *ValkaWorker) handleTaskSignal(signal *pb.TaskSignal) {
@@ -304,8 +378,6 @@ func (w *ValkaWorker) handleTaskSignal(signal *pb.TaskSignal) {
 }
 
 func (w *ValkaWorker) handleTaskAssignment(ctx context.Context, assignment *pb.TaskAssignment, client pb.WorkerServiceClient) {
-	// Acquire semaphore slot
-	w.semaphore <- struct{}{}
 	w.wg.Add(1)
 
 	taskCtx, taskCancel := context.WithCancel(ctx)
@@ -316,6 +388,9 @@ func (w *ValkaWorker) handleTaskAssignment(ctx context.Context, assignment *pb.T
 	w.signalChannels.Store(assignment.TaskId, sigCh)
 
 	go func() {
+		// Take the slot here, not in the receive loop, so acks, signals and cancels keep
+		// flowing while the worker is at capacity.
+		w.semaphore <- struct{}{}
 		defer func() {
 			<-w.semaphore
 			w.activeTasks.Delete(assignment.TaskId)
@@ -396,18 +471,14 @@ func (w *ValkaWorker) executeTask(ctx context.Context, cancel context.CancelFunc
 		}
 	}
 
-	w.sendCh <- &pb.WorkerRequest{
-		Request: &pb.WorkerRequest_TaskResult{
-			TaskResult: &pb.TaskResult{
-				TaskId:       assignment.TaskId,
-				TaskRunId:    assignment.TaskRunId,
-				Success:      success,
-				Retryable:    retryable,
-				Output:       output,
-				ErrorMessage: errorMessage,
-			},
-		},
-	}
+	w.deliver(&pb.TaskResult{
+		TaskId:       assignment.TaskId,
+		TaskRunId:    assignment.TaskRunId,
+		Success:      success,
+		Retryable:    retryable,
+		Output:       output,
+		ErrorMessage: errorMessage,
+	})
 }
 
 // generateUUID generates a UUID v4 using crypto/rand (no external deps).

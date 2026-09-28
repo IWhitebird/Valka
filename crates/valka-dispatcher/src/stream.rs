@@ -1,17 +1,19 @@
 use crate::service::DispatcherService;
 use crate::worker_handle::WorkerHandle;
 use futures::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tonic::Streaming;
 use tracing::{error, info, warn};
 use valka_core::WorkerId;
 use valka_proto::{WorkerRequest, WorkerResponse, worker_request, worker_response};
 
-/// Process the bidirectional worker stream
+/// Process the bidirectional worker stream. On server shutdown the worker is told to
+/// leave and the stream is closed, so the server can stop without waiting for it.
 pub async fn handle_worker_stream(
     dispatcher: DispatcherService,
     mut inbound: Streaming<WorkerRequest>,
     response_tx: mpsc::Sender<WorkerResponse>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     // First message must be WorkerHello
     let hello = match inbound.next().await {
@@ -64,9 +66,29 @@ pub async fn handle_worker_stream(
             .await;
     });
 
-    // Process incoming messages
+    let server_stopping = async move {
+        let _ = shutdown.wait_for(|s| *s).await;
+    };
+    tokio::pin!(server_stopping);
+
     loop {
-        match inbound.next().await {
+        let msg = tokio::select! {
+            msg = inbound.next() => msg,
+            _ = &mut server_stopping => {
+                let bye = WorkerResponse {
+                    response: Some(worker_response::Response::ServerShutdown(
+                        valka_proto::ServerShutdown {
+                            reason: "server shutting down".to_string(),
+                            drain_seconds: 0,
+                        },
+                    )),
+                };
+                let _ = response_tx.send(bye).await;
+                info!(worker_id = %worker_id, "Server shutting down; closing worker stream");
+                break;
+            }
+        };
+        match msg {
             Some(Ok(msg)) => match msg.request {
                 Some(worker_request::Request::TaskResult(result)) => {
                     dispatcher.handle_task_result(&worker_id, result).await;
@@ -91,12 +113,15 @@ pub async fn handle_worker_stream(
                     dispatcher.handle_signal_ack(&ack).await;
                 }
                 Some(worker_request::Request::Shutdown(shutdown)) => {
+                    // Stop dispatching, but keep the stream: the worker still sends results
+                    // for in-flight tasks and waits for their acks, then closes the stream.
                     info!(
                         worker_id = %worker_id,
                         reason = %shutdown.reason,
-                        "Worker graceful shutdown"
+                        "Worker draining"
                     );
-                    break;
+                    match_handle.abort();
+                    dispatcher.stop_dispatching(&worker_id);
                 }
                 None => {
                     warn!(worker_id = %worker_id, "Empty worker request");

@@ -1,11 +1,23 @@
 from valka.v1 import common_pb2 as _common_pb2
 from google.protobuf.internal import containers as _containers
+from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
 from collections.abc import Iterable as _Iterable, Mapping as _Mapping
 from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
+
+class ResultStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    RESULT_STATUS_UNSPECIFIED: _ClassVar[ResultStatus]
+    RESULT_STATUS_APPLIED: _ClassVar[ResultStatus]
+    RESULT_STATUS_STALE: _ClassVar[ResultStatus]
+    RESULT_STATUS_RETRY: _ClassVar[ResultStatus]
+RESULT_STATUS_UNSPECIFIED: ResultStatus
+RESULT_STATUS_APPLIED: ResultStatus
+RESULT_STATUS_STALE: ResultStatus
+RESULT_STATUS_RETRY: ResultStatus
 
 class WorkerRequest(_message.Message):
     __slots__ = ("hello", "task_result", "heartbeat", "log_batch", "shutdown", "signal_ack")
@@ -24,18 +36,20 @@ class WorkerRequest(_message.Message):
     def __init__(self, hello: _Optional[_Union[WorkerHello, _Mapping]] = ..., task_result: _Optional[_Union[TaskResult, _Mapping]] = ..., heartbeat: _Optional[_Union[Heartbeat, _Mapping]] = ..., log_batch: _Optional[_Union[LogBatch, _Mapping]] = ..., shutdown: _Optional[_Union[GracefulShutdown, _Mapping]] = ..., signal_ack: _Optional[_Union[SignalAck, _Mapping]] = ...) -> None: ...
 
 class WorkerResponse(_message.Message):
-    __slots__ = ("task_assignment", "task_cancellation", "heartbeat_ack", "server_shutdown", "task_signal")
+    __slots__ = ("task_assignment", "task_cancellation", "heartbeat_ack", "server_shutdown", "task_signal", "result_ack")
     TASK_ASSIGNMENT_FIELD_NUMBER: _ClassVar[int]
     TASK_CANCELLATION_FIELD_NUMBER: _ClassVar[int]
     HEARTBEAT_ACK_FIELD_NUMBER: _ClassVar[int]
     SERVER_SHUTDOWN_FIELD_NUMBER: _ClassVar[int]
     TASK_SIGNAL_FIELD_NUMBER: _ClassVar[int]
+    RESULT_ACK_FIELD_NUMBER: _ClassVar[int]
     task_assignment: TaskAssignment
     task_cancellation: TaskCancellation
     heartbeat_ack: HeartbeatAck
     server_shutdown: ServerShutdown
     task_signal: TaskSignal
-    def __init__(self, task_assignment: _Optional[_Union[TaskAssignment, _Mapping]] = ..., task_cancellation: _Optional[_Union[TaskCancellation, _Mapping]] = ..., heartbeat_ack: _Optional[_Union[HeartbeatAck, _Mapping]] = ..., server_shutdown: _Optional[_Union[ServerShutdown, _Mapping]] = ..., task_signal: _Optional[_Union[TaskSignal, _Mapping]] = ...) -> None: ...
+    result_ack: ResultAck
+    def __init__(self, task_assignment: _Optional[_Union[TaskAssignment, _Mapping]] = ..., task_cancellation: _Optional[_Union[TaskCancellation, _Mapping]] = ..., heartbeat_ack: _Optional[_Union[HeartbeatAck, _Mapping]] = ..., server_shutdown: _Optional[_Union[ServerShutdown, _Mapping]] = ..., task_signal: _Optional[_Union[TaskSignal, _Mapping]] = ..., result_ack: _Optional[_Union[ResultAck, _Mapping]] = ...) -> None: ...
 
 class WorkerHello(_message.Message):
     __slots__ = ("worker_id", "worker_name", "queues", "concurrency", "metadata")
@@ -176,6 +190,18 @@ class SignalAck(_message.Message):
     SIGNAL_ID_FIELD_NUMBER: _ClassVar[int]
     signal_id: str
     def __init__(self, signal_id: _Optional[str] = ...) -> None: ...
+
+class ResultAck(_message.Message):
+    __slots__ = ("task_id", "task_run_id", "status", "message")
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    TASK_RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    STATUS_FIELD_NUMBER: _ClassVar[int]
+    MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    task_id: str
+    task_run_id: str
+    status: ResultStatus
+    message: str
+    def __init__(self, task_id: _Optional[str] = ..., task_run_id: _Optional[str] = ..., status: _Optional[_Union[ResultStatus, str]] = ..., message: _Optional[str] = ...) -> None: ...
 
 class CheckpointRequest(_message.Message):
     __slots__ = ("task_id", "task_run_id", "step", "output")

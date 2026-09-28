@@ -8,8 +8,8 @@ use valka_core::TaskStatus;
 use valka_wal::{Envelope, FailureOutcome, WalRecord};
 
 use crate::state::{
-    CheckpointState, DeadLetterEntry, RunState, RunStatus, ShardState, SignalState, SignalStatus,
-    TaskState, Transition,
+    CheckpointState, DeadLetterEntry, RunEnd, RunState, RunStatus, ShardState, SignalState,
+    SignalStatus, TaskState, Transition,
 };
 
 impl ShardState {
@@ -98,6 +98,7 @@ impl ShardState {
                     started_at: now,
                     completed_at: None,
                     last_heartbeat: now,
+                    ended_by: None,
                 });
                 out.push(Transition {
                     task_id: task_id.clone(),
@@ -130,6 +131,7 @@ impl ShardState {
                 run.status = RunStatus::Completed;
                 run.output = output.clone();
                 run.completed_at = Some(now);
+                run.ended_by = Some(RunEnd::Completed);
                 let attempt = run.attempt_number;
                 let worker = run.worker_id.clone();
                 t.status = TaskStatus::Completed;
@@ -173,6 +175,10 @@ impl ShardState {
                 run.status = RunStatus::Failed;
                 run.error_message = Some(error.clone());
                 run.completed_at = Some(now);
+                run.ended_by = Some(match &env.record {
+                    WalRecord::LeaseExpired { .. } => RunEnd::Expired,
+                    _ => RunEnd::Failed,
+                });
                 let attempt = run.attempt_number;
                 let worker = run.worker_id.clone();
                 t.updated_at = now;
@@ -315,6 +321,7 @@ impl ShardState {
                     run.status = RunStatus::Failed;
                     run.error_message = Some(reason.clone());
                     run.completed_at = Some(now);
+                    run.ended_by = Some(RunEnd::Cancelled);
                 }
                 t.status = TaskStatus::Cancelled;
                 t.error_message = Some(reason.clone());

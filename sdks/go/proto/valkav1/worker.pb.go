@@ -21,6 +21,61 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type ResultStatus int32
+
+const (
+	ResultStatus_RESULT_STATUS_UNSPECIFIED ResultStatus = 0
+	// The result is durable, now or from an earlier delivery of the same result.
+	ResultStatus_RESULT_STATUS_APPLIED ResultStatus = 1
+	// The run already ended another way (lease expired, cancelled, deleted); not recorded.
+	ResultStatus_RESULT_STATUS_STALE ResultStatus = 2
+	// Not recorded yet; send it again.
+	ResultStatus_RESULT_STATUS_RETRY ResultStatus = 3
+)
+
+// Enum value maps for ResultStatus.
+var (
+	ResultStatus_name = map[int32]string{
+		0: "RESULT_STATUS_UNSPECIFIED",
+		1: "RESULT_STATUS_APPLIED",
+		2: "RESULT_STATUS_STALE",
+		3: "RESULT_STATUS_RETRY",
+	}
+	ResultStatus_value = map[string]int32{
+		"RESULT_STATUS_UNSPECIFIED": 0,
+		"RESULT_STATUS_APPLIED":     1,
+		"RESULT_STATUS_STALE":       2,
+		"RESULT_STATUS_RETRY":       3,
+	}
+)
+
+func (x ResultStatus) Enum() *ResultStatus {
+	p := new(ResultStatus)
+	*p = x
+	return p
+}
+
+func (x ResultStatus) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ResultStatus) Descriptor() protoreflect.EnumDescriptor {
+	return file_valka_v1_worker_proto_enumTypes[0].Descriptor()
+}
+
+func (ResultStatus) Type() protoreflect.EnumType {
+	return &file_valka_v1_worker_proto_enumTypes[0]
+}
+
+func (x ResultStatus) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ResultStatus.Descriptor instead.
+func (ResultStatus) EnumDescriptor() ([]byte, []int) {
+	return file_valka_v1_worker_proto_rawDescGZIP(), []int{0}
+}
+
 // Worker -> Server
 type WorkerRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -178,6 +233,7 @@ type WorkerResponse struct {
 	//	*WorkerResponse_HeartbeatAck
 	//	*WorkerResponse_ServerShutdown
 	//	*WorkerResponse_TaskSignal
+	//	*WorkerResponse_ResultAck
 	Response      isWorkerResponse_Response `protobuf_oneof:"response"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -265,6 +321,15 @@ func (x *WorkerResponse) GetTaskSignal() *TaskSignal {
 	return nil
 }
 
+func (x *WorkerResponse) GetResultAck() *ResultAck {
+	if x != nil {
+		if x, ok := x.Response.(*WorkerResponse_ResultAck); ok {
+			return x.ResultAck
+		}
+	}
+	return nil
+}
+
 type isWorkerResponse_Response interface {
 	isWorkerResponse_Response()
 }
@@ -289,6 +354,10 @@ type WorkerResponse_TaskSignal struct {
 	TaskSignal *TaskSignal `protobuf:"bytes,5,opt,name=task_signal,json=taskSignal,proto3,oneof"`
 }
 
+type WorkerResponse_ResultAck struct {
+	ResultAck *ResultAck `protobuf:"bytes,6,opt,name=result_ack,json=resultAck,proto3,oneof"`
+}
+
 func (*WorkerResponse_TaskAssignment) isWorkerResponse_Response() {}
 
 func (*WorkerResponse_TaskCancellation) isWorkerResponse_Response() {}
@@ -298,6 +367,8 @@ func (*WorkerResponse_HeartbeatAck) isWorkerResponse_Response() {}
 func (*WorkerResponse_ServerShutdown) isWorkerResponse_Response() {}
 
 func (*WorkerResponse_TaskSignal) isWorkerResponse_Response() {}
+
+func (*WorkerResponse_ResultAck) isWorkerResponse_Response() {}
 
 type WorkerHello struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -1119,6 +1190,75 @@ func (x *SignalAck) GetSignalId() string {
 	return ""
 }
 
+// Answer to a TaskResult. Workers keep a result until it is APPLIED or STALE.
+type ResultAck struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TaskId        string                 `protobuf:"bytes,1,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
+	TaskRunId     string                 `protobuf:"bytes,2,opt,name=task_run_id,json=taskRunId,proto3" json:"task_run_id,omitempty"`
+	Status        ResultStatus           `protobuf:"varint,3,opt,name=status,proto3,enum=valka.v1.ResultStatus" json:"status,omitempty"`
+	Message       string                 `protobuf:"bytes,4,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResultAck) Reset() {
+	*x = ResultAck{}
+	mi := &file_valka_v1_worker_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResultAck) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResultAck) ProtoMessage() {}
+
+func (x *ResultAck) ProtoReflect() protoreflect.Message {
+	mi := &file_valka_v1_worker_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResultAck.ProtoReflect.Descriptor instead.
+func (*ResultAck) Descriptor() ([]byte, []int) {
+	return file_valka_v1_worker_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *ResultAck) GetTaskId() string {
+	if x != nil {
+		return x.TaskId
+	}
+	return ""
+}
+
+func (x *ResultAck) GetTaskRunId() string {
+	if x != nil {
+		return x.TaskRunId
+	}
+	return ""
+}
+
+func (x *ResultAck) GetStatus() ResultStatus {
+	if x != nil {
+		return x.Status
+	}
+	return ResultStatus_RESULT_STATUS_UNSPECIFIED
+}
+
+func (x *ResultAck) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
 type CheckpointRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	TaskId        string                 `protobuf:"bytes,1,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
@@ -1131,7 +1271,7 @@ type CheckpointRequest struct {
 
 func (x *CheckpointRequest) Reset() {
 	*x = CheckpointRequest{}
-	mi := &file_valka_v1_worker_proto_msgTypes[15]
+	mi := &file_valka_v1_worker_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1143,7 +1283,7 @@ func (x *CheckpointRequest) String() string {
 func (*CheckpointRequest) ProtoMessage() {}
 
 func (x *CheckpointRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_valka_v1_worker_proto_msgTypes[15]
+	mi := &file_valka_v1_worker_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1156,7 +1296,7 @@ func (x *CheckpointRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CheckpointRequest.ProtoReflect.Descriptor instead.
 func (*CheckpointRequest) Descriptor() ([]byte, []int) {
-	return file_valka_v1_worker_proto_rawDescGZIP(), []int{15}
+	return file_valka_v1_worker_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *CheckpointRequest) GetTaskId() string {
@@ -1195,7 +1335,7 @@ type CheckpointResponse struct {
 
 func (x *CheckpointResponse) Reset() {
 	*x = CheckpointResponse{}
-	mi := &file_valka_v1_worker_proto_msgTypes[16]
+	mi := &file_valka_v1_worker_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1207,7 +1347,7 @@ func (x *CheckpointResponse) String() string {
 func (*CheckpointResponse) ProtoMessage() {}
 
 func (x *CheckpointResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_valka_v1_worker_proto_msgTypes[16]
+	mi := &file_valka_v1_worker_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1220,7 +1360,7 @@ func (x *CheckpointResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CheckpointResponse.ProtoReflect.Descriptor instead.
 func (*CheckpointResponse) Descriptor() ([]byte, []int) {
-	return file_valka_v1_worker_proto_rawDescGZIP(), []int{16}
+	return file_valka_v1_worker_proto_rawDescGZIP(), []int{17}
 }
 
 var File_valka_v1_worker_proto protoreflect.FileDescriptor
@@ -1237,14 +1377,16 @@ const file_valka_v1_worker_proto_rawDesc = "" +
 	"\bshutdown\x18\x05 \x01(\v2\x1a.valka.v1.GracefulShutdownH\x00R\bshutdown\x124\n" +
 	"\n" +
 	"signal_ack\x18\x06 \x01(\v2\x13.valka.v1.SignalAckH\x00R\tsignalAckB\t\n" +
-	"\arequest\"\xe9\x02\n" +
+	"\arequest\"\x9f\x03\n" +
 	"\x0eWorkerResponse\x12C\n" +
 	"\x0ftask_assignment\x18\x01 \x01(\v2\x18.valka.v1.TaskAssignmentH\x00R\x0etaskAssignment\x12I\n" +
 	"\x11task_cancellation\x18\x02 \x01(\v2\x1a.valka.v1.TaskCancellationH\x00R\x10taskCancellation\x12=\n" +
 	"\rheartbeat_ack\x18\x03 \x01(\v2\x16.valka.v1.HeartbeatAckH\x00R\fheartbeatAck\x12C\n" +
 	"\x0fserver_shutdown\x18\x04 \x01(\v2\x18.valka.v1.ServerShutdownH\x00R\x0eserverShutdown\x127\n" +
 	"\vtask_signal\x18\x05 \x01(\v2\x14.valka.v1.TaskSignalH\x00R\n" +
-	"taskSignalB\n" +
+	"taskSignal\x124\n" +
+	"\n" +
+	"result_ack\x18\x06 \x01(\v2\x13.valka.v1.ResultAckH\x00R\tresultAckB\n" +
 	"\n" +
 	"\bresponse\"\xa1\x01\n" +
 	"\vWorkerHello\x12\x1b\n" +
@@ -1308,13 +1450,23 @@ const file_valka_v1_worker_proto_rawDesc = "" +
 	"\apayload\x18\x04 \x01(\tR\apayload\x12!\n" +
 	"\ftimestamp_ms\x18\x05 \x01(\x03R\vtimestampMs\"(\n" +
 	"\tSignalAck\x12\x1b\n" +
-	"\tsignal_id\x18\x01 \x01(\tR\bsignalId\"x\n" +
+	"\tsignal_id\x18\x01 \x01(\tR\bsignalId\"\x8e\x01\n" +
+	"\tResultAck\x12\x17\n" +
+	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x1e\n" +
+	"\vtask_run_id\x18\x02 \x01(\tR\ttaskRunId\x12.\n" +
+	"\x06status\x18\x03 \x01(\x0e2\x16.valka.v1.ResultStatusR\x06status\x12\x18\n" +
+	"\amessage\x18\x04 \x01(\tR\amessage\"x\n" +
 	"\x11CheckpointRequest\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x1e\n" +
 	"\vtask_run_id\x18\x02 \x01(\tR\ttaskRunId\x12\x12\n" +
 	"\x04step\x18\x03 \x01(\tR\x04step\x12\x16\n" +
 	"\x06output\x18\x04 \x01(\tR\x06output\"\x14\n" +
-	"\x12CheckpointResponse2\x9a\x01\n" +
+	"\x12CheckpointResponse*z\n" +
+	"\fResultStatus\x12\x1d\n" +
+	"\x19RESULT_STATUS_UNSPECIFIED\x10\x00\x12\x19\n" +
+	"\x15RESULT_STATUS_APPLIED\x10\x01\x12\x17\n" +
+	"\x13RESULT_STATUS_STALE\x10\x02\x12\x17\n" +
+	"\x13RESULT_STATUS_RETRY\x10\x032\x9a\x01\n" +
 	"\rWorkerService\x12@\n" +
 	"\aSession\x12\x17.valka.v1.WorkerRequest\x1a\x18.valka.v1.WorkerResponse(\x010\x01\x12G\n" +
 	"\n" +
@@ -1332,51 +1484,56 @@ func file_valka_v1_worker_proto_rawDescGZIP() []byte {
 	return file_valka_v1_worker_proto_rawDescData
 }
 
-var file_valka_v1_worker_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
+var file_valka_v1_worker_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_valka_v1_worker_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
 var file_valka_v1_worker_proto_goTypes = []any{
-	(*WorkerRequest)(nil),      // 0: valka.v1.WorkerRequest
-	(*WorkerResponse)(nil),     // 1: valka.v1.WorkerResponse
-	(*WorkerHello)(nil),        // 2: valka.v1.WorkerHello
-	(*TaskResult)(nil),         // 3: valka.v1.TaskResult
-	(*Heartbeat)(nil),          // 4: valka.v1.Heartbeat
-	(*LogBatch)(nil),           // 5: valka.v1.LogBatch
-	(*LogEntry)(nil),           // 6: valka.v1.LogEntry
-	(*GracefulShutdown)(nil),   // 7: valka.v1.GracefulShutdown
-	(*TaskAssignment)(nil),     // 8: valka.v1.TaskAssignment
-	(*StepCheckpoint)(nil),     // 9: valka.v1.StepCheckpoint
-	(*TaskCancellation)(nil),   // 10: valka.v1.TaskCancellation
-	(*HeartbeatAck)(nil),       // 11: valka.v1.HeartbeatAck
-	(*ServerShutdown)(nil),     // 12: valka.v1.ServerShutdown
-	(*TaskSignal)(nil),         // 13: valka.v1.TaskSignal
-	(*SignalAck)(nil),          // 14: valka.v1.SignalAck
-	(*CheckpointRequest)(nil),  // 15: valka.v1.CheckpointRequest
-	(*CheckpointResponse)(nil), // 16: valka.v1.CheckpointResponse
-	(LogLevel)(0),              // 17: valka.v1.LogLevel
+	(ResultStatus)(0),          // 0: valka.v1.ResultStatus
+	(*WorkerRequest)(nil),      // 1: valka.v1.WorkerRequest
+	(*WorkerResponse)(nil),     // 2: valka.v1.WorkerResponse
+	(*WorkerHello)(nil),        // 3: valka.v1.WorkerHello
+	(*TaskResult)(nil),         // 4: valka.v1.TaskResult
+	(*Heartbeat)(nil),          // 5: valka.v1.Heartbeat
+	(*LogBatch)(nil),           // 6: valka.v1.LogBatch
+	(*LogEntry)(nil),           // 7: valka.v1.LogEntry
+	(*GracefulShutdown)(nil),   // 8: valka.v1.GracefulShutdown
+	(*TaskAssignment)(nil),     // 9: valka.v1.TaskAssignment
+	(*StepCheckpoint)(nil),     // 10: valka.v1.StepCheckpoint
+	(*TaskCancellation)(nil),   // 11: valka.v1.TaskCancellation
+	(*HeartbeatAck)(nil),       // 12: valka.v1.HeartbeatAck
+	(*ServerShutdown)(nil),     // 13: valka.v1.ServerShutdown
+	(*TaskSignal)(nil),         // 14: valka.v1.TaskSignal
+	(*SignalAck)(nil),          // 15: valka.v1.SignalAck
+	(*ResultAck)(nil),          // 16: valka.v1.ResultAck
+	(*CheckpointRequest)(nil),  // 17: valka.v1.CheckpointRequest
+	(*CheckpointResponse)(nil), // 18: valka.v1.CheckpointResponse
+	(LogLevel)(0),              // 19: valka.v1.LogLevel
 }
 var file_valka_v1_worker_proto_depIdxs = []int32{
-	2,  // 0: valka.v1.WorkerRequest.hello:type_name -> valka.v1.WorkerHello
-	3,  // 1: valka.v1.WorkerRequest.task_result:type_name -> valka.v1.TaskResult
-	4,  // 2: valka.v1.WorkerRequest.heartbeat:type_name -> valka.v1.Heartbeat
-	5,  // 3: valka.v1.WorkerRequest.log_batch:type_name -> valka.v1.LogBatch
-	7,  // 4: valka.v1.WorkerRequest.shutdown:type_name -> valka.v1.GracefulShutdown
-	14, // 5: valka.v1.WorkerRequest.signal_ack:type_name -> valka.v1.SignalAck
-	8,  // 6: valka.v1.WorkerResponse.task_assignment:type_name -> valka.v1.TaskAssignment
-	10, // 7: valka.v1.WorkerResponse.task_cancellation:type_name -> valka.v1.TaskCancellation
-	11, // 8: valka.v1.WorkerResponse.heartbeat_ack:type_name -> valka.v1.HeartbeatAck
-	12, // 9: valka.v1.WorkerResponse.server_shutdown:type_name -> valka.v1.ServerShutdown
-	13, // 10: valka.v1.WorkerResponse.task_signal:type_name -> valka.v1.TaskSignal
-	6,  // 11: valka.v1.LogBatch.entries:type_name -> valka.v1.LogEntry
-	17, // 12: valka.v1.LogEntry.level:type_name -> valka.v1.LogLevel
-	9,  // 13: valka.v1.TaskAssignment.checkpoints:type_name -> valka.v1.StepCheckpoint
-	0,  // 14: valka.v1.WorkerService.Session:input_type -> valka.v1.WorkerRequest
-	15, // 15: valka.v1.WorkerService.Checkpoint:input_type -> valka.v1.CheckpointRequest
-	1,  // 16: valka.v1.WorkerService.Session:output_type -> valka.v1.WorkerResponse
-	16, // 17: valka.v1.WorkerService.Checkpoint:output_type -> valka.v1.CheckpointResponse
-	16, // [16:18] is the sub-list for method output_type
-	14, // [14:16] is the sub-list for method input_type
-	14, // [14:14] is the sub-list for extension type_name
-	14, // [14:14] is the sub-list for extension extendee
-	0,  // [0:14] is the sub-list for field type_name
+	3,  // 0: valka.v1.WorkerRequest.hello:type_name -> valka.v1.WorkerHello
+	4,  // 1: valka.v1.WorkerRequest.task_result:type_name -> valka.v1.TaskResult
+	5,  // 2: valka.v1.WorkerRequest.heartbeat:type_name -> valka.v1.Heartbeat
+	6,  // 3: valka.v1.WorkerRequest.log_batch:type_name -> valka.v1.LogBatch
+	8,  // 4: valka.v1.WorkerRequest.shutdown:type_name -> valka.v1.GracefulShutdown
+	15, // 5: valka.v1.WorkerRequest.signal_ack:type_name -> valka.v1.SignalAck
+	9,  // 6: valka.v1.WorkerResponse.task_assignment:type_name -> valka.v1.TaskAssignment
+	11, // 7: valka.v1.WorkerResponse.task_cancellation:type_name -> valka.v1.TaskCancellation
+	12, // 8: valka.v1.WorkerResponse.heartbeat_ack:type_name -> valka.v1.HeartbeatAck
+	13, // 9: valka.v1.WorkerResponse.server_shutdown:type_name -> valka.v1.ServerShutdown
+	14, // 10: valka.v1.WorkerResponse.task_signal:type_name -> valka.v1.TaskSignal
+	16, // 11: valka.v1.WorkerResponse.result_ack:type_name -> valka.v1.ResultAck
+	7,  // 12: valka.v1.LogBatch.entries:type_name -> valka.v1.LogEntry
+	19, // 13: valka.v1.LogEntry.level:type_name -> valka.v1.LogLevel
+	10, // 14: valka.v1.TaskAssignment.checkpoints:type_name -> valka.v1.StepCheckpoint
+	0,  // 15: valka.v1.ResultAck.status:type_name -> valka.v1.ResultStatus
+	1,  // 16: valka.v1.WorkerService.Session:input_type -> valka.v1.WorkerRequest
+	17, // 17: valka.v1.WorkerService.Checkpoint:input_type -> valka.v1.CheckpointRequest
+	2,  // 18: valka.v1.WorkerService.Session:output_type -> valka.v1.WorkerResponse
+	18, // 19: valka.v1.WorkerService.Checkpoint:output_type -> valka.v1.CheckpointResponse
+	18, // [18:20] is the sub-list for method output_type
+	16, // [16:18] is the sub-list for method input_type
+	16, // [16:16] is the sub-list for extension type_name
+	16, // [16:16] is the sub-list for extension extendee
+	0,  // [0:16] is the sub-list for field type_name
 }
 
 func init() { file_valka_v1_worker_proto_init() }
@@ -1399,19 +1556,21 @@ func file_valka_v1_worker_proto_init() {
 		(*WorkerResponse_HeartbeatAck)(nil),
 		(*WorkerResponse_ServerShutdown)(nil),
 		(*WorkerResponse_TaskSignal)(nil),
+		(*WorkerResponse_ResultAck)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_valka_v1_worker_proto_rawDesc), len(file_valka_v1_worker_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   17,
+			NumEnums:      1,
+			NumMessages:   18,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
 		GoTypes:           file_valka_v1_worker_proto_goTypes,
 		DependencyIndexes: file_valka_v1_worker_proto_depIdxs,
+		EnumInfos:         file_valka_v1_worker_proto_enumTypes,
 		MessageInfos:      file_valka_v1_worker_proto_msgTypes,
 	}.Build()
 	File_valka_v1_worker_proto = out.File

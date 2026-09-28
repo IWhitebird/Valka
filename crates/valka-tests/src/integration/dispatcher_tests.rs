@@ -308,3 +308,54 @@ async fn test_retry_assignment_carries_checkpoints() {
     );
     h.abort();
 }
+
+async fn next_ack(
+    rx: &mut tokio::sync::mpsc::Receiver<valka_proto::WorkerResponse>,
+) -> valka_proto::ResultAck {
+    loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("an answer")
+            .expect("stream open");
+        if let Some(valka_proto::worker_response::Response::ResultAck(ack)) = msg.response {
+            return ack;
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_every_result_is_answered_with_a_result_ack() {
+    use valka_proto::ResultStatus;
+    let node = TestNode::new().await;
+    let (wid, mut rx) = node.register_worker(&["q"], 1).await;
+    let t = node.create("q", "t").await;
+    let run = node.start(&t.id, &wid.0);
+
+    let ok = result(&t.id, &run, true, false, r#"{"n":1}"#, "");
+    node.dispatcher.handle_task_result(&wid, ok.clone()).await;
+    let ack = next_ack(&mut rx).await;
+    assert_eq!(ack.status, ResultStatus::Applied as i32);
+    assert_eq!(
+        (ack.task_id.as_str(), ack.task_run_id.as_str()),
+        (t.id.as_str(), run.as_str())
+    );
+
+    node.dispatcher.handle_task_result(&wid, ok).await;
+    assert_eq!(
+        next_ack(&mut rx).await.status,
+        ResultStatus::Applied as i32,
+        "a resend is idempotent"
+    );
+
+    let c = node.create("q", "t").await;
+    let crun = node.start(&c.id, &wid.0);
+    node.engine.cancel_task(&c.id, "user").await.unwrap();
+    node.dispatcher
+        .handle_task_result(&wid, result(&c.id, &crun, true, false, "", ""))
+        .await;
+    assert_eq!(next_ack(&mut rx).await.status, ResultStatus::Stale as i32);
+    assert_eq!(
+        node.engine.get_task(&c.id).unwrap().status,
+        TaskStatus::Cancelled
+    );
+}

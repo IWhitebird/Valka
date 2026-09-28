@@ -1159,3 +1159,144 @@ async fn zero_log_budget_leaves_rounds_to_the_interval() {
     settle().await;
     assert!(store.list("snapshots/").await.unwrap().is_empty());
 }
+
+fn completed(v: serde_json::Value) -> crate::RunResult {
+    crate::RunResult::Completed(Some(v))
+}
+
+fn failed(error: &str) -> crate::RunResult {
+    crate::RunResult::Failed {
+        error: error.into(),
+        retryable: true,
+    }
+}
+
+async fn records_of(store: &Store, kind: &str) -> usize {
+    reader::read_all(store, "node-a", None)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|(_, r)| r.record.kind() == kind)
+        .count()
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_results_are_applied_once() {
+    use crate::ResultOutcome::Applied;
+    let store = Store::memory();
+    let e = open(&store).await;
+
+    let t = e.create_task(create("q")).await.unwrap();
+    let d = e.dispatch(&t.id, "w").unwrap();
+    assert_eq!(
+        e.report_result(&t.id, &d.run_id, completed(serde_json::json!(1)))
+            .await,
+        Applied
+    );
+    assert_eq!(
+        e.report_result(&t.id, &d.run_id, completed(serde_json::json!(1)))
+            .await,
+        Applied
+    );
+    assert_eq!(e.get_task(&t.id).unwrap().status, TaskStatus::Completed);
+
+    let f = e.create_task(create("q")).await.unwrap();
+    let df = e.dispatch(&f.id, "w").unwrap();
+    assert_eq!(
+        e.report_result(&f.id, &df.run_id, failed("boom")).await,
+        Applied
+    );
+    assert_eq!(
+        e.report_result(&f.id, &df.run_id, failed("boom")).await,
+        Applied
+    );
+    let v = e.get_task(&f.id).unwrap();
+    assert_eq!(v.status, TaskStatus::Retry);
+    assert_eq!(
+        v.attempt_count, 1,
+        "a resent failure does not spend another attempt"
+    );
+
+    e.sync().await.unwrap();
+    assert_eq!(records_of(&store, "run_completed").await, 1);
+    assert_eq!(records_of(&store, "run_failed").await, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn results_for_runs_that_ended_otherwise_are_stale() {
+    use crate::ResultOutcome::Stale;
+    let store = Store::memory();
+    let e = open(&store).await;
+
+    let mut req = create("q");
+    req.timeout_seconds = 5;
+    let expired = e.create_task(req).await.unwrap();
+    let de = e.dispatch(&expired.id, "w").unwrap();
+    tokio::time::advance(Duration::from_secs(36)).await;
+    settle().await;
+    assert_eq!(e.get_task(&expired.id).unwrap().status, TaskStatus::Retry);
+    assert_eq!(
+        e.report_result(&expired.id, &de.run_id, completed(serde_json::json!(1)))
+            .await,
+        Stale,
+        "a completion after lease expiry is not recorded"
+    );
+    assert_eq!(
+        e.report_result(&expired.id, &de.run_id, failed("late"))
+            .await,
+        Stale
+    );
+
+    let cancelled = e.create_task(create("q")).await.unwrap();
+    let dc = e.dispatch(&cancelled.id, "w").unwrap();
+    e.cancel_task(&cancelled.id, "user").await.unwrap();
+    assert_eq!(
+        e.report_result(&cancelled.id, &dc.run_id, failed("x"))
+            .await,
+        Stale
+    );
+
+    let deleted = e.create_task(create("q")).await.unwrap();
+    let dd = e.dispatch(&deleted.id, "w").unwrap();
+    e.delete_task(&deleted.id).await.unwrap();
+    assert_eq!(
+        e.report_result(&deleted.id, &dd.run_id, completed(serde_json::json!(1)))
+            .await,
+        Stale
+    );
+    assert_eq!(
+        e.get_task(&cancelled.id).unwrap().status,
+        TaskStatus::Cancelled
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn results_that_cannot_be_made_durable_are_retried() {
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let (store, faults) = faulty_over(backing, 9);
+    let mut cfg = EngineConfig::for_tests("node-a");
+    cfg.wal.put_retries = 0;
+    let e = Engine::open_with(
+        store.clone(),
+        cfg,
+        TokioClock::new(),
+        Arc::new(crate::sink::NoopSink),
+    )
+    .await
+    .unwrap();
+    let t = e.create_task(create("q")).await.unwrap();
+    let d = e.dispatch(&t.id, "w").unwrap();
+    faults.set_puts_down(true);
+    assert_eq!(
+        e.report_result(&t.id, &d.run_id, completed(serde_json::json!(1)))
+            .await,
+        crate::ResultOutcome::Retry
+    );
+    assert_eq!(
+        e.report_result(&t.id, &d.run_id, completed(serde_json::json!(1)))
+            .await,
+        crate::ResultOutcome::Retry,
+        "RAM already shows the run completed, but that is not durable: never answer Applied"
+    );
+}

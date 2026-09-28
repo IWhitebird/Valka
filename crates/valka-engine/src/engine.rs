@@ -94,6 +94,24 @@ pub struct FailResult {
     pub outcome: FailureOutcome,
 }
 
+/// What a worker reports for a run.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunResult {
+    Completed(Option<Value>),
+    Failed { error: String, retryable: bool },
+}
+
+/// The answer to a reported result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultOutcome {
+    /// Durable: recorded now, or by an earlier delivery of the same result.
+    Applied,
+    /// The run already ended another way; the result was not recorded.
+    Stale,
+    /// Not recorded; report it again later.
+    Retry,
+}
+
 /// Runnable tasks ordered by priority desc, then creation order.
 pub(crate) type PendingKey = (i32, i64, String);
 /// task_id -> (shard, run_id, lease_until) awaiting a coalesced `LeaseExtended` record.

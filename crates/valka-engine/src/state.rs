@@ -31,6 +31,15 @@ impl RunStatus {
     }
 }
 
+/// How a run left RUNNING.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RunEnd {
+    Completed,
+    Failed,
+    Expired,
+    Cancelled,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunState {
     pub id: String,
@@ -44,6 +53,8 @@ pub struct RunState {
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub last_heartbeat: DateTime<Utc>,
+    #[serde(default)]
+    pub ended_by: Option<RunEnd>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

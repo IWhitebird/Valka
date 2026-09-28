@@ -5,8 +5,8 @@ use serde_json::Value;
 use valka_core::{ServerError, ShardId, TaskStatus, shard_of_task_id};
 use valka_wal::{TaskSpec, WalRecord};
 
-use crate::engine::{CreateTask, DispatchInfo, Engine, FailResult};
-use crate::state::RunStatus;
+use crate::engine::{CreateTask, DispatchInfo, Engine, FailResult, ResultOutcome, RunResult};
+use crate::state::{RunEnd, RunStatus};
 use crate::timers::TimerKind;
 use crate::view::{DeadLetterView, RunView, TaskView};
 use crate::write_path::{decide_outcome, dispatchable, ensure_running};
@@ -328,6 +328,55 @@ impl Engine {
         durable.wait().await?;
         self.after_durable(&transitions);
         Ok(FailResult { outcome })
+    }
+
+    /// Record a worker's result idempotently. A result that cannot be recorded because the
+    /// run already ended is `Applied` if it ended exactly this way, `Stale` otherwise. Both
+    /// answers are given only once the state they describe is durable.
+    pub async fn report_result(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        result: RunResult,
+    ) -> ResultOutcome {
+        let recorded = match &result {
+            RunResult::Completed(output) => self
+                .complete_run(task_id, run_id, output.clone())
+                .await
+                .map(|_| ()),
+            RunResult::Failed { error, retryable } => self
+                .fail_run(task_id, run_id, error, *retryable)
+                .await
+                .map(|_| ()),
+        };
+        match recorded {
+            Ok(()) => ResultOutcome::Applied,
+            Err(e) if e.is_transient() => ResultOutcome::Retry,
+            Err(_) => {
+                let same = matches!(
+                    (self.run_end(task_id, run_id), &result),
+                    (Some(RunEnd::Completed), RunResult::Completed(_))
+                        | (Some(RunEnd::Failed), RunResult::Failed { .. })
+                );
+                match self.sync().await {
+                    Err(_) => ResultOutcome::Retry,
+                    Ok(_) if same => ResultOutcome::Applied,
+                    Ok(_) => ResultOutcome::Stale,
+                }
+            }
+        }
+    }
+
+    fn run_end(&self, task_id: &str, run_id: &str) -> Option<RunEnd> {
+        let shard = shard_of_task_id(task_id)?;
+        self.inner.shards[shard.0 as usize]
+            .lock()
+            .tasks
+            .get(task_id)?
+            .runs
+            .iter()
+            .find(|r| r.id == run_id)?
+            .ended_by
     }
 
     /// Extend leases in RAM now; the WAL record is coalesced by the ticker.

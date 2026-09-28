@@ -39,6 +39,19 @@ pub enum ServerError {
     Internal(String),
 }
 
+impl ServerError {
+    /// The operation may succeed if retried later: storage trouble or ownership in flux.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            ServerError::NotOwner(_)
+                | ServerError::Unavailable(_)
+                | ServerError::Storage(_)
+                | ServerError::Internal(_)
+        )
+    }
+}
+
 impl From<ServerError> for tonic::Status {
     fn from(err: ServerError) -> Self {
         match &err {

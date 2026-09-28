@@ -30,13 +30,13 @@ end-to-end with the Rust SDK, incl. server crash/restart), MinIO-gated 2.
       `GET /api/v1/tasks/{id}/checkpoints`, Steps table on the task page. DESIGN.md §16.
 - [x] SDKs: `step`/`checkpoint` in Rust, TypeScript, Go and Python; `steps` example per language.
 
-Test inventory now: valka-wal 23, valka-engine 35, valka-tests 257, web 22, Go SDK 5, Python SDK 5.
+Test inventory now: valka-wal 25, valka-engine 42, valka-tests 265, web 22, Go SDK 9, Python SDK 11.
 
 ## Phase 2 — cluster
 
 Design, decisions and milestones: [`PHASE2.md`](PHASE2.md).
 
-- [ ] M0 Phase-1 hardening: snapshot durability fix, `AlreadyExists` read-back, end-to-end result acks, exit on poison, log budget.
+- [x] M0 Phase-1 hardening: snapshot durability fix, `AlreadyExists` read-back, end-to-end result acks in all four SDKs, non-blocking SDK receive loops, worker drain and server-restart protocol, exit on poison, log budget.
 - [ ] M1 TLA+ model of leases, ownership, sealing, splitting and GC; TLC in CI.
 - [ ] M2 Formats: `cluster.json`, 16-bit shard ids, `gen` in records, sealable segments, `owners/`, `nodes/`, new snapshot keys.
 - [ ] M3 One node on the full protocol: incarnations, lease fencing, per-shard claim/release/split.

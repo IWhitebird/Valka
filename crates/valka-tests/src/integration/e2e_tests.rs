@@ -316,3 +316,117 @@ async fn e2e_retry_resumes_after_the_last_checkpointed_step() {
     let _ = server.shutdown.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), server.handle).await;
 }
+
+#[tokio::test]
+async fn e2e_result_finished_while_server_down_is_resent_and_applied_once() {
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let store = Store::wrap(backing, "", true, "shared-memory");
+    let port = free_port().await;
+    let server = start_server(store.clone(), "resend", port).await;
+
+    let runs = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (r, gate) = (runs.clone(), release.clone());
+    let worker = ValkaWorker::builder()
+        .name("resend-worker")
+        .server_addr(&server.addr)
+        .queues(&["q"])
+        .handler(move |_ctx| {
+            let (r, gate) = (r.clone(), gate.clone());
+            async move {
+                r.fetch_add(1, Ordering::SeqCst);
+                gate.notified().await;
+                Ok(serde_json::json!({"done": true}))
+            }
+        })
+        .build()
+        .await
+        .unwrap();
+    let stop = worker.shutdown_handle();
+    let worker_task = tokio::spawn(worker.run());
+
+    let mut client = ValkaClient::connect(&server.addr).await.unwrap();
+    let id = client.create_task("q", "t", None).await.unwrap().id;
+    wait_status(&mut client, &id, 3, Duration::from_secs(10)).await;
+    server.node.engine.sync().await.unwrap();
+
+    let _ = server.shutdown.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), server.handle).await;
+    drop(server.node);
+    drop(client);
+    release.notify_one();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let server = start_server(store, "resend", port).await;
+    let mut client = ValkaClient::connect(&server.addr).await.unwrap();
+    let t = wait_status(&mut client, &id, 4, Duration::from_secs(15)).await;
+    assert_eq!(t.attempt_count, 1, "the task was not re-run");
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the handler ran exactly once"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&t.output).unwrap(),
+        serde_json::json!({"done": true})
+    );
+
+    stop.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker_task).await;
+    let _ = server.shutdown.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), server.handle).await;
+}
+
+#[tokio::test]
+async fn e2e_graceful_worker_shutdown_delivers_in_flight_results() {
+    let port = free_port().await;
+    let server = start_server(Store::memory(), "drain", port).await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let s = started.clone();
+    let worker = ValkaWorker::builder()
+        .name("drain-worker")
+        .server_addr(&server.addr)
+        .queues(&["q"])
+        .handler(move |_ctx| {
+            let s = s.clone();
+            async move {
+                s.notify_one();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                Ok(serde_json::json!({"drained": true}))
+            }
+        })
+        .build()
+        .await
+        .unwrap();
+    let stop = worker.shutdown_handle();
+    let worker_task = tokio::spawn(worker.run());
+
+    let mut client = ValkaClient::connect(&server.addr).await.unwrap();
+    let id = client.create_task("q", "t", None).await.unwrap().id;
+    started.notified().await;
+    stop.shutdown();
+
+    let exited = tokio::time::timeout(Duration::from_secs(10), worker_task).await;
+    assert!(
+        matches!(exited, Ok(Ok(Ok(())))),
+        "worker exits cleanly: {exited:?}"
+    );
+    let t = client.get_task(&id).await.unwrap();
+    assert_eq!(
+        t.status, 4,
+        "the in-flight task completed before the worker left"
+    );
+    assert_eq!(t.attempt_count, 1);
+
+    let other = client.create_task("q", "t", None).await.unwrap().id;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        client.get_task(&other).await.unwrap().status,
+        1,
+        "a drained worker receives no new tasks"
+    );
+
+    let _ = server.shutdown.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), server.handle).await;
+}

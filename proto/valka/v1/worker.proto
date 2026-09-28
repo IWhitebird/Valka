@@ -31,6 +31,7 @@ message WorkerResponse {
         HeartbeatAck heartbeat_ack = 3;
         ServerShutdown server_shutdown = 4;
         TaskSignal task_signal = 5;
+        ResultAck result_ack = 6;
     }
 }
 
@@ -119,6 +120,24 @@ message TaskSignal {
 
 message SignalAck {
     string signal_id = 1;
+}
+
+// Answer to a TaskResult. Workers keep a result until it is APPLIED or STALE.
+message ResultAck {
+    string task_id = 1;
+    string task_run_id = 2;
+    ResultStatus status = 3;
+    string message = 4;
+}
+
+enum ResultStatus {
+    RESULT_STATUS_UNSPECIFIED = 0;
+    // The result is durable, now or from an earlier delivery of the same result.
+    RESULT_STATUS_APPLIED = 1;
+    // The run already ended another way (lease expired, cancelled, deleted); not recorded.
+    RESULT_STATUS_STALE = 2;
+    // Not recorded yet; send it again.
+    RESULT_STATUS_RETRY = 3;
 }
 
 // --- Checkpoints ---

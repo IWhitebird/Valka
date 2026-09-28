@@ -25,7 +25,10 @@ mod write_path;
 
 pub use checkpoints::{MAX_CHECKPOINT_BYTES, MAX_CHECKPOINTS_PER_TASK, MAX_STEP_NAME_LEN};
 pub use clock::{Clock, TokioClock};
-pub use engine::{CreateTask, DispatchInfo, Engine, EngineConfig, EngineEvent, FailResult};
+pub use engine::{
+    CreateTask, DispatchInfo, Engine, EngineConfig, EngineEvent, FailResult, ResultOutcome,
+    RunResult,
+};
 pub use ingest::LogIngester;
 pub use sink::{DispatchableTask, NoopSink, OfferOutcome, TaskSink};
 pub use stats::{NodeStats, ShardDetail, ShardStats, TaskCounts};

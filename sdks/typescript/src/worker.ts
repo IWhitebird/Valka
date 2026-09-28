@@ -4,8 +4,11 @@ import { TaskContext } from "./context.js";
 import { ConnectionError, HandlerError } from "./errors.js";
 import {
   CheckpointRequest,
+  ResultStatus,
   WorkerServiceDefinition,
   type DeepPartial,
+  type ResultAck,
+  type TaskResult,
   type WorkerRequest,
 } from "./generated/valka/v1/worker.js";
 import { RetryPolicy } from "./retry.js";
@@ -59,6 +62,8 @@ function createMessageChannel<T>(): MessageChannel<T> {
   };
 }
 
+const RESULT_RETRY_DELAY_MS = 1_000;
+
 export class ValkaWorker {
   private readonly workerId: string;
   private readonly name: string;
@@ -69,6 +74,15 @@ export class ValkaWorker {
   private readonly metadataStr: string;
   private shutdownResolve: (() => void) | null = null;
   private readonly shutdownPromise: Promise<void>;
+
+  // Survive reconnects: tasks running or awaiting a result ack (heartbeated on whichever
+  // connection is current), results not yet acknowledged, and the current connection.
+  private readonly running = new Set<string>();
+  private readonly unacked = new Map<string, TaskResult>();
+  private readonly taskContexts = new Map<string, TaskContext>();
+  private outbound: ((msg: DeepPartial<WorkerRequest>) => void) | null = null;
+  private activeCount = 0;
+  private readonly slotWaiters: Array<() => void> = [];
 
   private constructor(options: ValkaWorkerOptions) {
     this.workerId = randomUUID();
@@ -88,6 +102,47 @@ export class ValkaWorker {
       this.shutdownResolve();
       this.shutdownResolve = null;
     }
+  }
+
+  private acquireSlot(): Promise<void> {
+    if (this.activeCount < this.concurrency) {
+      this.activeCount++;
+      return Promise.resolve();
+    }
+    return new Promise<void>((res) => this.slotWaiters.push(res));
+  }
+
+  private releaseSlot(): void {
+    const next = this.slotWaiters.shift();
+    if (next) {
+      next();
+    } else {
+      this.activeCount--;
+    }
+  }
+
+  /** Keep the result until it is APPLIED or STALE; a later connection resends it. */
+  private deliver(result: TaskResult): void {
+    this.unacked.set(result.taskRunId, result);
+    this.outbound?.({ taskResult: result });
+  }
+
+  private onResultAck(ack: ResultAck): void {
+    const stale = ack.status === ResultStatus.RESULT_STATUS_STALE;
+    if (stale || ack.status === ResultStatus.RESULT_STATUS_APPLIED) {
+      if (stale) {
+        console.warn(
+          `[valka] Result for ${ack.taskId} not recorded: the run already ended another way`,
+        );
+      }
+      this.unacked.delete(ack.taskRunId);
+      this.running.delete(ack.taskId);
+      return;
+    }
+    setTimeout(() => {
+      const pending = this.unacked.get(ack.taskRunId);
+      if (pending) this.outbound?.({ taskResult: pending });
+    }, RESULT_RETRY_DELAY_MS);
   }
 
   static builder(): ValkaWorkerBuilder {
@@ -130,27 +185,7 @@ export class ValkaWorker {
     );
 
     let gracefulShutdown = false;
-    const activeTasks = new Set<string>();
-    const taskContexts = new Map<string, TaskContext>();
-    let activeCount = 0;
-    const pendingResolves: Array<() => void> = [];
-
-    // Semaphore-like concurrency control
-    const acquireSlot = (): Promise<void> => {
-      if (activeCount < this.concurrency) {
-        activeCount++;
-        return Promise.resolve();
-      }
-      return new Promise<void>((res) => pendingResolves.push(res));
-    };
-    const releaseSlot = (): void => {
-      if (pendingResolves.length > 0) {
-        const next = pendingResolves.shift()!;
-        next();
-      } else {
-        activeCount--;
-      }
-    };
+    let serverStopping = false;
 
     const send = (msg: DeepPartial<WorkerRequest>): void => {
       requests.send(msg);
@@ -167,11 +202,17 @@ export class ValkaWorker {
       },
     });
 
-    // Heartbeat every 10 seconds
+    // Register this connection before resending: a result delivered concurrently is
+    // then either in the resend below or sent on this connection.
+    this.outbound = send;
+    for (const result of this.unacked.values()) {
+      send({ taskResult: result });
+    }
+
     const heartbeatInterval = setInterval(() => {
       send({
         heartbeat: {
-          activeTaskIds: Array.from(activeTasks),
+          activeTaskIds: Array.from(this.running),
           timestampMs: Date.now(),
         },
       });
@@ -185,7 +226,7 @@ export class ValkaWorker {
       send({ shutdown: { reason: "SIGINT" } });
 
       const checkDrained = setInterval(() => {
-        if (activeTasks.size === 0) {
+        if (this.running.size === 0) {
           clearInterval(checkDrained);
           requests.close();
         }
@@ -203,6 +244,7 @@ export class ValkaWorker {
     this.shutdownPromise.then(shutdownHandler);
 
     const cleanup = () => {
+      this.outbound = null;
       clearInterval(heartbeatInterval);
       process.removeListener("SIGINT", shutdownHandler);
       process.removeListener("SIGTERM", shutdownHandler);
@@ -215,9 +257,9 @@ export class ValkaWorker {
       for await (const response of client.session(requests as any)) {
         if (response.taskAssignment) {
           const assignment = response.taskAssignment;
-          activeTasks.add(assignment.taskId);
+          this.running.add(assignment.taskId);
 
-          acquireSlot().then(async () => {
+          this.acquireSlot().then(async () => {
             const ctx = new TaskContext(
               assignment.taskId,
               assignment.taskRunId,
@@ -240,55 +282,52 @@ export class ValkaWorker {
                 await client.checkpoint(request as never);
               },
             );
-            taskContexts.set(assignment.taskId, ctx);
+            this.taskContexts.set(assignment.taskId, ctx);
 
+            let result: TaskResult;
             try {
               const output = await this.handler(ctx);
-              send({
-                taskResult: {
-                  taskId: assignment.taskId,
-                  taskRunId: assignment.taskRunId,
-                  success: true,
-                  retryable: false,
-                  output: output != null ? JSON.stringify(output) : "",
-                  errorMessage: "",
-                },
-              });
+              result = {
+                taskId: assignment.taskId,
+                taskRunId: assignment.taskRunId,
+                success: true,
+                retryable: false,
+                output: output != null ? JSON.stringify(output) : "",
+                errorMessage: "",
+              };
             } catch (err) {
-              const isRetryable = err instanceof HandlerError ? err.retryable : true;
-              const errorMessage = err instanceof Error ? err.message : String(err);
-              send({
-                taskResult: {
-                  taskId: assignment.taskId,
-                  taskRunId: assignment.taskRunId,
-                  success: false,
-                  retryable: isRetryable,
-                  output: "",
-                  errorMessage,
-                },
-              });
-            } finally {
-              activeTasks.delete(assignment.taskId);
-              taskContexts.delete(assignment.taskId);
-              releaseSlot();
+              result = {
+                taskId: assignment.taskId,
+                taskRunId: assignment.taskRunId,
+                success: false,
+                retryable: err instanceof HandlerError ? err.retryable : true,
+                output: "",
+                errorMessage: err instanceof Error ? err.message : String(err),
+              };
             }
+            this.taskContexts.delete(assignment.taskId);
+            this.releaseSlot();
+            this.deliver(result);
           });
         } else if (response.taskSignal) {
           const signal = response.taskSignal;
-          const ctx = taskContexts.get(signal.taskId);
+          const ctx = this.taskContexts.get(signal.taskId);
           if (ctx) {
             ctx._deliverSignal(signal);
           }
         } else if (response.taskCancellation) {
           const cancel = response.taskCancellation;
           console.log(`[valka] Task cancelled: ${cancel.taskId} (${cancel.reason})`);
-          activeTasks.delete(cancel.taskId);
-          taskContexts.delete(cancel.taskId);
+          this.running.delete(cancel.taskId);
+          this.taskContexts.delete(cancel.taskId);
+        } else if (response.resultAck) {
+          this.onResultAck(response.resultAck);
         } else if (response.heartbeatAck) {
           // No-op
         } else if (response.serverShutdown) {
           const shutdown = response.serverShutdown;
           console.log(`[valka] Server shutting down: ${shutdown.reason}`);
+          serverStopping = true;
           break;
         }
       }
@@ -301,6 +340,9 @@ export class ValkaWorker {
     cleanup();
     requests.close();
     channel.close();
+    if (serverStopping && !gracefulShutdown) {
+      throw new ConnectionError("server shutting down");
+    }
   }
 }
 

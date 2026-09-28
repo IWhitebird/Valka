@@ -11,6 +11,54 @@ import { LogLevel, logLevelFromJSON, logLevelToJSON } from "./common.js";
 
 export const protobufPackage = "valka.v1";
 
+export enum ResultStatus {
+  RESULT_STATUS_UNSPECIFIED = 0,
+  /** RESULT_STATUS_APPLIED - The result is durable, now or from an earlier delivery of the same result. */
+  RESULT_STATUS_APPLIED = 1,
+  /** RESULT_STATUS_STALE - The run already ended another way (lease expired, cancelled, deleted); not recorded. */
+  RESULT_STATUS_STALE = 2,
+  /** RESULT_STATUS_RETRY - Not recorded yet; send it again. */
+  RESULT_STATUS_RETRY = 3,
+  UNRECOGNIZED = -1,
+}
+
+export function resultStatusFromJSON(object: any): ResultStatus {
+  switch (object) {
+    case 0:
+    case "RESULT_STATUS_UNSPECIFIED":
+      return ResultStatus.RESULT_STATUS_UNSPECIFIED;
+    case 1:
+    case "RESULT_STATUS_APPLIED":
+      return ResultStatus.RESULT_STATUS_APPLIED;
+    case 2:
+    case "RESULT_STATUS_STALE":
+      return ResultStatus.RESULT_STATUS_STALE;
+    case 3:
+    case "RESULT_STATUS_RETRY":
+      return ResultStatus.RESULT_STATUS_RETRY;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return ResultStatus.UNRECOGNIZED;
+  }
+}
+
+export function resultStatusToJSON(object: ResultStatus): string {
+  switch (object) {
+    case ResultStatus.RESULT_STATUS_UNSPECIFIED:
+      return "RESULT_STATUS_UNSPECIFIED";
+    case ResultStatus.RESULT_STATUS_APPLIED:
+      return "RESULT_STATUS_APPLIED";
+    case ResultStatus.RESULT_STATUS_STALE:
+      return "RESULT_STATUS_STALE";
+    case ResultStatus.RESULT_STATUS_RETRY:
+      return "RESULT_STATUS_RETRY";
+    case ResultStatus.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 /** Worker -> Server */
 export interface WorkerRequest {
   hello?: WorkerHello | undefined;
@@ -28,6 +76,7 @@ export interface WorkerResponse {
   heartbeatAck?: HeartbeatAck | undefined;
   serverShutdown?: ServerShutdown | undefined;
   taskSignal?: TaskSignal | undefined;
+  resultAck?: ResultAck | undefined;
 }
 
 export interface WorkerHello {
@@ -118,6 +167,14 @@ export interface TaskSignal {
 
 export interface SignalAck {
   signalId: string;
+}
+
+/** Answer to a TaskResult. Workers keep a result until it is APPLIED or STALE. */
+export interface ResultAck {
+  taskId: string;
+  taskRunId: string;
+  status: ResultStatus;
+  message: string;
 }
 
 export interface CheckpointRequest {
@@ -309,6 +366,7 @@ function createBaseWorkerResponse(): WorkerResponse {
     heartbeatAck: undefined,
     serverShutdown: undefined,
     taskSignal: undefined,
+    resultAck: undefined,
   };
 }
 
@@ -328,6 +386,9 @@ export const WorkerResponse: MessageFns<WorkerResponse> = {
     }
     if (message.taskSignal !== undefined) {
       TaskSignal.encode(message.taskSignal, writer.uint32(42).fork()).join();
+    }
+    if (message.resultAck !== undefined) {
+      ResultAck.encode(message.resultAck, writer.uint32(50).fork()).join();
     }
     return writer;
   },
@@ -379,6 +440,14 @@ export const WorkerResponse: MessageFns<WorkerResponse> = {
           message.taskSignal = TaskSignal.decode(reader, reader.uint32());
           continue;
         }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.resultAck = ResultAck.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -415,6 +484,11 @@ export const WorkerResponse: MessageFns<WorkerResponse> = {
         : isSet(object.task_signal)
         ? TaskSignal.fromJSON(object.task_signal)
         : undefined,
+      resultAck: isSet(object.resultAck)
+        ? ResultAck.fromJSON(object.resultAck)
+        : isSet(object.result_ack)
+        ? ResultAck.fromJSON(object.result_ack)
+        : undefined,
     };
   },
 
@@ -434,6 +508,9 @@ export const WorkerResponse: MessageFns<WorkerResponse> = {
     }
     if (message.taskSignal !== undefined) {
       obj.taskSignal = TaskSignal.toJSON(message.taskSignal);
+    }
+    if (message.resultAck !== undefined) {
+      obj.resultAck = ResultAck.toJSON(message.resultAck);
     }
     return obj;
   },
@@ -457,6 +534,9 @@ export const WorkerResponse: MessageFns<WorkerResponse> = {
       : undefined;
     message.taskSignal = (object.taskSignal !== undefined && object.taskSignal !== null)
       ? TaskSignal.fromPartial(object.taskSignal)
+      : undefined;
+    message.resultAck = (object.resultAck !== undefined && object.resultAck !== null)
+      ? ResultAck.fromPartial(object.resultAck)
       : undefined;
     return message;
   },
@@ -1844,6 +1924,122 @@ export const SignalAck: MessageFns<SignalAck> = {
   fromPartial<I extends Exact<DeepPartial<SignalAck>, I>>(object: I): SignalAck {
     const message = createBaseSignalAck();
     message.signalId = object.signalId ?? "";
+    return message;
+  },
+};
+
+function createBaseResultAck(): ResultAck {
+  return { taskId: "", taskRunId: "", status: 0, message: "" };
+}
+
+export const ResultAck: MessageFns<ResultAck> = {
+  encode(message: ResultAck, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.taskId !== "") {
+      writer.uint32(10).string(message.taskId);
+    }
+    if (message.taskRunId !== "") {
+      writer.uint32(18).string(message.taskRunId);
+    }
+    if (message.status !== 0) {
+      writer.uint32(24).int32(message.status);
+    }
+    if (message.message !== "") {
+      writer.uint32(34).string(message.message);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ResultAck {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseResultAck();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.taskId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.taskRunId = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.status = reader.int32() as any;
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.message = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ResultAck {
+    return {
+      taskId: isSet(object.taskId)
+        ? globalThis.String(object.taskId)
+        : isSet(object.task_id)
+        ? globalThis.String(object.task_id)
+        : "",
+      taskRunId: isSet(object.taskRunId)
+        ? globalThis.String(object.taskRunId)
+        : isSet(object.task_run_id)
+        ? globalThis.String(object.task_run_id)
+        : "",
+      status: isSet(object.status) ? resultStatusFromJSON(object.status) : 0,
+      message: isSet(object.message) ? globalThis.String(object.message) : "",
+    };
+  },
+
+  toJSON(message: ResultAck): unknown {
+    const obj: any = {};
+    if (message.taskId !== "") {
+      obj.taskId = message.taskId;
+    }
+    if (message.taskRunId !== "") {
+      obj.taskRunId = message.taskRunId;
+    }
+    if (message.status !== 0) {
+      obj.status = resultStatusToJSON(message.status);
+    }
+    if (message.message !== "") {
+      obj.message = message.message;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<ResultAck>, I>>(base?: I): ResultAck {
+    return ResultAck.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ResultAck>, I>>(object: I): ResultAck {
+    const message = createBaseResultAck();
+    message.taskId = object.taskId ?? "";
+    message.taskRunId = object.taskRunId ?? "";
+    message.status = object.status ?? 0;
+    message.message = object.message ?? "";
     return message;
   },
 };

@@ -24,6 +24,7 @@ pub struct ApiServiceImpl {
 
 pub struct WorkerServiceImpl {
     dispatcher: DispatcherService,
+    shutdown: watch::Receiver<bool>,
 }
 
 fn parse_json(field: &str, s: &str) -> Result<Option<serde_json::Value>, Status> {
@@ -267,8 +268,15 @@ impl worker_service_server::WorkerService for WorkerServiceImpl {
         let (response_tx, response_rx) = mpsc::channel(256);
 
         let dispatcher = self.dispatcher.clone();
+        let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
-            valka_dispatcher::stream::handle_worker_stream(dispatcher, inbound, response_tx).await;
+            valka_dispatcher::stream::handle_worker_stream(
+                dispatcher,
+                inbound,
+                response_tx,
+                shutdown,
+            )
+            .await;
         });
 
         let stream = ReceiverStream::new(response_rx).map(Ok);
@@ -306,7 +314,10 @@ pub async fn serve_grpc(
         logs: logs.clone(),
     };
 
-    let worker_service = WorkerServiceImpl { dispatcher };
+    let worker_service = WorkerServiceImpl {
+        dispatcher,
+        shutdown: shutdown.clone(),
+    };
 
     let internal_service = InternalServiceImpl {
         engine,

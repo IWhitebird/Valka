@@ -46,7 +46,7 @@ cargo fmt --check                # Format check
 | `valka-server` | Binary: assembles all services (gRPC + REST + engine + log ingester) |
 | `valka-sdk` | Rust worker SDK: ValkaClient (task CRUD) + ValkaWorker (builder pattern, stream) |
 | `valka-cli` | CLI: `valka task create/get/list/cancel`, `valka logs tail` |
-| `valka-tests` | Unit + integration test suite (257 tests, plus MinIO-gated) |
+| `valka-tests` | Unit + integration test suite (265 tests, plus MinIO-gated) |
 | `examples/rs` | Rust examples (producer, worker, full_lifecycle, signal_demo, steps) |
 
 ## SDKs
@@ -100,6 +100,9 @@ Every arrow is a `WalRecord` (`TaskCreated`, `TaskDispatched`, `RunCompleted`, `
 ### Step Checkpoints
 A running run records completed steps via the unary `WorkerService.Checkpoint` RPC → `TaskCheckpointed` record (acked once durable). Only the task's current RUNNING run may checkpoint; `apply` re-checks this. Checkpoints live on `TaskState.checkpoints` (snapshotted with the task) and ride on every `TaskAssignment`, so SDK `step(name, fn)` skips steps a previous attempt finished. Limits in `valka_engine::MAX_*`. Spec: `docs/wal/DESIGN.md` §16. REST: `GET /api/v1/tasks/:id/checkpoints`.
 
+### Result delivery and drain
+Every `TaskResult` gets a `ResultAck` (APPLIED / STALE / RETRY) from `Engine::report_result`, which is idempotent and syncs the WAL before confirming an already-ended run. SDKs keep results until APPLIED or STALE, resend on reconnect, and heartbeat the task meanwhile. `GracefulShutdown` stops dispatch but keeps the stream for results; on server SIGTERM each worker stream gets `ServerShutdown` and workers reconnect. A poisoned WAL writer makes the server exit non-zero (`valka_server::server::wait_for_exit`). DESIGN.md §17.
+
 ### Task Signals
 Workers can receive signals on running tasks (e.g. progress requests, config updates). Signals flow through the dispatcher over the existing gRPC bidi stream:
 - `POST /api/v1/tasks/:id/signal` or gRPC `SendSignal` creates a signal
@@ -138,9 +141,9 @@ Dev default is `./data` via the `local` backend. MinIO for S3 semantics: `docker
 
 ```bash
 cargo test --workspace                                   # everything, no external services
-cargo test -p valka-wal                                  # 23: store, codec, writer under faults, snapshots, ownership
-cargo test -p valka-engine                               # 35: lifecycle, timers (paused time), recovery, checkpoints, crash/replay proptest
-cargo test -p valka-tests                                # 257: unit + REST + lifecycle + dispatcher + gRPC e2e with the SDK
+cargo test -p valka-wal                                  # 25: store, codec, writer under faults, snapshots, ownership
+cargo test -p valka-engine                               # 42: lifecycle, timers (paused time), recovery, checkpoints, results, log budget, crash/replay proptest
+cargo test -p valka-tests                                # 265: unit + REST + lifecycle + dispatcher + gRPC e2e with the SDK, server exit
 VALKA_TEST_S3_ENDPOINT=http://localhost:9000 AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
   cargo test -p valka-tests --features minio minio_    # real S3 conditional writes (bucket valka-test)
 ```

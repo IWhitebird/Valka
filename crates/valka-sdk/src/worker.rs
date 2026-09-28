@@ -2,9 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tracing::{error, info, warn};
@@ -94,6 +95,8 @@ impl ValkaWorkerBuilder {
             handler,
             metadata: self.metadata,
             shutdown: Arc::new(Notify::new()),
+            slots: Arc::new(Semaphore::new(self.concurrency.max(1) as usize)),
+            session: Arc::new(Session::default()),
         })
     }
 }
@@ -125,6 +128,72 @@ pub struct ValkaWorker {
     handler: TaskHandler,
     metadata: String,
     shutdown: Arc<Notify>,
+    slots: Arc<Semaphore>,
+    session: Arc<Session>,
+}
+
+/// State that outlives a single connection: tasks still running or awaiting a result ack
+/// (heartbeated on whichever connection is current), results the server has not yet
+/// acknowledged, and the current outbound channel.
+#[derive(Default)]
+struct Session {
+    running: Mutex<HashSet<String>>,
+    unacked: Mutex<HashMap<String, TaskResult>>,
+    signals: Mutex<HashMap<String, mpsc::Sender<TaskSignal>>>,
+    outbound: Mutex<Option<mpsc::Sender<WorkerRequest>>>,
+}
+
+const RESULT_RETRY_DELAY: Duration = Duration::from_secs(1);
+const SHUTDOWN_ACK_WAIT: Duration = Duration::from_secs(5);
+
+impl Session {
+    async fn send(&self, request: WorkerRequest) {
+        let tx = self.outbound.lock().await.clone();
+        if let Some(tx) = tx {
+            let _ = tx.send(request).await;
+        }
+    }
+
+    /// Keep the result until the server answers APPLIED or STALE; send it on the current
+    /// connection. A connection that comes up later resends everything still unacked.
+    async fn deliver(&self, result: TaskResult) {
+        self.unacked
+            .lock()
+            .await
+            .insert(result.task_run_id.clone(), result.clone());
+        self.send(result_request(result)).await;
+    }
+
+    async fn on_ack(self: &Arc<Self>, ack: ResultAck) {
+        match ResultStatus::try_from(ack.status).unwrap_or(ResultStatus::Unspecified) {
+            ResultStatus::Applied | ResultStatus::Stale => {
+                if ack.status == ResultStatus::Stale as i32 {
+                    warn!(
+                        task_id = %ack.task_id,
+                        "result not recorded: the run already ended another way"
+                    );
+                }
+                self.unacked.lock().await.remove(&ack.task_run_id);
+                self.running.lock().await.remove(&ack.task_id);
+            }
+            ResultStatus::Retry | ResultStatus::Unspecified => {
+                let session = self.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(RESULT_RETRY_DELAY).await;
+                    let pending = session.unacked.lock().await.get(&ack.task_run_id).cloned();
+                    if let Some(result) = pending {
+                        session.send(result_request(result)).await;
+                    }
+                });
+            }
+        }
+    }
+}
+
+fn result_request(result: TaskResult) -> WorkerRequest {
+    WorkerRequest {
+        request: Some(worker_request::Request::TaskResult(result)),
+    }
 }
 
 impl ValkaWorker {
@@ -163,25 +232,20 @@ impl ValkaWorker {
     async fn connect_and_run(&self, retry_policy: &mut RetryPolicy) -> Result<(), SdkError> {
         let channel = Channel::from_shared(self.server_addr.clone())
             .map_err(|e| SdkError::Connection(e.to_string()))?
-            .http2_keep_alive_interval(std::time::Duration::from_secs(10))
-            .keep_alive_timeout(std::time::Duration::from_secs(5))
+            .http2_keep_alive_interval(Duration::from_secs(10))
+            .keep_alive_timeout(Duration::from_secs(5))
             .keep_alive_while_idle(true)
             .connect()
             .await?;
 
         let mut client = WorkerServiceClient::new(channel);
-
-        // Set up bidirectional stream
         let (request_tx, request_rx) = mpsc::channel::<WorkerRequest>(256);
-        let outbound = ReceiverStream::new(request_rx);
-
-        let response = client.session(outbound).await?;
+        let response = client.session(ReceiverStream::new(request_rx)).await?;
         let mut inbound = response.into_inner();
 
         retry_policy.reset();
         info!(worker_id = %self.worker_id, name = %self.name, "Connected to server");
 
-        // Send hello
         let hello = WorkerRequest {
             request: Some(worker_request::Request::Hello(WorkerHello {
                 worker_id: self.worker_id.clone(),
@@ -196,23 +260,29 @@ impl ValkaWorker {
             .await
             .map_err(|_| SdkError::NotConnected)?;
 
-        // Shared active task tracking
-        let active_tasks: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-        // Signal senders for routing signals to task contexts
-        let signal_senders: Arc<Mutex<HashMap<String, mpsc::Sender<TaskSignal>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        // Register this connection before collecting unacked results: a result delivered
+        // concurrently is then either in the snapshot below or sent on this connection.
+        *self.session.outbound.lock().await = Some(request_tx.clone());
+        let unacked: Vec<TaskResult> = self
+            .session
+            .unacked
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        for result in unacked {
+            let _ = request_tx.send(result_request(result)).await;
+        }
 
-        // Start heartbeat loop
         let hb_tx = request_tx.clone();
-        let hb_active = active_tasks.clone();
+        let hb_session = self.session.clone();
         let hb_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 interval.tick().await;
-                let task_ids: Vec<String> = {
-                    let guard = hb_active.lock().await;
-                    guard.iter().cloned().collect()
-                };
+                let task_ids: Vec<String> =
+                    hb_session.running.lock().await.iter().cloned().collect();
                 let hb = WorkerRequest {
                     request: Some(worker_request::Request::Heartbeat(Heartbeat {
                         active_task_ids: task_ids,
@@ -225,149 +295,142 @@ impl ValkaWorker {
             }
         });
 
-        // Process incoming messages
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.concurrency as usize));
-
-        loop {
+        let mut draining: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = None;
+        let outcome = loop {
             tokio::select! {
                 msg = inbound.next() => {
                     match msg {
-                        Some(Ok(response)) => {
-                            match response.response {
-                                Some(worker_response::Response::TaskAssignment(assignment)) => {
-                                    // Track active task
-                                    {
-                                        let mut guard = active_tasks.lock().await;
-                                        guard.insert(assignment.task_id.clone());
-                                    }
-
-                                    // Create signal channel for this task
-                                    let (sig_tx, sig_rx) = mpsc::channel::<TaskSignal>(64);
-                                    {
-                                        let mut sigs = signal_senders.lock().await;
-                                        sigs.insert(assignment.task_id.clone(), sig_tx);
-                                    }
-
-                                    let permit = semaphore.clone().acquire_owned().await
-                                        .map_err(|_| SdkError::ShuttingDown)?;
-                                    let handler = self.handler.clone();
-                                    let tx = request_tx.clone();
-                                    let active = active_tasks.clone();
-                                    let sigs = signal_senders.clone();
-                                    let rpc = client.clone();
-                                    tokio::spawn(async move {
-                                        let task_id = assignment.task_id.clone();
-                                        let task_run_id = assignment.task_run_id.clone();
-
-                                        let ctx =
-                                            TaskContext::new(assignment, tx.clone(), sig_rx, rpc);
-
-                                        let result = handler(ctx).await;
-
-                                        let task_result = match result {
-                                            Ok(output) => TaskResult {
-                                                task_id: task_id.clone(),
-                                                task_run_id,
-                                                success: true,
-                                                retryable: false,
-                                                output: output.to_string(),
-                                                error_message: String::new(),
-                                            },
-                                            Err(err) => TaskResult {
-                                                task_id: task_id.clone(),
-                                                task_run_id,
-                                                success: false,
-                                                retryable: true,
-                                                output: String::new(),
-                                                error_message: err,
-                                            },
-                                        };
-
-                                        let request = WorkerRequest {
-                                            request: Some(worker_request::Request::TaskResult(task_result)),
-                                        };
-                                        let _ = tx.send(request).await;
-
-                                        // Remove from active tasks and signal senders
-                                        {
-                                            let mut guard = active.lock().await;
-                                            guard.remove(&task_id);
-                                        }
-                                        {
-                                            let mut guard = sigs.lock().await;
-                                            guard.remove(&task_id);
-                                        }
-
-                                        drop(permit);
-                                    });
-                                }
-                                Some(worker_response::Response::TaskCancellation(cancel)) => {
-                                    info!(task_id = %cancel.task_id, "Task cancelled by server");
-                                    // Remove from active tasks and signal senders
-                                    {
-                                        let mut guard = active_tasks.lock().await;
-                                        guard.remove(&cancel.task_id);
-                                    }
-                                    {
-                                        let mut guard = signal_senders.lock().await;
-                                        guard.remove(&cancel.task_id);
-                                    }
-                                }
-                                Some(worker_response::Response::TaskSignal(signal)) => {
-                                    let sigs = signal_senders.lock().await;
-                                    if let Some(tx) = sigs.get(&signal.task_id)
-                                        && tx.send(signal).await.is_err()
-                                    {
-                                        warn!("Signal channel closed for task");
-                                    }
-                                }
-                                Some(worker_response::Response::HeartbeatAck(_)) => {}
-                                Some(worker_response::Response::ServerShutdown(shutdown)) => {
-                                    info!(reason = %shutdown.reason, "Server shutting down");
-                                    break;
-                                }
-                                None => {}
+                        Some(Ok(response)) => match response.response {
+                            Some(worker_response::Response::TaskAssignment(assignment)) => {
+                                self.start_task(assignment, request_tx.clone(), client.clone())
+                                    .await;
                             }
-                        }
+                            Some(worker_response::Response::TaskCancellation(cancel)) => {
+                                info!(task_id = %cancel.task_id, "Task cancelled by server");
+                                self.session.running.lock().await.remove(&cancel.task_id);
+                                self.session.signals.lock().await.remove(&cancel.task_id);
+                            }
+                            Some(worker_response::Response::TaskSignal(signal)) => {
+                                let tx = self.session.signals.lock().await.get(&signal.task_id).cloned();
+                                if let Some(tx) = tx
+                                    && tx.send(signal).await.is_err()
+                                {
+                                    warn!("Signal channel closed for task");
+                                }
+                            }
+                            Some(worker_response::Response::ResultAck(ack)) => {
+                                self.session.on_ack(ack).await;
+                            }
+                            Some(worker_response::Response::HeartbeatAck(_)) => {}
+                            Some(worker_response::Response::ServerShutdown(shutdown)) => {
+                                info!(reason = %shutdown.reason, "Server shutting down");
+                                break Err(SdkError::Connection("server shutting down".into()));
+                            }
+                            None => {}
+                        },
+                        Some(Err(_)) | None if draining.is_some() => break Ok(()),
                         Some(Err(e)) => {
                             error!(error = %e, "Stream error");
-                            break;
+                            break Err(SdkError::Connection("stream error".into()));
                         }
                         None => {
                             info!("Server closed stream");
-                            break;
+                            break Err(SdkError::Connection("Stream closed".to_string()));
                         }
                     }
                 }
-                _ = tokio::signal::ctrl_c() => {
-                    info!("SIGINT received, shutting down gracefully");
-                    let shutdown = WorkerRequest {
-                        request: Some(worker_request::Request::Shutdown(GracefulShutdown {
-                            reason: "SIGINT".to_string(),
-                        })),
-                    };
-                    let _ = request_tx.send(shutdown).await;
-                    // Wait for in-flight tasks
-                    let _ = semaphore.acquire_many(self.concurrency as u32).await;
-                    hb_handle.abort();
-                    return Ok(());
+                _ = async { draining.as_mut().expect("guarded").await }, if draining.is_some() => {
+                    break Ok(());
                 }
-                _ = self.shutdown.notified() => {
+                _ = tokio::signal::ctrl_c(), if draining.is_none() => {
+                    info!("SIGINT received, shutting down gracefully");
+                    draining = Some(Box::pin(self.drain(request_tx.clone(), "SIGINT")));
+                }
+                _ = self.shutdown.notified(), if draining.is_none() => {
                     info!("Shutdown requested via handle, draining gracefully");
-                    let shutdown = WorkerRequest {
-                        request: Some(worker_request::Request::Shutdown(GracefulShutdown {
-                            reason: "shutdown_handle".to_string(),
-                        })),
-                    };
-                    let _ = request_tx.send(shutdown).await;
-                    let _ = semaphore.acquire_many(self.concurrency as u32).await;
-                    hb_handle.abort();
-                    return Ok(());
+                    draining = Some(Box::pin(self.drain(request_tx.clone(), "shutdown_handle")));
                 }
             }
-        }
+        };
 
         hb_handle.abort();
-        Err(SdkError::Connection("Stream closed".to_string()))
+        *self.session.outbound.lock().await = None;
+        outcome
+    }
+
+    /// Run the handler without ever blocking the receive loop: the slot is taken inside
+    /// the spawned task, so cancels, signals and acks keep flowing at full capacity.
+    async fn start_task(
+        &self,
+        assignment: TaskAssignment,
+        request_tx: mpsc::Sender<WorkerRequest>,
+        rpc: WorkerServiceClient<Channel>,
+    ) {
+        let task_id = assignment.task_id.clone();
+        self.session.running.lock().await.insert(task_id.clone());
+        let (sig_tx, sig_rx) = mpsc::channel::<TaskSignal>(64);
+        self.session
+            .signals
+            .lock()
+            .await
+            .insert(task_id.clone(), sig_tx);
+
+        let slots = self.slots.clone();
+        let handler = self.handler.clone();
+        let session = self.session.clone();
+        tokio::spawn(async move {
+            let Ok(permit) = slots.acquire_owned().await else {
+                return;
+            };
+            let task_run_id = assignment.task_run_id.clone();
+            let ctx = TaskContext::new(assignment, request_tx, sig_rx, rpc);
+            let result = match handler(ctx).await {
+                Ok(output) => TaskResult {
+                    task_id: task_id.clone(),
+                    task_run_id,
+                    success: true,
+                    retryable: false,
+                    output: output.to_string(),
+                    error_message: String::new(),
+                },
+                Err(err) => TaskResult {
+                    task_id: task_id.clone(),
+                    task_run_id,
+                    success: false,
+                    retryable: true,
+                    output: String::new(),
+                    error_message: err,
+                },
+            };
+            session.signals.lock().await.remove(&task_id);
+            drop(permit);
+            session.deliver(result).await;
+        });
+    }
+
+    /// Stop receiving tasks, wait for in-flight handlers, then give their results a moment
+    /// to be acknowledged. The receive loop keeps running meanwhile, so acks arrive.
+    fn drain(
+        &self,
+        request_tx: mpsc::Sender<WorkerRequest>,
+        reason: &str,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let shutdown = WorkerRequest {
+            request: Some(worker_request::Request::Shutdown(GracefulShutdown {
+                reason: reason.to_string(),
+            })),
+        };
+        let slots = self.slots.clone();
+        let all_slots = self.concurrency.max(1) as u32;
+        let session = self.session.clone();
+        async move {
+            let _ = request_tx.send(shutdown).await;
+            let _ = slots.acquire_many(all_slots).await;
+            let deadline = tokio::time::Instant::now() + SHUTDOWN_ACK_WAIT;
+            while !session.unacked.lock().await.is_empty() && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
     }
 }

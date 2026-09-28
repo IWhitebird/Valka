@@ -119,8 +119,11 @@ handler                shard lock                WAL writer task           bucke
 - Segments are pipelined: while segment `k` is in flight, `k+1` fills. Acks resolve in
   segment order.
 - On PUT failure the writer retries with backoff; on persistent failure parked acks fail
-  with `UNAVAILABLE` and the RAM state for those records is *not* rolled back (the node
-  must restart to reconverge — simple and safe; see Open Questions).
+  with `UNAVAILABLE` and the RAM state for those records is *not* rolled back. The writer
+  is poisoned and the server exits non-zero, so its supervisor restarts it and it rebuilds
+  from the bucket (see Open Questions).
+- A retried segment PUT that finds the position taken succeeds only if the stored bytes are
+  its own (its earlier attempt landed with the response lost); anything else is fatal.
 
 ## 6. Heartbeats and leases
 
@@ -141,6 +144,12 @@ from task state on replay, never persisted separately.
 - Every `snapshot_interval` (default 60 s) or `snapshot_after_records` (default 50k),
   each dirty shard is serialized (`ShardSnapshot` = tasks, runs, signals, dead letters,
   idempotency map) as zstd JSON to `snapshots/{shard}/{lsn}.snap`.
+- **Log budget:** once `log_budget_bytes` (default 64 MiB) of segments have been
+  committed since the last full round, every dirty shard is snapshotted (checked every
+  second). This bounds restart replay whatever the write pattern.
+- **Snapshots only cover durable records.** Shards are captured in batches of 64, then the
+  writer is synced unconditionally. If that sync fails, the batch is abandoned and nothing
+  is written, so a snapshot can never resurrect a write whose caller was told it failed.
 - A shard's snapshot LSN is the writer's LSN at the moment the shard lock was held, so it
   is exact.
 - Segments with LSN < min(snapshot LSN over owned shards) are deleted after a grace
@@ -217,7 +226,8 @@ the phase-1 single-object design that PHASE2.md replaces.
 
 ## 15. Open questions
 
-- Roll back RAM state on persistent PUT failure vs. restart the node? Phase 1: restart.
+- Roll back RAM state on persistent PUT failure vs. restart the node? Phase 1: the node
+  exits and its supervisor restarts it.
 - Payload blob threshold (probably 64 KB) — deferred.
 - `ack=fast` per-task mode — deferred.
 
@@ -241,3 +251,26 @@ once durable, like `RunCompleted`.
 - **Limits.** Step names 1–256 bytes, outputs ≤ 256 KiB of JSON, ≤ 256 distinct steps per
   task (`valka_engine::MAX_*`); violations are `INVALID_ARGUMENT`.
 - **Read path.** `GET /api/v1/tasks/{id}/checkpoints`; the task page shows a Steps table.
+
+## 17. Worker protocol: results, drain and server restarts
+
+- **Results are acknowledged end to end.** Every `TaskResult` is answered with a
+  `ResultAck`: `APPLIED` (durable, now or from an earlier delivery), `STALE` (the run
+  already ended another way: lease expired, cancelled, deleted) or `RETRY` (not recorded;
+  send again). `Engine::report_result` is idempotent, and answers `APPLIED` or `STALE` for
+  an already-ended run only after a WAL sync, so it never confirms state that exists only
+  in RAM.
+- **SDKs keep a result until APPLIED or STALE.** They resend it on `RETRY`, on reconnect
+  (Go also on every heartbeat tick), and keep heartbeating the task meanwhile so its lease
+  does not expire. A handler that finishes while the server is down therefore still gets
+  its result recorded once the server is back, without re-running the task.
+- **Slots never block the receive loop.** A handler takes its concurrency slot inside its
+  own task, so acks, signals and cancellations keep flowing at full capacity.
+- **Worker drain.** `GracefulShutdown` means "stop sending me tasks": the server removes the
+  worker from matching but keeps the stream, so results of in-flight tasks and their acks
+  still flow. The worker closes the stream once its handlers are done and their results
+  acknowledged (or after 5 s).
+- **Server shutdown.** On SIGTERM every worker stream gets `ServerShutdown` and is closed,
+  so the server stops promptly instead of waiting for streams. Workers treat it as a
+  disconnect and reconnect with backoff; they do not exit.
+

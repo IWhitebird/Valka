@@ -5,12 +5,12 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 use valka_core::{NodeId, PartitionId, WorkerId};
-use valka_engine::Engine;
+use valka_engine::{Engine, ResultOutcome, RunResult};
 use valka_matching::MatchingService;
 use valka_matching::partition::TaskEnvelope;
 use valka_proto::{
-    Heartbeat, LogBatch, SignalAck, StepCheckpoint, TaskAssignment, TaskCancellation, TaskResult,
-    TaskSignal, WorkerResponse, worker_response,
+    Heartbeat, LogBatch, ResultAck, ResultStatus, SignalAck, StepCheckpoint, TaskAssignment,
+    TaskCancellation, TaskResult, TaskSignal, WorkerResponse, worker_response,
 };
 use valka_wal::logstore::LogLine;
 
@@ -65,6 +65,11 @@ impl DispatcherService {
             // Active tasks are reclaimed by lease expiry in the engine.
         }
         valka_core::metrics::set_active_workers(self.workers.len() as f64);
+    }
+
+    /// The worker is draining: no new tasks, but its stream stays open for results.
+    pub fn stop_dispatching(&self, worker_id: &WorkerId) {
+        self.matching.deregister_worker(worker_id);
     }
 
     /// Background loop: register as waiting in matching service, receive tasks, push to worker
@@ -204,41 +209,52 @@ impl DispatcherService {
         }
     }
 
+    /// Record a worker's result and answer with a `ResultAck`. The worker keeps the result
+    /// until the answer is APPLIED or STALE, so a lost ack only costs a resend.
     pub async fn handle_task_result(&self, worker_id: &WorkerId, result: TaskResult) {
-        if let Some(mut handle) = self.workers.get_mut(worker_id.as_ref()) {
+        let tx = self.workers.get_mut(worker_id.as_ref()).map(|mut handle| {
             handle.complete_task(&result.task_id);
-        }
+            handle.response_tx.clone()
+        });
 
-        let outcome = if result.success {
-            let output: Option<serde_json::Value> = if result.output.is_empty() {
+        let run_result = if result.success {
+            RunResult::Completed(if result.output.is_empty() {
                 None
             } else {
                 serde_json::from_str(&result.output).ok()
-            };
-            self.engine
-                .complete_run(&result.task_id, &result.task_run_id, output)
-                .await
-                .map(|_| ())
+            })
         } else {
-            self.engine
-                .fail_run(
-                    &result.task_id,
-                    &result.task_run_id,
-                    &result.error_message,
-                    result.retryable,
-                )
-                .await
-                .map(|_| ())
+            RunResult::Failed {
+                error: result.error_message.clone(),
+                retryable: result.retryable,
+            }
         };
-
-        if let Err(e) = outcome {
-            // Stale result (task cancelled, lease already expired, duplicate): log and drop.
-            warn!(
-                task_id = %result.task_id,
-                task_run_id = %result.task_run_id,
-                error = %e,
-                "task result not applied"
-            );
+        let outcome = self
+            .engine
+            .report_result(&result.task_id, &result.task_run_id, run_result)
+            .await;
+        let status = match outcome {
+            ResultOutcome::Applied => ResultStatus::Applied,
+            ResultOutcome::Stale => {
+                warn!(
+                    task_id = %result.task_id,
+                    task_run_id = %result.task_run_id,
+                    "stale task result: the run already ended another way"
+                );
+                ResultStatus::Stale
+            }
+            ResultOutcome::Retry => ResultStatus::Retry,
+        };
+        if let Some(tx) = tx {
+            let ack = WorkerResponse {
+                response: Some(worker_response::Response::ResultAck(ResultAck {
+                    task_id: result.task_id,
+                    task_run_id: result.task_run_id,
+                    status: status as i32,
+                    message: String::new(),
+                })),
+            };
+            let _ = tx.send(ack).await;
         }
     }
 
