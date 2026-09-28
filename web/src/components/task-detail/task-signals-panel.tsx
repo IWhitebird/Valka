@@ -31,7 +31,7 @@ function signalStatusColor(status: string) {
     case "DELIVERED":
       return "bg-blue-500/10 text-blue-400 border-blue-500/20";
     case "ACKNOWLEDGED":
-      return "bg-emerald-500/10 text-emerald-400 border-emerald-500/20";
+      return "bg-green-500/10 text-green-400 border-green-500/20";
     default:
       return "bg-zinc-500/10 text-zinc-400 border-zinc-500/20";
   }

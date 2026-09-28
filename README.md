@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="Valka — Distributed Task Queue" width="700"/>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/banner-dark.svg">
+    <img src="assets/brand/banner-light.svg" alt="Valka, a distributed task queue whose only dependency is a bucket" width="700">
+  </picture>
 </p>
 
 <p align="center">

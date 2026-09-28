@@ -1,7 +1,15 @@
 import { RootProvider } from 'fumadocs-ui/provider/next';
 import type { ReactNode } from 'react';
 import type { Metadata } from 'next';
+import { Instrument_Sans, JetBrains_Mono, Schibsted_Grotesk } from 'next/font/google';
 import './global.css';
+
+const instrumentSans = Instrument_Sans({ subsets: ['latin'], variable: '--font-instrument-sans' });
+const schibstedGrotesk = Schibsted_Grotesk({
+  subsets: ['latin'],
+  variable: '--font-schibsted-grotesk',
+});
+const jetbrainsMono = JetBrains_Mono({ subsets: ['latin'], variable: '--font-jetbrains-mono' });
 
 export const metadata: Metadata = {
   title: {
@@ -9,24 +17,16 @@ export const metadata: Metadata = {
     default: 'Valka — Distributed Task Queue',
   },
   description:
-    'A Rust-native distributed task queue powered by PostgreSQL. One dependency. Zero brokers. Built for simplicity.',
+    'A Rust-native distributed task queue whose only dependency is an S3 bucket. No database, no broker, nodes you can kill.',
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en" suppressHydrationWarning>
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com" />
-        <link
-          rel="preconnect"
-          href="https://fonts.gstatic.com"
-          crossOrigin="anonymous"
-        />
-        <link
-          rel="stylesheet"
-          href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&display=swap"
-        />
-      </head>
+    <html
+      lang="en"
+      className={`${instrumentSans.variable} ${schibstedGrotesk.variable} ${jetbrainsMono.variable}`}
+      suppressHydrationWarning
+    >
       <body className="flex flex-col min-h-screen">
         <RootProvider>{children}</RootProvider>
       </body>

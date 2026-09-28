@@ -64,7 +64,7 @@ export function formatDurationSecs(secs: number | null | undefined): string {
 export function nodeStatusDot(status: NodeStatus): string {
   switch (status) {
     case "alive":
-      return "bg-emerald-400";
+      return "bg-green-400";
     case "draining":
       return "bg-amber-400";
     case "suspect":
@@ -85,8 +85,8 @@ export function healthTone(status: ClusterHealth["status"]): {
   switch (status) {
     case "ok":
       return {
-        badge: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
-        bar: "border-emerald-500/30 bg-emerald-500/5",
+        badge: "bg-green-500/10 text-green-400 border-green-500/20",
+        bar: "border-green-500/30 bg-green-500/5",
         label: "Healthy",
       };
     case "degraded":

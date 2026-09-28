@@ -25,7 +25,7 @@ interface QueueStats {
 }
 
 const legendItems = [
-  { label: "Completed", color: "bg-emerald-500" },
+  { label: "Completed", color: "bg-green-500" },
   { label: "Running", color: "bg-sky-500" },
   { label: "Pending", color: "bg-zinc-500" },
   { label: "Failed", color: "bg-red-500" },
@@ -35,7 +35,7 @@ function QueueBar({ queue }: { queue: QueueStats }) {
   if (queue.total === 0) return null;
 
   const segments = [
-    { count: queue.completed, color: "bg-emerald-500" },
+    { count: queue.completed, color: "bg-green-500" },
     { count: queue.running, color: "bg-sky-500" },
     { count: queue.pending, color: "bg-zinc-500" },
     { count: queue.failed, color: "bg-red-500" },
@@ -71,7 +71,7 @@ function QueueItem({ queue }: { queue: QueueStats }) {
 
       <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs">
         {queue.completed > 0 && (
-          <span className="text-emerald-400">{queue.completed} completed</span>
+          <span className="text-green-400">{queue.completed} completed</span>
         )}
         {queue.running > 0 && (
           <span className="text-sky-400">{queue.running} running</span>

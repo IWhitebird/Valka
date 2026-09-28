@@ -21,7 +21,7 @@ function workerStatusDot(status: string): string {
   switch (status.toUpperCase()) {
     case "ACTIVE":
     case "CONNECTED":
-      return "bg-emerald-400";
+      return "bg-green-400";
     case "IDLE":
       return "bg-zinc-400";
     case "DRAINING":

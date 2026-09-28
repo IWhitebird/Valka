@@ -1,40 +1,41 @@
 @import "tailwindcss";
 
 @theme {
-  --color-background: #09090b;
-  --color-foreground: #fafafa;
-  --color-card: #0a0a0c;
-  --color-card-foreground: #fafafa;
-  --color-popover: #0a0a0c;
-  --color-popover-foreground: #fafafa;
-  --color-primary: #6366f1;
-  --color-primary-foreground: #ffffff;
-  --color-secondary: #1c1c20;
-  --color-secondary-foreground: #fafafa;
-  --color-muted: #18181b;
-  --color-muted-foreground: #a1a1aa;
-  --color-accent: #1c1c20;
-  --color-accent-foreground: #fafafa;
+  --color-background: #111816;
+  --color-foreground: #eef2ef;
+  --color-card: #141c1a;
+  --color-card-foreground: #eef2ef;
+  --color-popover: #141c1a;
+  --color-popover-foreground: #eef2ef;
+  --color-primary: #67c2aa;
+  --color-primary-foreground: #111816;
+  --color-secondary: #1b2422;
+  --color-secondary-foreground: #eef2ef;
+  --color-muted: #1b2422;
+  --color-muted-foreground: #94a19c;
+  --color-accent: #1b2422;
+  --color-accent-foreground: #eef2ef;
   --color-destructive: #dc2626;
   --color-destructive-foreground: #ffffff;
   --color-success: #22c55e;
   --color-warning: #f59e0b;
   --color-info: #3b82f6;
-  --color-border: #1e1e22;
-  --color-input: #1e1e22;
-  --color-ring: #6366f1;
-  --color-sidebar: #09090b;
-  --color-sidebar-foreground: #a1a1aa;
-  --color-sidebar-border: #1e1e22;
-  --color-sidebar-accent: #18181b;
-  --color-sidebar-accent-foreground: #fafafa;
-  --color-sidebar-primary: #6366f1;
-  --color-sidebar-primary-foreground: #ffffff;
-  --color-sidebar-ring: #6366f1;
+  --color-border: #25302c;
+  --color-input: #25302c;
+  --color-ring: #67c2aa;
+  --color-sidebar: #111816;
+  --color-sidebar-foreground: #94a19c;
+  --color-sidebar-border: #25302c;
+  --color-sidebar-accent: #1b2422;
+  --color-sidebar-accent-foreground: #eef2ef;
+  --color-sidebar-primary: #67c2aa;
+  --color-sidebar-primary-foreground: #111816;
+  --color-sidebar-ring: #67c2aa;
 
   --radius: 0.5rem;
-  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
-  --font-mono: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+  --font-sans: "Instrument Sans Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-display: "Schibsted Grotesk Variable", "Instrument Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", "Fira Code", ui-monospace, monospace;
 
   --animate-in: enter 0.2s ease-out;
   --animate-out: exit 0.15s ease-in;
@@ -68,6 +69,13 @@ body {
   min-height: 100vh;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+  letter-spacing: -0.015em;
 }
 
 /* Custom scrollbar */

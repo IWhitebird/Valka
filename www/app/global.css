@@ -8,32 +8,41 @@
   --fd-toc-width: 220px;
 }
 
-/* True black dark theme */
+/* Ink dark theme */
 .dark,
 [data-theme='dark'] {
-  --color-fd-background: #000000;
-  --color-fd-foreground: #fafafa;
-  --color-fd-muted: #0a0a0a;
-  --color-fd-muted-foreground: #a1a1aa;
-  --color-fd-popover: #0a0a0a;
-  --color-fd-popover-foreground: #e4e4e7;
-  --color-fd-card: #0a0a0a;
-  --color-fd-card-foreground: #fafafa;
+  --color-fd-background: #0d1211;
+  --color-fd-foreground: #eef2ef;
+  --color-fd-muted: #141b19;
+  --color-fd-muted-foreground: #94a19c;
+  --color-fd-popover: #141b19;
+  --color-fd-popover-foreground: #e6ece9;
+  --color-fd-card: #141b19;
+  --color-fd-card-foreground: #eef2ef;
   --color-fd-border: rgba(255, 255, 255, 0.08);
-  --color-fd-primary: #818cf8;
-  --color-fd-primary-foreground: #000000;
-  --color-fd-secondary: #111111;
-  --color-fd-secondary-foreground: #fafafa;
+  --color-fd-primary: #67c2aa;
+  --color-fd-primary-foreground: #111816;
+  --color-fd-secondary: #1b2422;
+  --color-fd-secondary-foreground: #eef2ef;
   --color-fd-accent: rgba(255, 255, 255, 0.06);
-  --color-fd-accent-foreground: #e4e4e7;
-  --color-fd-ring: #818cf8;
+  --color-fd-accent-foreground: #e6ece9;
+  --color-fd-ring: #67c2aa;
 }
 
 /* Light theme with Valka brand */
 @theme {
-  --color-fd-primary: #6366f1;
+  --color-fd-primary: #1f5b4f;
   --color-fd-primary-foreground: #ffffff;
-  --color-fd-ring: #6366f1;
+  --color-fd-ring: #1f5b4f;
+  --font-sans: var(--font-instrument-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, monospace;
+  --font-display: var(--font-schibsted-grotesk), var(--font-instrument-sans), ui-sans-serif, sans-serif;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
 }
 
 /* Docs sidebar styling */
@@ -44,7 +53,7 @@
 /* Better code blocks */
 .dark pre,
 [data-theme='dark'] pre {
-  background: #0a0a0a !important;
+  background: #141b19 !important;
   border: 1px solid rgba(255, 255, 255, 0.06);
 }
 
@@ -84,11 +93,6 @@
   }
 }
 
-@keyframes gradient-shift {
-  0%, 100% { background-position: 0% 50%; }
-  50% { background-position: 100% 50%; }
-}
-
 @keyframes float-slow {
   0%, 100% { transform: translate(0, 0) scale(1); }
   33% { transform: translate(30px, -20px) scale(1.05); }
@@ -120,11 +124,6 @@
 .hero-animate-scale {
   animation: hero-fade-in-scale 0.9s cubic-bezier(0.16, 1, 0.3, 1) both;
   opacity: 0;
-}
-
-.gradient-text-animated {
-  background-size: 200% 200%;
-  animation: gradient-shift 6s ease infinite;
 }
 
 .float-orb {

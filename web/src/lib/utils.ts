@@ -43,7 +43,7 @@ export function statusColor(status: string): string {
     case "RUNNING":
       return "bg-sky-500/10 text-sky-400 border-sky-500/20";
     case "COMPLETED":
-      return "bg-emerald-500/10 text-emerald-400 border-emerald-500/20";
+      return "bg-green-500/10 text-green-400 border-green-500/20";
     case "FAILED":
       return "bg-red-500/10 text-red-400 border-red-500/20";
     case "RETRY":
@@ -66,7 +66,7 @@ export function statusDotColor(status: string): string {
     case "RUNNING":
       return "bg-sky-400";
     case "COMPLETED":
-      return "bg-emerald-400";
+      return "bg-green-400";
     case "FAILED":
       return "bg-red-400";
     case "RETRY":

@@ -24,19 +24,19 @@ function ConnectionIndicator({ connected }: { connected: boolean }) {
     <div className="flex items-center gap-2">
       <span className="relative flex h-2 w-2">
         {connected && (
-          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-green-400 opacity-75" />
         )}
         <span
           className={cn(
             "relative inline-flex h-2 w-2 rounded-full",
-            connected ? "bg-emerald-400" : "bg-zinc-500"
+            connected ? "bg-green-400" : "bg-zinc-500"
           )}
         />
       </span>
       <span
         className={cn(
           "text-xs font-medium",
-          connected ? "text-emerald-400" : "text-muted-foreground"
+          connected ? "text-green-400" : "text-muted-foreground"
         )}
       >
         {connected ? "Live" : "Disconnected"}

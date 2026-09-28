@@ -32,9 +32,9 @@ export function Sidebar() {
     <aside className="flex h-screen w-56 flex-col border-r bg-background">
       <div className="flex h-14 items-center gap-2.5 px-5">
         <Link to="/" className="flex items-center gap-2.5">
-          <img src="/valka.svg" alt="Valka" className="h-7 w-7 rounded-lg" />
-          <span className="text-[15px] font-semibold tracking-tight text-foreground">
-            Valka
+          <img src="/valka.svg" alt="" className="h-6 w-6" />
+          <span className="font-display text-[19px] font-extrabold tracking-tight text-foreground">
+            valka
           </span>
         </Link>
       </div>

@@ -5,8 +5,8 @@ export function baseOptions(): BaseLayoutProps {
     nav: {
       title: (
         <div className="flex items-center gap-2.5">
-          <img src="/logo.svg" alt="Valka" className="size-6" />
-          <span className="text-base font-bold tracking-tight">Valka</span>
+          <img src="/logo.svg" alt="" className="size-6" />
+          <span className="font-display text-lg font-extrabold tracking-tight">valka</span>
         </div>
       ),
       url: '/',

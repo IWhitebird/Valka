@@ -3,18 +3,17 @@ import type { ShardStats } from "@/api/types";
 export type HeatmapMode = "owner" | "load" | "snapshot_age" | "dirty";
 
 export const OWNER_PALETTE = [
-  "#6366f1",
-  "#10b981",
-  "#f59e0b",
-  "#ec4899",
-  "#06b6d4",
-  "#84cc16",
-  "#a855f7",
-  "#f97316",
+  "#2fa68a",
+  "#c98500",
+  "#9085e9",
+  "#008300",
+  "#e66767",
+  "#3987e5",
+  "#d55181",
 ];
 
-export const COLOR_EMPTY = "#18181b";
-export const COLOR_IDLE = "#27272a";
+export const COLOR_EMPTY = "#1b2422";
+export const COLOR_IDLE = "#25302c";
 export const COLOR_UNOWNED = "#7f1d1d";
 export const COLOR_NEVER_SNAPSHOTTED = "#b45309";
 

@@ -52,8 +52,8 @@ const stats = [
     key: "completed",
     title: "Completed",
     icon: CheckCircle,
-    iconColor: "text-emerald-400",
-    iconBg: "bg-emerald-500/15",
+    iconColor: "text-green-400",
+    iconBg: "bg-green-500/15",
   },
   {
     key: "failed",
