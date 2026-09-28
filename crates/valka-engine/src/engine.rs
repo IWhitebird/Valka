@@ -18,6 +18,7 @@ use crate::clock::{Clock, TokioClock};
 use crate::sink::{DispatchableTask, NoopSink, TaskSink};
 use crate::state::{ShardSnapshot, ShardState};
 use crate::timers::TimerWheel;
+use crate::view::CheckpointView;
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -84,6 +85,7 @@ pub struct DispatchInfo {
     pub attempt: i32,
     pub lease_until: DateTime<Utc>,
     pub task: DispatchableTask,
+    pub checkpoints: Vec<CheckpointView>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

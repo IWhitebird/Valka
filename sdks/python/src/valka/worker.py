@@ -184,7 +184,7 @@ class ValkaWorker:
                 async for response in self._stream:
                     if self._shutting_down:
                         break
-                    await self._handle_response(response)
+                    await self._handle_response(response, stub)
             finally:
                 heartbeat_task.cancel()
                 try:
@@ -213,10 +213,10 @@ class ValkaWorker:
             except Exception:
                 break
 
-    async def _handle_response(self, response: Any) -> None:
+    async def _handle_response(self, response: Any, stub: Any) -> None:
         kind = response.WhichOneof("response")
         if kind == "task_assignment":
-            await self._handle_task_assignment(response.task_assignment)
+            await self._handle_task_assignment(response.task_assignment, stub)
         elif kind == "task_signal":
             self._handle_task_signal(response.task_signal)
         elif kind == "task_cancellation":
@@ -227,9 +227,9 @@ class ValkaWorker:
         elif kind == "heartbeat_ack":
             pass
 
-    async def _handle_task_assignment(self, assignment: Any) -> None:
+    async def _handle_task_assignment(self, assignment: Any, stub: Any) -> None:
         await self._semaphore.acquire()
-        task = asyncio.create_task(self._execute_task(assignment))
+        task = asyncio.create_task(self._execute_task(assignment, stub))
         self._active_tasks[assignment.task_id] = task
         task.add_done_callback(lambda _t: self._task_done(assignment.task_id))
 
@@ -243,8 +243,18 @@ class ValkaWorker:
         self._task_contexts.pop(task_id, None)
         self._semaphore.release()
 
-    async def _execute_task(self, assignment: Any) -> None:
+    async def _execute_task(self, assignment: Any, stub: Any) -> None:
         from valka._proto.valka.v1 import worker_pb2
+
+        async def checkpoint(step: str, output: str) -> None:
+            await stub.Checkpoint(
+                worker_pb2.CheckpointRequest(
+                    task_id=assignment.task_id,
+                    task_run_id=assignment.task_run_id,
+                    step=step,
+                    output=output,
+                )
+            )
 
         ctx = TaskContext(
             task_id=assignment.task_id,
@@ -255,6 +265,8 @@ class ValkaWorker:
             raw_input=assignment.input,
             raw_metadata=assignment.metadata,
             send_fn=self._send,
+            checkpoints={c.step: c.output for c in assignment.checkpoints},
+            checkpoint_fn=checkpoint,
         )
         self._task_contexts[assignment.task_id] = ctx
 

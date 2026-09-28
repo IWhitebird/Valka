@@ -82,6 +82,15 @@ export interface TaskAssignment {
   timeoutSeconds: number;
   /** JSON string */
   metadata: string;
+  checkpoints: StepCheckpoint[];
+}
+
+export interface StepCheckpoint {
+  step: string;
+  /** JSON string */
+  output: string;
+  attemptNumber: number;
+  createdAtMs: number;
 }
 
 export interface TaskCancellation {
@@ -109,6 +118,17 @@ export interface TaskSignal {
 
 export interface SignalAck {
   signalId: string;
+}
+
+export interface CheckpointRequest {
+  taskId: string;
+  taskRunId: string;
+  step: string;
+  /** JSON string */
+  output: string;
+}
+
+export interface CheckpointResponse {
 }
 
 function createBaseWorkerRequest(): WorkerRequest {
@@ -1070,6 +1090,7 @@ function createBaseTaskAssignment(): TaskAssignment {
     attemptNumber: 0,
     timeoutSeconds: 0,
     metadata: "",
+    checkpoints: [],
   };
 }
 
@@ -1098,6 +1119,9 @@ export const TaskAssignment: MessageFns<TaskAssignment> = {
     }
     if (message.metadata !== "") {
       writer.uint32(66).string(message.metadata);
+    }
+    for (const v of message.checkpoints) {
+      StepCheckpoint.encode(v!, writer.uint32(74).fork()).join();
     }
     return writer;
   },
@@ -1173,6 +1197,14 @@ export const TaskAssignment: MessageFns<TaskAssignment> = {
           message.metadata = reader.string();
           continue;
         }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.checkpoints.push(StepCheckpoint.decode(reader, reader.uint32()));
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1216,6 +1248,9 @@ export const TaskAssignment: MessageFns<TaskAssignment> = {
         ? globalThis.Number(object.timeout_seconds)
         : 0,
       metadata: isSet(object.metadata) ? globalThis.String(object.metadata) : "",
+      checkpoints: globalThis.Array.isArray(object?.checkpoints)
+        ? object.checkpoints.map((e: any) => StepCheckpoint.fromJSON(e))
+        : [],
     };
   },
 
@@ -1245,6 +1280,9 @@ export const TaskAssignment: MessageFns<TaskAssignment> = {
     if (message.metadata !== "") {
       obj.metadata = message.metadata;
     }
+    if (message.checkpoints?.length) {
+      obj.checkpoints = message.checkpoints.map((e) => StepCheckpoint.toJSON(e));
+    }
     return obj;
   },
 
@@ -1261,6 +1299,123 @@ export const TaskAssignment: MessageFns<TaskAssignment> = {
     message.attemptNumber = object.attemptNumber ?? 0;
     message.timeoutSeconds = object.timeoutSeconds ?? 0;
     message.metadata = object.metadata ?? "";
+    message.checkpoints = object.checkpoints?.map((e) => StepCheckpoint.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseStepCheckpoint(): StepCheckpoint {
+  return { step: "", output: "", attemptNumber: 0, createdAtMs: 0 };
+}
+
+export const StepCheckpoint: MessageFns<StepCheckpoint> = {
+  encode(message: StepCheckpoint, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.step !== "") {
+      writer.uint32(10).string(message.step);
+    }
+    if (message.output !== "") {
+      writer.uint32(18).string(message.output);
+    }
+    if (message.attemptNumber !== 0) {
+      writer.uint32(24).int32(message.attemptNumber);
+    }
+    if (message.createdAtMs !== 0) {
+      writer.uint32(32).int64(message.createdAtMs);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): StepCheckpoint {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseStepCheckpoint();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.step = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.output = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.attemptNumber = reader.int32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.createdAtMs = longToNumber(reader.int64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): StepCheckpoint {
+    return {
+      step: isSet(object.step) ? globalThis.String(object.step) : "",
+      output: isSet(object.output) ? globalThis.String(object.output) : "",
+      attemptNumber: isSet(object.attemptNumber)
+        ? globalThis.Number(object.attemptNumber)
+        : isSet(object.attempt_number)
+        ? globalThis.Number(object.attempt_number)
+        : 0,
+      createdAtMs: isSet(object.createdAtMs)
+        ? globalThis.Number(object.createdAtMs)
+        : isSet(object.created_at_ms)
+        ? globalThis.Number(object.created_at_ms)
+        : 0,
+    };
+  },
+
+  toJSON(message: StepCheckpoint): unknown {
+    const obj: any = {};
+    if (message.step !== "") {
+      obj.step = message.step;
+    }
+    if (message.output !== "") {
+      obj.output = message.output;
+    }
+    if (message.attemptNumber !== 0) {
+      obj.attemptNumber = Math.round(message.attemptNumber);
+    }
+    if (message.createdAtMs !== 0) {
+      obj.createdAtMs = Math.round(message.createdAtMs);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<StepCheckpoint>, I>>(base?: I): StepCheckpoint {
+    return StepCheckpoint.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<StepCheckpoint>, I>>(object: I): StepCheckpoint {
+    const message = createBaseStepCheckpoint();
+    message.step = object.step ?? "";
+    message.output = object.output ?? "";
+    message.attemptNumber = object.attemptNumber ?? 0;
+    message.createdAtMs = object.createdAtMs ?? 0;
     return message;
   },
 };
@@ -1693,6 +1848,165 @@ export const SignalAck: MessageFns<SignalAck> = {
   },
 };
 
+function createBaseCheckpointRequest(): CheckpointRequest {
+  return { taskId: "", taskRunId: "", step: "", output: "" };
+}
+
+export const CheckpointRequest: MessageFns<CheckpointRequest> = {
+  encode(message: CheckpointRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.taskId !== "") {
+      writer.uint32(10).string(message.taskId);
+    }
+    if (message.taskRunId !== "") {
+      writer.uint32(18).string(message.taskRunId);
+    }
+    if (message.step !== "") {
+      writer.uint32(26).string(message.step);
+    }
+    if (message.output !== "") {
+      writer.uint32(34).string(message.output);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CheckpointRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCheckpointRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.taskId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.taskRunId = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.step = reader.string();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.output = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): CheckpointRequest {
+    return {
+      taskId: isSet(object.taskId)
+        ? globalThis.String(object.taskId)
+        : isSet(object.task_id)
+        ? globalThis.String(object.task_id)
+        : "",
+      taskRunId: isSet(object.taskRunId)
+        ? globalThis.String(object.taskRunId)
+        : isSet(object.task_run_id)
+        ? globalThis.String(object.task_run_id)
+        : "",
+      step: isSet(object.step) ? globalThis.String(object.step) : "",
+      output: isSet(object.output) ? globalThis.String(object.output) : "",
+    };
+  },
+
+  toJSON(message: CheckpointRequest): unknown {
+    const obj: any = {};
+    if (message.taskId !== "") {
+      obj.taskId = message.taskId;
+    }
+    if (message.taskRunId !== "") {
+      obj.taskRunId = message.taskRunId;
+    }
+    if (message.step !== "") {
+      obj.step = message.step;
+    }
+    if (message.output !== "") {
+      obj.output = message.output;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<CheckpointRequest>, I>>(base?: I): CheckpointRequest {
+    return CheckpointRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<CheckpointRequest>, I>>(object: I): CheckpointRequest {
+    const message = createBaseCheckpointRequest();
+    message.taskId = object.taskId ?? "";
+    message.taskRunId = object.taskRunId ?? "";
+    message.step = object.step ?? "";
+    message.output = object.output ?? "";
+    return message;
+  },
+};
+
+function createBaseCheckpointResponse(): CheckpointResponse {
+  return {};
+}
+
+export const CheckpointResponse: MessageFns<CheckpointResponse> = {
+  encode(_: CheckpointResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CheckpointResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCheckpointResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(_: any): CheckpointResponse {
+    return {};
+  },
+
+  toJSON(_: CheckpointResponse): unknown {
+    const obj: any = {};
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<CheckpointResponse>, I>>(base?: I): CheckpointResponse {
+    return CheckpointResponse.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<CheckpointResponse>, I>>(_: I): CheckpointResponse {
+    const message = createBaseCheckpointResponse();
+    return message;
+  },
+};
+
 export type WorkerServiceDefinition = typeof WorkerServiceDefinition;
 export const WorkerServiceDefinition = {
   name: "WorkerService",
@@ -1707,6 +2021,15 @@ export const WorkerServiceDefinition = {
       responseStream: true,
       options: {},
     },
+    /** Persist the result of a completed step of a running task. Returns once durable. */
+    checkpoint: {
+      name: "Checkpoint",
+      requestType: CheckpointRequest,
+      requestStream: false,
+      responseType: CheckpointResponse,
+      responseStream: false,
+      options: {},
+    },
   },
 } as const;
 
@@ -1716,6 +2039,11 @@ export interface WorkerServiceImplementation<CallContextExt = {}> {
     request: AsyncIterable<WorkerRequest>,
     context: CallContext & CallContextExt,
   ): ServerStreamingMethodResult<DeepPartial<WorkerResponse>>;
+  /** Persist the result of a completed step of a running task. Returns once durable. */
+  checkpoint(
+    request: CheckpointRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<CheckpointResponse>>;
 }
 
 export interface WorkerServiceClient<CallOptionsExt = {}> {
@@ -1724,6 +2052,11 @@ export interface WorkerServiceClient<CallOptionsExt = {}> {
     request: AsyncIterable<DeepPartial<WorkerRequest>>,
     options?: CallOptions & CallOptionsExt,
   ): AsyncIterable<WorkerResponse>;
+  /** Persist the result of a completed step of a running task. Returns once durable. */
+  checkpoint(
+    request: DeepPartial<CheckpointRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<CheckpointResponse>;
 }
 
 type Builtin = Date | Function | Uint8Array | string | number | boolean | undefined;

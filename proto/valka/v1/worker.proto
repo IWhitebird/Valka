@@ -7,6 +7,8 @@ import "valka/v1/common.proto";
 service WorkerService {
     // Primary bidirectional stream for ALL worker communication
     rpc Session(stream WorkerRequest) returns (stream WorkerResponse);
+    // Persist the result of a completed step of a running task. Returns once durable.
+    rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
 }
 
 // Worker -> Server
@@ -83,6 +85,14 @@ message TaskAssignment {
     int32 attempt_number = 6;
     int32 timeout_seconds = 7;
     string metadata = 8;           // JSON string
+    repeated StepCheckpoint checkpoints = 9;
+}
+
+message StepCheckpoint {
+    string step = 1;
+    string output = 2;             // JSON string
+    int32 attempt_number = 3;
+    int64 created_at_ms = 4;
 }
 
 message TaskCancellation {
@@ -110,3 +120,14 @@ message TaskSignal {
 message SignalAck {
     string signal_id = 1;
 }
+
+// --- Checkpoints ---
+
+message CheckpointRequest {
+    string task_id = 1;
+    string task_run_id = 2;
+    string step = 3;
+    string output = 4;             // JSON string
+}
+
+message CheckpointResponse {}

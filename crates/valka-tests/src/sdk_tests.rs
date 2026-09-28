@@ -1,5 +1,9 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use tokio::sync::mpsc;
-use valka_proto::{TaskSignal, WorkerRequest, worker_request};
+use tonic::transport::Channel;
+use valka_proto::worker_service_client::WorkerServiceClient;
+use valka_proto::{StepCheckpoint, TaskAssignment, TaskSignal, WorkerRequest, worker_request};
 use valka_sdk::context::{SignalData, TaskContext};
 use valka_sdk::retry::RetryPolicy;
 
@@ -138,27 +142,51 @@ fn test_retry_policy_many_iterations_no_panic() {
 
 // ─── Signal context tests ───────────────────────────────────────────
 
-fn make_test_context() -> (
+fn make_context_with(
+    checkpoints: Vec<StepCheckpoint>,
+) -> (
     TaskContext,
     mpsc::Sender<TaskSignal>,
     mpsc::Receiver<WorkerRequest>,
 ) {
     let (request_tx, request_rx) = mpsc::channel::<WorkerRequest>(64);
     let (signal_tx, signal_rx) = mpsc::channel::<TaskSignal>(64);
-
+    let assignment = TaskAssignment {
+        task_id: "task-1".to_string(),
+        task_run_id: "run-1".to_string(),
+        queue_name: "queue".to_string(),
+        task_name: "test-task".to_string(),
+        input: "{}".to_string(),
+        attempt_number: 1,
+        timeout_seconds: 30,
+        metadata: "{}".to_string(),
+        checkpoints,
+    };
+    let unreachable = Channel::from_static("http://127.0.0.1:1").connect_lazy();
     let ctx = TaskContext::new(
-        "task-1".to_string(),
-        "run-1".to_string(),
-        "queue".to_string(),
-        "test-task".to_string(),
-        1,
-        "{}".to_string(),
-        "{}".to_string(),
+        assignment,
         request_tx,
         signal_rx,
+        WorkerServiceClient::new(unreachable),
     );
-
     (ctx, signal_tx, request_rx)
+}
+
+fn make_test_context() -> (
+    TaskContext,
+    mpsc::Sender<TaskSignal>,
+    mpsc::Receiver<WorkerRequest>,
+) {
+    make_context_with(Vec::new())
+}
+
+fn step_checkpoint(step: &str, output: &str) -> StepCheckpoint {
+    StepCheckpoint {
+        step: step.to_string(),
+        output: output.to_string(),
+        attempt_number: 1,
+        created_at_ms: 1700000000000,
+    }
 }
 
 fn make_signal(id: &str, name: &str, payload: &str) -> TaskSignal {
@@ -303,4 +331,63 @@ async fn test_context_signal_sends_ack() {
         }
         other => panic!("Expected SignalAck, got {other:?}"),
     }
+}
+
+// ─── Checkpoint context tests ───────────────────────────────────────
+
+#[tokio::test]
+async fn test_step_returns_checkpointed_value_without_running() {
+    let (ctx, _signal_tx, _request_rx) =
+        make_context_with(vec![step_checkpoint("fetch", r#"{"rows":3}"#)]);
+    let runs = AtomicUsize::new(0);
+
+    let value: serde_json::Value = ctx
+        .step("fetch", || async {
+            runs.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, String>(serde_json::json!({"rows": 99}))
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(value, serde_json::json!({"rows": 3}));
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_step_error_is_returned_and_nothing_is_checkpointed() {
+    let (ctx, _signal_tx, _request_rx) = make_test_context();
+
+    let err = ctx
+        .step("parse", || async { Err::<i32, _>("bad input") })
+        .await
+        .unwrap_err();
+
+    assert_eq!(err, "bad input");
+    assert_eq!(ctx.checkpoint_value::<i32>("parse").unwrap(), None);
+}
+
+#[tokio::test]
+async fn test_step_fails_when_checkpoint_cannot_be_persisted() {
+    let (ctx, _signal_tx, _request_rx) = make_test_context();
+
+    let result = ctx.step("upload", || async { Ok::<_, String>(7) }).await;
+
+    assert!(result.is_err());
+    assert_eq!(ctx.checkpoint_value::<i32>("upload").unwrap(), None);
+}
+
+#[tokio::test]
+async fn test_checkpoint_value_decodes_typed_output() {
+    let (ctx, _signal_tx, _request_rx) = make_context_with(vec![
+        step_checkpoint("ids", "[1,2,3]"),
+        step_checkpoint("done", "null"),
+    ]);
+
+    assert_eq!(
+        ctx.checkpoint_value::<Vec<u32>>("ids").unwrap(),
+        Some(vec![1, 2, 3])
+    );
+    assert_eq!(ctx.checkpoint_value::<()>("done").unwrap(), Some(()));
+    assert_eq!(ctx.checkpoint_value::<u32>("missing").unwrap(), None);
+    assert!(ctx.checkpoint_value::<String>("ids").is_err());
 }

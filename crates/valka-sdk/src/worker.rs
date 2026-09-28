@@ -254,21 +254,13 @@ impl ValkaWorker {
                                     let tx = request_tx.clone();
                                     let active = active_tasks.clone();
                                     let sigs = signal_senders.clone();
+                                    let rpc = client.clone();
                                     tokio::spawn(async move {
                                         let task_id = assignment.task_id.clone();
                                         let task_run_id = assignment.task_run_id.clone();
 
-                                        let ctx = TaskContext::new(
-                                            assignment.task_id.clone(),
-                                            assignment.task_run_id.clone(),
-                                            assignment.queue_name,
-                                            assignment.task_name,
-                                            assignment.attempt_number,
-                                            assignment.input,
-                                            assignment.metadata,
-                                            tx.clone(),
-                                            sig_rx,
-                                        );
+                                        let ctx =
+                                            TaskContext::new(assignment, tx.clone(), sig_rx, rpc);
 
                                         let result = handler(ctx).await;
 

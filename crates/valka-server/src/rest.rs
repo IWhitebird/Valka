@@ -134,6 +134,10 @@ pub fn build_api_router(
         .route("/api/v1/tasks/{task_id}/signals", get(list_signals))
         .route("/api/v1/tasks/{task_id}/runs", get(get_task_runs))
         .route(
+            "/api/v1/tasks/{task_id}/checkpoints",
+            get(get_task_checkpoints),
+        )
+        .route(
             "/api/v1/tasks/{task_id}/runs/{run_id}/logs",
             get(get_run_logs),
         )
@@ -413,6 +417,18 @@ async fn get_task_runs(
 ) -> Result<impl IntoResponse, ApiError> {
     let runs = state.engine.runs_for_task(&task_id).unwrap_or_default();
     let result: Vec<serde_json::Value> = runs.iter().map(|r| r.to_json()).collect();
+    Ok(Json(result))
+}
+
+async fn get_task_checkpoints(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let checkpoints = state
+        .engine
+        .checkpoints_for_task(&task_id)
+        .ok_or(ServerError::TaskNotFound(task_id))?;
+    let result: Vec<serde_json::Value> = checkpoints.iter().map(|c| c.to_json()).collect();
     Ok(Json(result))
 }
 

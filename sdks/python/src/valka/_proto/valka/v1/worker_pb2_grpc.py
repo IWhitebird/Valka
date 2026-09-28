@@ -39,6 +39,11 @@ class WorkerServiceStub(object):
                 request_serializer=valka_dot_v1_dot_worker__pb2.WorkerRequest.SerializeToString,
                 response_deserializer=valka_dot_v1_dot_worker__pb2.WorkerResponse.FromString,
                 _registered_method=True)
+        self.Checkpoint = channel.unary_unary(
+                '/valka.v1.WorkerService/Checkpoint',
+                request_serializer=valka_dot_v1_dot_worker__pb2.CheckpointRequest.SerializeToString,
+                response_deserializer=valka_dot_v1_dot_worker__pb2.CheckpointResponse.FromString,
+                _registered_method=True)
 
 
 class WorkerServiceServicer(object):
@@ -51,6 +56,13 @@ class WorkerServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Checkpoint(self, request, context):
+        """Persist the result of a completed step of a running task. Returns once durable.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_WorkerServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -58,6 +70,11 @@ def add_WorkerServiceServicer_to_server(servicer, server):
                     servicer.Session,
                     request_deserializer=valka_dot_v1_dot_worker__pb2.WorkerRequest.FromString,
                     response_serializer=valka_dot_v1_dot_worker__pb2.WorkerResponse.SerializeToString,
+            ),
+            'Checkpoint': grpc.unary_unary_rpc_method_handler(
+                    servicer.Checkpoint,
+                    request_deserializer=valka_dot_v1_dot_worker__pb2.CheckpointRequest.FromString,
+                    response_serializer=valka_dot_v1_dot_worker__pb2.CheckpointResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -87,6 +104,33 @@ class WorkerService(object):
             '/valka.v1.WorkerService/Session',
             valka_dot_v1_dot_worker__pb2.WorkerRequest.SerializeToString,
             valka_dot_v1_dot_worker__pb2.WorkerResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Checkpoint(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/valka.v1.WorkerService/Checkpoint',
+            valka_dot_v1_dot_worker__pb2.CheckpointRequest.SerializeToString,
+            valka_dot_v1_dot_worker__pb2.CheckpointResponse.FromString,
             options,
             channel_credentials,
             insecure,

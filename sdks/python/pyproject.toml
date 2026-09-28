@@ -19,6 +19,7 @@ dependencies = [
 dev = [
     "grpcio-tools>=1.60",
     "mypy>=1.8",
+    "pytest>=7",
     "ruff>=0.2",
 ]
 

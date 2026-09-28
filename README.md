@@ -41,6 +41,7 @@ Most task queues bolt together a message broker, a database, and a cache. Every 
 - gRPC bidirectional streaming (single connection per worker, no polling)
 - 4096 fixed storage shards with single-writer ownership (multi-node takeover: phase 2, see `docs/wal/PLAN.md`)
 - Task signals — send real-time signals to running workers
+- Step checkpoints — a failed task retries from the last completed step, not from scratch
 - Automatic retries with exponential backoff + dead letter queue
 - Structured log streaming per task run
 - Event broadcasting via gRPC streams and SSE
@@ -116,6 +117,27 @@ const worker = new ValkaWorker({
 await worker.run();
 ```
 
+### Step checkpoints
+
+A handler can split its work into named steps. Each step's result is written to the WAL
+before the step returns, and every retry of the task (after a failure, a lease expiry, or
+a node crash) receives the recorded results, so completed steps are skipped:
+
+```rust
+.handler(|ctx: TaskContext| async move {
+    let rows: Vec<Row> = ctx.step("fetch", || fetch_rows()).await?;
+    let report: Report = ctx.step("transform", || build_report(&rows)).await?;
+    ctx.step("upload", || upload(&report)).await?;
+    Ok(serde_json::json!({"rows": rows.len()}))
+})
+```
+
+The same API exists in every SDK: `ctx.step(name, fn)` in TypeScript and Python,
+`valka.Step(ctx, name, fn)` in Go. A step that fails before its checkpoint is recorded runs
+again, so steps with external side effects should still be idempotent. Checkpoints are
+visible at `GET /api/v1/tasks/{id}/checkpoints` and on the task page. Runnable examples:
+`examples/{rs,typescript,go,python}` (`steps`).
+
 ## Architecture
 
 ```
@@ -169,7 +191,7 @@ Valka ships with a built-in React dashboard at the root path.
 cd web && npm install && npm run dev  # Dev server on :5173
 ```
 
-Pages: Dashboard, Tasks, Task Detail (runs, logs, signals), Workers, Cluster (nodes, WAL health, shard map, storage), Events, Dead Letters.
+Pages: Dashboard, Tasks, Task Detail (runs, logs, signals, steps), Workers, Cluster (nodes, WAL health, shard map, storage), Events, Dead Letters.
 
 ## Deployment
 
@@ -214,6 +236,7 @@ Layered via [figment](https://github.com/SergioBenitez/Figment): defaults → `v
 - [x] REST API + CLI + Web dashboard
 - [x] Real-time event and log streaming
 - [x] Task signals (send signals to running workers)
+- [x] Step checkpoints (retries resume after the last completed step)
 - [x] Polyglot SDKs — Rust, TypeScript, Go, Python
 - [x] Object-storage WAL: diskless nodes, snapshots, exact replay, fault-injected tests
 

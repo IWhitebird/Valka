@@ -2,6 +2,7 @@ import { fetchAPI } from "./client";
 import type {
   Task,
   TaskRun,
+  TaskCheckpoint,
   TaskLog,
   TaskSignal,
   CreateTaskRequest,
@@ -57,6 +58,10 @@ export const tasksApi = {
 
   getRuns(taskId: string): Promise<TaskRun[]> {
     return fetchAPI<TaskRun[]>(`/api/v1/tasks/${taskId}/runs`);
+  },
+
+  getCheckpoints(taskId: string): Promise<TaskCheckpoint[]> {
+    return fetchAPI<TaskCheckpoint[]>(`/api/v1/tasks/${taskId}/checkpoints`);
   },
 
   getRunLogs(taskId: string, runId: string): Promise<TaskLog[]> {

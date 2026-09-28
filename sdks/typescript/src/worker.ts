@@ -3,6 +3,7 @@ import { createChannel, createClient, type Channel } from "nice-grpc";
 import { TaskContext } from "./context.js";
 import { ConnectionError, HandlerError } from "./errors.js";
 import {
+  CheckpointRequest,
   WorkerServiceDefinition,
   type DeepPartial,
   type WorkerRequest,
@@ -226,6 +227,18 @@ export class ValkaWorker {
               assignment.input,
               assignment.metadata,
               send,
+              assignment.checkpoints,
+              async (step, output) => {
+                const request = CheckpointRequest.fromPartial({
+                  taskId: assignment.taskId,
+                  taskRunId: assignment.taskRunId,
+                  step,
+                  output,
+                });
+                // ts-proto's Exact<> generic on fromPartial collapses nice-grpc's inferred
+                // request type to an index signature of `never`; the runtime type is correct.
+                await client.checkpoint(request as never);
+              },
             );
             taskContexts.set(assignment.taskId, ctx);
 

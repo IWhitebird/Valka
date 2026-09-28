@@ -1,10 +1,11 @@
 import { useState, useEffect } from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
 import { ArrowLeft, Trash2 } from "lucide-react";
-import { useTask, useTaskRuns, useDeleteTask } from "@/hooks/use-tasks";
+import { useTask, useTaskRuns, useTaskCheckpoints, useDeleteTask } from "@/hooks/use-tasks";
 import { TaskDetailPanel } from "@/components/task-detail/task-detail-panel";
 import { TaskSignalsPanel } from "@/components/task-detail/task-signals-panel";
 import { TaskRunsTable } from "@/components/task-detail/task-runs-table";
+import { TaskCheckpointsTable } from "@/components/task-detail/task-checkpoints-table";
 import { TaskLogsViewer } from "@/components/task-detail/task-logs-viewer";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
@@ -14,6 +15,7 @@ export function TaskDetailPage() {
   const navigate = useNavigate();
   const { data: task, isLoading: taskLoading } = useTask(taskId!);
   const { data: runs = [], isLoading: runsLoading } = useTaskRuns(taskId!);
+  const { data: checkpoints = [] } = useTaskCheckpoints(taskId!);
   const deleteTask = useDeleteTask();
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
 
@@ -83,6 +85,13 @@ export function TaskDetailPage() {
       <TaskSignalsPanel taskId={taskId!} taskStatus={task.status} />
 
       <Separator />
+
+      {checkpoints.length > 0 && (
+        <div className="space-y-4">
+          <h3 className="text-lg font-semibold text-foreground">Steps</h3>
+          <TaskCheckpointsTable checkpoints={checkpoints} />
+        </div>
+      )}
 
       <div className="space-y-4">
         <h3 className="text-lg font-semibold text-foreground">Runs</h3>

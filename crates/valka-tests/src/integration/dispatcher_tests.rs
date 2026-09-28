@@ -266,3 +266,45 @@ async fn test_pending_signals_delivered_on_dispatch() {
     assert_eq!(node.engine.list_signals(&t.id, None)[0].status, "DELIVERED");
     h.abort();
 }
+
+#[tokio::test(start_paused = true)]
+async fn test_retry_assignment_carries_checkpoints() {
+    let node = TestNode::new().await;
+    let (wid, mut rx) = node.register_worker(&["q"], 1).await;
+    let t = node.create("q", "t").await;
+    let run = node.start(&t.id, &wid.0);
+    node.engine
+        .checkpoint(&t.id, &run, "fetch", serde_json::json!({"rows": 3}))
+        .await
+        .unwrap();
+    node.engine
+        .fail_run(&t.id, &run, "boom", true)
+        .await
+        .unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(3)).await;
+    settle().await;
+    assert_eq!(
+        node.engine.get_task(&t.id).unwrap().status,
+        TaskStatus::Pending
+    );
+
+    let d = node.dispatcher.clone();
+    let w = wid.clone();
+    let h = tokio::spawn(async move { d.run_worker_match_loop(w, vec!["q".into()]).await });
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let Some(valka_proto::worker_response::Response::TaskAssignment(a)) = msg.response else {
+        panic!("expected an assignment, got {:?}", msg.response);
+    };
+    assert_eq!(a.attempt_number, 2);
+    assert_eq!(a.checkpoints.len(), 1);
+    assert_eq!(a.checkpoints[0].step, "fetch");
+    assert_eq!(a.checkpoints[0].attempt_number, 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&a.checkpoints[0].output).unwrap(),
+        serde_json::json!({"rows": 3})
+    );
+    h.abort();
+}

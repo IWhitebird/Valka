@@ -111,6 +111,29 @@ impl SignalView {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct CheckpointView {
+    pub task_id: String,
+    pub step: String,
+    pub output: Value,
+    pub run_id: String,
+    pub attempt_number: i32,
+    pub created_at: DateTime<Utc>,
+}
+
+impl CheckpointView {
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "task_id": self.task_id,
+            "step": self.step,
+            "output": self.output,
+            "run_id": self.run_id,
+            "attempt_number": self.attempt_number,
+            "created_at": self.created_at.to_rfc3339(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct DeadLetterView {
     pub id: String,
     pub task_id: String,

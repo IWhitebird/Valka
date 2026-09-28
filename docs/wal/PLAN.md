@@ -23,6 +23,15 @@ end-to-end with the Rust SDK, incl. server crash/restart), MinIO-gated 2.
 - [x] Dashboard: Cluster / Node / Shards (4096-cell heatmap) / Storage pages, cluster strip,
       Node columns, Shard row. See `CLUSTER_UI.md` for the phase 2 half.
 
+## Step checkpoints — shipped
+
+- [x] `TaskCheckpointed` record, fenced to the current run; checkpoints snapshotted with the task
+      and carried on every `TaskAssignment`. `WorkerService.Checkpoint` RPC,
+      `GET /api/v1/tasks/{id}/checkpoints`, Steps table on the task page. DESIGN.md §16.
+- [x] SDKs: `step`/`checkpoint` in Rust, TypeScript, Go and Python; `steps` example per language.
+
+Test inventory now: valka-wal 23, valka-engine 35, valka-tests 257, web 22, Go SDK 5, Python SDK 5.
+
 ## Phase 2 — cluster
 
 - [ ] Assignment CAS + epochs, flush-time ownership verification.

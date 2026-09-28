@@ -19,7 +19,8 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	WorkerService_Session_FullMethodName = "/valka.v1.WorkerService/Session"
+	WorkerService_Session_FullMethodName    = "/valka.v1.WorkerService/Session"
+	WorkerService_Checkpoint_FullMethodName = "/valka.v1.WorkerService/Checkpoint"
 )
 
 // WorkerServiceClient is the client API for WorkerService service.
@@ -28,6 +29,8 @@ const (
 type WorkerServiceClient interface {
 	// Primary bidirectional stream for ALL worker communication
 	Session(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[WorkerRequest, WorkerResponse], error)
+	// Persist the result of a completed step of a running task. Returns once durable.
+	Checkpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error)
 }
 
 type workerServiceClient struct {
@@ -51,12 +54,24 @@ func (c *workerServiceClient) Session(ctx context.Context, opts ...grpc.CallOpti
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type WorkerService_SessionClient = grpc.BidiStreamingClient[WorkerRequest, WorkerResponse]
 
+func (c *workerServiceClient) Checkpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CheckpointResponse)
+	err := c.cc.Invoke(ctx, WorkerService_Checkpoint_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // WorkerServiceServer is the server API for WorkerService service.
 // All implementations must embed UnimplementedWorkerServiceServer
 // for forward compatibility.
 type WorkerServiceServer interface {
 	// Primary bidirectional stream for ALL worker communication
 	Session(grpc.BidiStreamingServer[WorkerRequest, WorkerResponse]) error
+	// Persist the result of a completed step of a running task. Returns once durable.
+	Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error)
 	mustEmbedUnimplementedWorkerServiceServer()
 }
 
@@ -69,6 +84,9 @@ type UnimplementedWorkerServiceServer struct{}
 
 func (UnimplementedWorkerServiceServer) Session(grpc.BidiStreamingServer[WorkerRequest, WorkerResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method Session not implemented")
+}
+func (UnimplementedWorkerServiceServer) Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Checkpoint not implemented")
 }
 func (UnimplementedWorkerServiceServer) mustEmbedUnimplementedWorkerServiceServer() {}
 func (UnimplementedWorkerServiceServer) testEmbeddedByValue()                       {}
@@ -98,13 +116,36 @@ func _WorkerService_Session_Handler(srv interface{}, stream grpc.ServerStream) e
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type WorkerService_SessionServer = grpc.BidiStreamingServer[WorkerRequest, WorkerResponse]
 
+func _WorkerService_Checkpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CheckpointRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServiceServer).Checkpoint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerService_Checkpoint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServiceServer).Checkpoint(ctx, req.(*CheckpointRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // WorkerService_ServiceDesc is the grpc.ServiceDesc for WorkerService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
 var WorkerService_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "valka.v1.WorkerService",
 	HandlerType: (*WorkerServiceServer)(nil),
-	Methods:     []grpc.MethodDesc{},
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Checkpoint",
+			Handler:    _WorkerService_Checkpoint_Handler,
+		},
+	},
 	Streams: []grpc.StreamDesc{
 		{
 			StreamName:    "Session",

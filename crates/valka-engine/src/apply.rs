@@ -8,8 +8,8 @@ use valka_core::TaskStatus;
 use valka_wal::{Envelope, FailureOutcome, WalRecord};
 
 use crate::state::{
-    DeadLetterEntry, RunState, RunStatus, ShardState, SignalState, SignalStatus, TaskState,
-    Transition,
+    CheckpointState, DeadLetterEntry, RunState, RunStatus, ShardState, SignalState, SignalStatus,
+    TaskState, Transition,
 };
 
 impl ShardState {
@@ -50,6 +50,7 @@ impl ShardState {
                     updated_at: now,
                     runs: Vec::new(),
                     signals: Vec::new(),
+                    checkpoints: Vec::new(),
                     offered: false,
                 };
                 out.push(Transition {
@@ -232,6 +233,40 @@ impl ShardState {
                     run.lease_until = run.lease_until.max(*lease_until);
                     run.last_heartbeat = now;
                 }
+            }
+
+            WalRecord::TaskCheckpointed {
+                task_id,
+                run_id,
+                step,
+                output,
+            } => {
+                let Some(t) = self.tasks.get_mut(task_id) else {
+                    return out;
+                };
+                if t.status != TaskStatus::Running {
+                    return out;
+                }
+                let Some(attempt_number) = t
+                    .runs
+                    .iter()
+                    .find(|r| r.id == *run_id && r.status == RunStatus::Running)
+                    .map(|r| r.attempt_number)
+                else {
+                    return out;
+                };
+                let checkpoint = CheckpointState {
+                    step: step.clone(),
+                    output: output.clone(),
+                    run_id: run_id.clone(),
+                    attempt_number,
+                    created_at: now,
+                };
+                match t.checkpoints.iter_mut().find(|c| c.step == *step) {
+                    Some(existing) => *existing = checkpoint,
+                    None => t.checkpoints.push(checkpoint),
+                }
+                t.updated_at = now;
             }
 
             WalRecord::TaskPromoted { task_id } => {
@@ -579,6 +614,105 @@ mod tests {
         assert_eq!(r.tasks["a"].signals, vec!["sig".to_string()]);
         assert_eq!(r.signals["sig"].status, SignalStatus::Pending);
         assert_eq!(r.snapshot_lsn, Lsn::new(1, 4));
+    }
+
+    fn dispatched(s: &mut ShardState, task: &str, run: &str, attempt: i32) {
+        s.apply(&mut env(WalRecord::TaskDispatched {
+            task_id: task.into(),
+            run_id: run.into(),
+            attempt,
+            worker_id: "w".into(),
+            node_id: "n".into(),
+            lease_until: Utc::now(),
+        }));
+    }
+
+    fn checkpointed(task: &str, run: &str, step: &str, output: serde_json::Value) -> Envelope {
+        env(WalRecord::TaskCheckpointed {
+            task_id: task.into(),
+            run_id: run.into(),
+            step: step.into(),
+            output,
+        })
+    }
+
+    #[test]
+    fn checkpoint_applies_only_to_the_running_run() {
+        let mut s = ShardState::new(ShardId(0));
+        s.apply(&mut env(WalRecord::TaskCreated { task: spec("a") }));
+        s.apply(&mut checkpointed("a", "r1", "early", serde_json::json!(0)));
+        assert!(
+            s.tasks["a"].checkpoints.is_empty(),
+            "pending task has no run"
+        );
+
+        dispatched(&mut s, "a", "r1", 1);
+        s.apply(&mut checkpointed("a", "r1", "fetch", serde_json::json!(1)));
+        s.apply(&mut checkpointed("a", "r1", "parse", serde_json::json!(2)));
+        s.apply(&mut checkpointed(
+            "a",
+            "other",
+            "rogue",
+            serde_json::json!(3),
+        ));
+        s.apply(&mut checkpointed(
+            "missing",
+            "r1",
+            "x",
+            serde_json::json!(4),
+        ));
+        let steps: Vec<&str> = s.tasks["a"]
+            .checkpoints
+            .iter()
+            .map(|c| c.step.as_str())
+            .collect();
+        assert_eq!(steps, vec!["fetch", "parse"]);
+
+        s.apply(&mut env(WalRecord::RunFailed {
+            task_id: "a".into(),
+            run_id: "r1".into(),
+            error: "boom".into(),
+            outcome: FailureOutcome::Retry { at: Utc::now() },
+        }));
+        s.apply(&mut checkpointed("a", "r1", "late", serde_json::json!(5)));
+        s.apply(&mut env(WalRecord::TaskPromoted {
+            task_id: "a".into(),
+        }));
+        dispatched(&mut s, "a", "r2", 2);
+        s.apply(&mut checkpointed("a", "r2", "fetch", serde_json::json!(10)));
+
+        let cps = &s.tasks["a"].checkpoints;
+        assert_eq!(cps.len(), 2, "the failed run's late checkpoint is a no-op");
+        assert_eq!(cps[0].step, "fetch");
+        assert_eq!(cps[0].output, serde_json::json!(10));
+        assert_eq!(cps[0].attempt_number, 2);
+        assert_eq!(cps[0].run_id, "r2");
+        assert_eq!(cps[1].attempt_number, 1);
+    }
+
+    #[test]
+    fn checkpoints_round_trip_through_snapshots_and_old_snapshots_load() {
+        let mut s = ShardState::new(ShardId(1));
+        s.apply(&mut env(WalRecord::TaskCreated { task: spec("a") }));
+        dispatched(&mut s, "a", "r1", 1);
+        s.apply(&mut checkpointed(
+            "a",
+            "r1",
+            "fetch",
+            serde_json::json!({"k": 1}),
+        ));
+        let json = serde_json::to_value(s.to_snapshot(Utc::now())).unwrap();
+        let back: ShardSnapshot = serde_json::from_value(json.clone()).unwrap();
+        let r = ShardState::from_snapshot(back, Lsn::new(1, 1));
+        assert_eq!(r.tasks["a"].checkpoints, s.tasks["a"].checkpoints);
+
+        let mut old = json;
+        old["tasks"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("checkpoints");
+        let back: ShardSnapshot = serde_json::from_value(old).unwrap();
+        assert!(back.tasks[0].checkpoints.is_empty());
     }
 
     #[test]

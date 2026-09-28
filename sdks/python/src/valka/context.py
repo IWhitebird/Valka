@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Awaitable, TYPE_CHECKING
+from typing import Any, Callable, Awaitable, Mapping, TypeVar, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from valka._proto.valka.v1 import worker_pb2
+
+T = TypeVar("T")
+_MISSING = object()
 
 
 @dataclass
@@ -30,7 +34,7 @@ class SignalData:
 class TaskContext:
     """Context provided to task handler functions.
 
-    Exposes task metadata, logging, and signal reception methods.
+    Exposes task metadata, logging, signal reception and step checkpoints.
     """
 
     def __init__(
@@ -44,6 +48,8 @@ class TaskContext:
         raw_input: str,
         raw_metadata: str,
         send_fn: Callable[[worker_pb2.WorkerRequest], Awaitable[None]],
+        checkpoints: Mapping[str, str],
+        checkpoint_fn: Callable[[str, str], Awaitable[None]],
     ) -> None:
         self.task_id = task_id
         self.task_run_id = task_run_id
@@ -55,6 +61,8 @@ class TaskContext:
         self._send_fn = send_fn
         self._signal_queue: asyncio.Queue[Any] = asyncio.Queue()
         self._signal_buffer: list[Any] = []
+        self._checkpoints = dict(checkpoints)
+        self._checkpoint_fn = checkpoint_fn
 
     def input(self) -> Any:
         """Parse and return the task input JSON. Returns None if empty."""
@@ -67,6 +75,34 @@ class TaskContext:
         if not self._raw_metadata:
             return {}
         return json.loads(self._raw_metadata)
+
+    async def step(self, name: str, fn: Callable[[], Awaitable[T] | T]) -> T:
+        """Run ``fn`` as the step ``name``, or return its result from an earlier attempt
+        that already checkpointed it.
+
+        The result must be JSON-serializable and is checkpointed before this returns, so
+        a retry of the task skips the step. A step that fails before its checkpoint
+        lands runs again.
+        """
+        done = self.checkpoint_value(name, _MISSING)
+        if done is not _MISSING:
+            return done
+        value = fn()
+        if inspect.isawaitable(value):
+            value = await value
+        await self.checkpoint(name, value)
+        return value
+
+    async def checkpoint(self, step: str, value: Any) -> None:
+        """Durably record ``value`` as the result of ``step`` for this task."""
+        output = json.dumps(value)
+        await self._checkpoint_fn(step, output)
+        self._checkpoints[step] = output
+
+    def checkpoint_value(self, step: str, default: Any = None) -> Any:
+        """The checkpointed result of ``step``, or ``default`` if no attempt recorded one."""
+        output = self._checkpoints.get(step)
+        return default if output is None else json.loads(output)
 
     async def log(self, message: str) -> None:
         """Send an INFO log entry."""

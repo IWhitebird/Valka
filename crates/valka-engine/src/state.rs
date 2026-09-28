@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use valka_core::{ShardId, TaskStatus};
 use valka_wal::{Lsn, TaskSpec};
 
-use crate::view::{DeadLetterView, RunView, SignalView, TaskView};
+use crate::view::{CheckpointView, DeadLetterView, RunView, SignalView, TaskView};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunStatus {
@@ -84,6 +84,15 @@ pub struct SignalState {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointState {
+    pub step: String,
+    pub output: Value,
+    pub run_id: String,
+    pub attempt_number: i32,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeadLetterEntry {
     pub id: String,
     pub task_id: String,
@@ -111,6 +120,9 @@ pub struct TaskState {
     pub updated_at: DateTime<Utc>,
     pub runs: Vec<RunState>,
     pub signals: Vec<String>,
+    /// Completed steps in first-completion order; a step checkpointed again is updated in place.
+    #[serde(default)]
+    pub checkpoints: Vec<CheckpointState>,
     /// Runtime-only: the task has been handed to the matching layer and must not be
     /// offered again until it leaves PENDING or is explicitly un-offered.
     #[serde(skip)]
@@ -192,6 +204,20 @@ impl TaskState {
             .collect();
         v.sort_by_key(|r| std::cmp::Reverse(r.attempt_number));
         v
+    }
+
+    pub fn checkpoint_views(&self) -> Vec<CheckpointView> {
+        self.checkpoints
+            .iter()
+            .map(|c| CheckpointView {
+                task_id: self.spec.id.clone(),
+                step: c.step.clone(),
+                output: c.output.clone(),
+                run_id: c.run_id.clone(),
+                attempt_number: c.attempt_number,
+                created_at: c.created_at,
+            })
+            .collect()
     }
 }
 

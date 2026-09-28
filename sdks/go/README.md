@@ -79,6 +79,24 @@ func main() {
 }
 ```
 
+### Step checkpoints
+
+`valka.Step` runs a named step once per task: its result is checkpointed on the server, and
+a retry of the task returns the recorded result instead of running the step again.
+
+```go
+func handle(ctx *valka.TaskContext) (interface{}, error) {
+    rows, err := valka.Step(ctx, "fetch", func() ([]Row, error) { return fetchRows(ctx) })
+    if err != nil {
+        return nil, err
+    }
+    return valka.Step(ctx, "upload", func() (string, error) { return upload(ctx, rows) })
+}
+```
+
+`ctx.Checkpoint(step, value)` and `ctx.CheckpointValue(step, &dest)` record and read
+checkpoints directly. Step results must round-trip through `encoding/json`.
+
 ## Requirements
 
 - Go 1.21+

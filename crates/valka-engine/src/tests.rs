@@ -837,3 +837,205 @@ async fn node_and_shard_stats_reflect_state() {
     );
     let _ = b;
 }
+
+async fn promote_retry(e: &Engine, task_id: &str) {
+    tokio::time::advance(Duration::from_secs(3)).await;
+    settle().await;
+    assert_eq!(e.get_task(task_id).unwrap().status, TaskStatus::Pending);
+}
+
+#[tokio::test(start_paused = true)]
+async fn checkpoints_carry_into_the_retry_dispatch() {
+    let store = Store::memory();
+    let e = open(&store).await;
+    let t = e.create_task(create("q")).await.unwrap();
+
+    let d1 = e.dispatch(&t.id, "w1").unwrap();
+    assert!(d1.checkpoints.is_empty());
+    let c = e
+        .checkpoint(
+            &t.id,
+            &d1.run_id,
+            "download",
+            serde_json::json!({"bytes": 10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(c.step, "download");
+    assert_eq!(c.attempt_number, 1);
+    assert_eq!(c.run_id, d1.run_id);
+    e.checkpoint(&t.id, &d1.run_id, "parse", serde_json::json!([1, 2]))
+        .await
+        .unwrap();
+    e.fail_run(&t.id, &d1.run_id, "enrich blew up", true)
+        .await
+        .unwrap();
+    promote_retry(&e, &t.id).await;
+
+    let d2 = e.dispatch(&t.id, "w2").unwrap();
+    let steps: Vec<(&str, i32)> = d2
+        .checkpoints
+        .iter()
+        .map(|c| (c.step.as_str(), c.attempt_number))
+        .collect();
+    assert_eq!(steps, vec![("download", 1), ("parse", 1)]);
+    assert_eq!(d2.checkpoints[0].output, serde_json::json!({"bytes": 10}));
+
+    e.checkpoint(&t.id, &d2.run_id, "enrich", serde_json::json!("ok"))
+        .await
+        .unwrap();
+    e.checkpoint(&t.id, &d2.run_id, "parse", serde_json::json!([3]))
+        .await
+        .unwrap();
+    e.complete_run(&t.id, &d2.run_id, None).await.unwrap();
+
+    let all = e.checkpoints_for_task(&t.id).unwrap();
+    let steps: Vec<(&str, i32)> = all
+        .iter()
+        .map(|c| (c.step.as_str(), c.attempt_number))
+        .collect();
+    assert_eq!(
+        steps,
+        vec![("download", 1), ("parse", 2), ("enrich", 2)],
+        "re-checkpointing a step updates it in place"
+    );
+    assert_eq!(all[1].output, serde_json::json!([3]));
+
+    e.sync().await.unwrap();
+    let recs = reader::read_all(&store, "node-a", None).await.unwrap();
+    let written = recs
+        .iter()
+        .filter(|(_, r)| r.record.kind() == "task_checkpointed")
+        .count();
+    assert_eq!(written, 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn checkpoint_is_fenced_to_the_current_running_run() {
+    use valka_core::ServerError;
+    let store = Store::memory();
+    let e = open(&store).await;
+    let mut req = create("q");
+    req.timeout_seconds = 5;
+    let t = e.create_task(req).await.unwrap();
+
+    let pending = e
+        .checkpoint(&t.id, "no-run", "s", serde_json::Value::Null)
+        .await;
+    assert!(matches!(
+        pending,
+        Err(ServerError::InvalidStatusTransition { .. })
+    ));
+
+    let d1 = e.dispatch(&t.id, "w").unwrap();
+    tokio::time::advance(Duration::from_secs(36)).await;
+    settle().await;
+    assert_eq!(e.get_task(&t.id).unwrap().status, TaskStatus::Retry);
+    promote_retry(&e, &t.id).await;
+    let d2 = e.dispatch(&t.id, "w").unwrap();
+
+    let stale = e
+        .checkpoint(&t.id, &d1.run_id, "s", serde_json::Value::Null)
+        .await;
+    assert!(stale.is_err(), "the expired run may not checkpoint");
+    assert!(d2.checkpoints.is_empty());
+
+    e.complete_run(&t.id, &d2.run_id, None).await.unwrap();
+    let finished = e
+        .checkpoint(&t.id, &d2.run_id, "s", serde_json::Value::Null)
+        .await;
+    assert!(finished.is_err());
+
+    let c = e.create_task(create("q")).await.unwrap();
+    let dc = e.dispatch(&c.id, "w").unwrap();
+    e.cancel_task(&c.id, "user").await.unwrap();
+    let cancelled = e
+        .checkpoint(&c.id, &dc.run_id, "s", serde_json::Value::Null)
+        .await;
+    assert!(cancelled.is_err());
+
+    assert!(matches!(
+        e.checkpoint("not-a-task", "r", "s", serde_json::Value::Null)
+            .await,
+        Err(ServerError::TaskNotFound(_))
+    ));
+    assert!(e.checkpoints_for_task(&t.id).unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn checkpoint_limits_are_enforced() {
+    use crate::checkpoints::{MAX_CHECKPOINT_BYTES, MAX_CHECKPOINTS_PER_TASK, MAX_STEP_NAME_LEN};
+    use valka_core::ServerError;
+    let store = Store::memory();
+    let e = open(&store).await;
+    let t = e.create_task(create("q")).await.unwrap();
+    let d = e.dispatch(&t.id, "w").unwrap();
+    let run = d.run_id.as_str();
+    let invalid = |r: Result<crate::CheckpointView, ServerError>| {
+        matches!(r, Err(ServerError::InvalidArgument(_)))
+    };
+
+    assert!(invalid(
+        e.checkpoint(&t.id, run, "", serde_json::Value::Null).await
+    ));
+    let long_name = "s".repeat(MAX_STEP_NAME_LEN + 1);
+    assert!(invalid(
+        e.checkpoint(&t.id, run, &long_name, serde_json::Value::Null)
+            .await
+    ));
+    let too_big = serde_json::Value::String("x".repeat(MAX_CHECKPOINT_BYTES));
+    assert!(invalid(e.checkpoint(&t.id, run, "big", too_big).await));
+
+    for i in 0..MAX_CHECKPOINTS_PER_TASK {
+        e.checkpoint(&t.id, run, &format!("step-{i}"), serde_json::json!(i))
+            .await
+            .unwrap();
+    }
+    assert!(invalid(
+        e.checkpoint(&t.id, run, "one-too-many", serde_json::Value::Null)
+            .await
+    ));
+    e.checkpoint(&t.id, run, "step-0", serde_json::json!("updated"))
+        .await
+        .expect("updating an existing step is allowed at the limit");
+    assert_eq!(
+        e.checkpoints_for_task(&t.id).unwrap().len(),
+        MAX_CHECKPOINTS_PER_TASK
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn checkpoints_survive_crash_via_snapshot_and_wal_tail() {
+    let store = Store::memory();
+    let id;
+    {
+        let e = open(&store).await;
+        let t = e.create_task(create("q")).await.unwrap();
+        let d = e.dispatch(&t.id, "w").unwrap();
+        e.checkpoint(&t.id, &d.run_id, "in-snapshot", serde_json::json!(1))
+            .await
+            .unwrap();
+        e.snapshot_now().await;
+        e.checkpoint(&t.id, &d.run_id, "in-wal-tail", serde_json::json!(2))
+            .await
+            .unwrap();
+        id = t.id;
+    }
+    let e2 = open(&store).await;
+    let steps: Vec<String> = e2
+        .checkpoints_for_task(&id)
+        .unwrap()
+        .into_iter()
+        .map(|c| c.step)
+        .collect();
+    assert_eq!(steps, vec!["in-snapshot", "in-wal-tail"]);
+
+    tokio::time::advance(Duration::from_secs(61)).await;
+    settle().await;
+    assert_eq!(e2.get_task(&id).unwrap().status, TaskStatus::Retry);
+    promote_retry(&e2, &id).await;
+    let d = e2.dispatch(&id, "w").unwrap();
+    assert_eq!(d.attempt, 2);
+    assert_eq!(d.checkpoints.len(), 2);
+    assert_eq!(d.checkpoints[1].output, serde_json::json!(2));
+}

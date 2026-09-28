@@ -11,6 +11,7 @@ fn test_task_assignment_construction() {
         attempt_number: 1,
         timeout_seconds: 300,
         metadata: "{}".to_string(),
+        checkpoints: vec![],
     };
     assert_eq!(assignment.task_id, "task-123");
     assert_eq!(assignment.queue_name, "emails");
@@ -29,6 +30,7 @@ fn test_worker_response_task_assignment_variant() {
             attempt_number: 1,
             timeout_seconds: 60,
             metadata: String::new(),
+            checkpoints: vec![],
         })),
     };
 

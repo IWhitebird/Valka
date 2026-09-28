@@ -64,6 +64,22 @@ async def main():
 asyncio.run(main())
 ```
 
+### Step checkpoints
+
+`ctx.step` runs a named step once per task: its result is checkpointed on the server, and a
+retry of the task returns the recorded result instead of running the step again. The step
+function may be sync or async; its result must be JSON-serializable.
+
+```python
+async def handle(ctx: TaskContext) -> dict:
+    rows = await ctx.step("fetch", fetch_rows)
+    url = await ctx.step("upload", lambda: upload(rows))
+    return {"url": url}
+```
+
+`await ctx.checkpoint(step, value)` and `ctx.checkpoint_value(step, default)` record and read
+checkpoints directly.
+
 ## Requirements
 
 - Python 3.10+

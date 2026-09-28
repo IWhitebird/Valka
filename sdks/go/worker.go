@@ -222,7 +222,7 @@ func (w *ValkaWorker) session(ctx context.Context) error {
 			return nil
 		}
 
-		w.handleResponse(ctx, resp)
+		w.handleResponse(ctx, resp, client)
 	}
 }
 
@@ -272,10 +272,10 @@ func (w *ValkaWorker) heartbeatLoop(ctx context.Context) {
 	}
 }
 
-func (w *ValkaWorker) handleResponse(ctx context.Context, resp *pb.WorkerResponse) {
+func (w *ValkaWorker) handleResponse(ctx context.Context, resp *pb.WorkerResponse, client pb.WorkerServiceClient) {
 	switch msg := resp.Response.(type) {
 	case *pb.WorkerResponse_TaskAssignment:
-		w.handleTaskAssignment(ctx, msg.TaskAssignment)
+		w.handleTaskAssignment(ctx, msg.TaskAssignment, client)
 	case *pb.WorkerResponse_TaskCancellation:
 		w.handleTaskCancellation(msg.TaskCancellation)
 	case *pb.WorkerResponse_TaskSignal:
@@ -303,7 +303,7 @@ func (w *ValkaWorker) handleTaskSignal(signal *pb.TaskSignal) {
 	}
 }
 
-func (w *ValkaWorker) handleTaskAssignment(ctx context.Context, assignment *pb.TaskAssignment) {
+func (w *ValkaWorker) handleTaskAssignment(ctx context.Context, assignment *pb.TaskAssignment, client pb.WorkerServiceClient) {
 	// Acquire semaphore slot
 	w.semaphore <- struct{}{}
 	w.wg.Add(1)
@@ -323,7 +323,7 @@ func (w *ValkaWorker) handleTaskAssignment(ctx context.Context, assignment *pb.T
 			w.wg.Done()
 		}()
 
-		w.executeTask(taskCtx, taskCancel, assignment, sigCh)
+		w.executeTask(taskCtx, taskCancel, assignment, sigCh, client)
 	}()
 }
 
@@ -334,7 +334,7 @@ func (w *ValkaWorker) handleTaskCancellation(cancellation *pb.TaskCancellation) 
 	}
 }
 
-func (w *ValkaWorker) executeTask(ctx context.Context, cancel context.CancelFunc, assignment *pb.TaskAssignment, sigCh chan *pb.TaskSignal) {
+func (w *ValkaWorker) executeTask(ctx context.Context, cancel context.CancelFunc, assignment *pb.TaskAssignment, sigCh chan *pb.TaskSignal, client pb.WorkerServiceClient) {
 	defer cancel()
 
 	tctx := &TaskContext{
@@ -355,6 +355,19 @@ func (w *ValkaWorker) executeTask(ctx context.Context, cancel context.CancelFunc
 		},
 		cancel:   cancel,
 		signalCh: sigCh,
+		checkpointFn: func(ctx context.Context, step, output string) error {
+			_, err := client.Checkpoint(ctx, &pb.CheckpointRequest{
+				TaskId:    assignment.TaskId,
+				TaskRunId: assignment.TaskRunId,
+				Step:      step,
+				Output:    output,
+			})
+			return err
+		},
+		checkpoints: make(map[string]string, len(assignment.Checkpoints)),
+	}
+	for _, cp := range assignment.Checkpoints {
+		tctx.checkpoints[cp.Step] = cp.Output
 	}
 
 	success := false

@@ -72,6 +72,15 @@ export function useTaskRuns(taskId: string) {
   });
 }
 
+export function useTaskCheckpoints(taskId: string) {
+  return useQuery({
+    queryKey: ["tasks", taskId, "checkpoints"],
+    queryFn: () => tasksApi.getCheckpoints(taskId),
+    enabled: !!taskId,
+    refetchInterval: 5_000,
+  });
+}
+
 export function useTaskRunLogs(taskId: string, runId: string) {
   return useQuery({
     queryKey: ["tasks", taskId, "runs", runId, "logs"],

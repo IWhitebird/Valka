@@ -82,6 +82,7 @@ their own records (`LeaseExpired`, `Promoted`) so recovery is deterministic.
 | `RunFailed` | task_id, run_id, error, retryable, next_attempt_at | RUNNING → RETRY / FAILED / DEAD_LETTER |
 | `LeaseExpired` | task_id, run_id, next_attempt_at | RUNNING → RETRY / DEAD_LETTER |
 | `LeaseExtended` | task_id, run_id, lease_until | heartbeat (coalesced, see §6) |
+| `TaskCheckpointed` | task_id, run_id, step, output | records a completed step (see §16) |
 | `TaskPromoted` | task_id | RETRY/scheduled → PENDING |
 | `TaskCancelled` | task_id, reason | any non-terminal → CANCELLED |
 | `TaskDeleted` | task_id | removes task and its runs/DLQ entry |
@@ -215,3 +216,24 @@ state (their history remains in the WAL/snapshots in the bucket).
 - Roll back RAM state on persistent PUT failure vs. restart the node? Phase 1: restart.
 - Payload blob threshold (probably 64 KB) — deferred.
 - `ack=fast` per-task mode — deferred.
+
+## 16. Step checkpoints
+
+A running run may record that it completed a named step: `WorkerService.Checkpoint`
+(`task_id`, `task_run_id`, `step`, JSON `output`) → `TaskCheckpointed`, acknowledged only
+once durable, like `RunCompleted`.
+
+- **Fencing.** The engine accepts a checkpoint only from the task's current RUNNING run;
+  `apply` re-checks the same precondition, so a stale run (lease expired, cancelled,
+  finished) can never add or overwrite one, at runtime or on replay.
+- **State.** `TaskState.checkpoints` holds steps in first-completion order; checkpointing a
+  step again updates it in place. Checkpoints are part of the task, so snapshots, eviction
+  and `TaskDeleted` cover them with no extra machinery.
+- **Resume.** Every dispatch carries the task's checkpoints in `TaskAssignment.checkpoints`.
+  The SDKs' `step(name, fn)` returns a recorded result without running `fn`, otherwise runs
+  it and checkpoints the result before returning.
+- **Semantics.** A checkpointed step never re-runs. The step in progress when an attempt
+  dies runs again (at-least-once), so steps with external side effects must be idempotent.
+- **Limits.** Step names 1–256 bytes, outputs ≤ 256 KiB of JSON, ≤ 256 distinct steps per
+  task (`valka_engine::MAX_*`); violations are `INVALID_ARGUMENT`.
+- **Read path.** `GET /api/v1/tasks/{id}/checkpoints`; the task page shows a Steps table.

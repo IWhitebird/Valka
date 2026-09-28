@@ -9,8 +9,8 @@ use valka_engine::Engine;
 use valka_matching::MatchingService;
 use valka_matching::partition::TaskEnvelope;
 use valka_proto::{
-    Heartbeat, LogBatch, SignalAck, TaskAssignment, TaskCancellation, TaskResult, TaskSignal,
-    WorkerResponse, worker_response,
+    Heartbeat, LogBatch, SignalAck, StepCheckpoint, TaskAssignment, TaskCancellation, TaskResult,
+    TaskSignal, WorkerResponse, worker_response,
 };
 use valka_wal::logstore::LogLine;
 
@@ -158,6 +158,16 @@ impl DispatcherService {
             attempt_number: info.attempt,
             timeout_seconds: info.task.timeout_seconds,
             metadata: info.task.metadata.to_string(),
+            checkpoints: info
+                .checkpoints
+                .into_iter()
+                .map(|c| StepCheckpoint {
+                    step: c.step,
+                    output: c.output.to_string(),
+                    attempt_number: c.attempt_number,
+                    created_at_ms: c.created_at.timestamp_millis(),
+                })
+                .collect(),
         };
 
         let tx = {

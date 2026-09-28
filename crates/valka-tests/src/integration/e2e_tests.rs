@@ -231,3 +231,88 @@ async fn e2e_server_crash_and_restart_worker_reconnects() {
         );
     }
 }
+
+#[tokio::test]
+async fn e2e_retry_resumes_after_the_last_checkpointed_step() {
+    let port = free_port().await;
+    let server = start_server(Store::memory(), "e2e-steps", port).await;
+    let runs: Arc<[AtomicUsize; 3]> = Arc::new(Default::default());
+
+    let counters = runs.clone();
+    let worker = ValkaWorker::builder()
+        .name("steps-worker")
+        .server_addr(&server.addr)
+        .queues(&["pipeline"])
+        .handler(move |ctx| {
+            let counters = counters.clone();
+            async move {
+                let c = &counters;
+                let rows: u32 = ctx
+                    .step("fetch", || async move {
+                        c[0].fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, String>(3)
+                    })
+                    .await?;
+                let doubled: u32 = ctx
+                    .step("transform", || async move {
+                        if c[1].fetch_add(1, Ordering::SeqCst) == 0 {
+                            return Err("flaky transform".to_string());
+                        }
+                        Ok(rows * 2)
+                    })
+                    .await?;
+                let saved: String = ctx
+                    .step("store", || async move {
+                        c[2].fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, String>(format!("stored {doubled}"))
+                    })
+                    .await?;
+                Ok(serde_json::json!({"result": saved, "attempt": ctx.attempt_number}))
+            }
+        })
+        .build()
+        .await
+        .unwrap();
+    let stop = worker.shutdown_handle();
+    let worker_task = tokio::spawn(worker.run());
+
+    let mut client = ValkaClient::connect(&server.addr).await.unwrap();
+    let id = client
+        .create_task("pipeline", "etl", None)
+        .await
+        .unwrap()
+        .id;
+    let t = wait_status(&mut client, &id, 4, Duration::from_secs(15)).await;
+
+    let out: serde_json::Value = serde_json::from_str(&t.output).unwrap();
+    assert_eq!(out, serde_json::json!({"result": "stored 6", "attempt": 2}));
+    assert_eq!(t.attempt_count, 2);
+    let executions: Vec<usize> = runs.iter().map(|c| c.load(Ordering::SeqCst)).collect();
+    assert_eq!(
+        executions,
+        vec![1, 2, 1],
+        "fetch ran once, transform retried, store once"
+    );
+
+    let steps: Vec<(String, i32)> = server
+        .node
+        .engine
+        .checkpoints_for_task(&id)
+        .unwrap()
+        .into_iter()
+        .map(|c| (c.step, c.attempt_number))
+        .collect();
+    assert_eq!(
+        steps,
+        vec![
+            ("fetch".to_string(), 1),
+            ("transform".to_string(), 2),
+            ("store".to_string(), 2)
+        ]
+    );
+
+    stop.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker_task).await;
+    let _ = server.shutdown.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), server.handle).await;
+}

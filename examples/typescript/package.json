@@ -7,7 +7,8 @@
     "producer": "tsx producer.ts",
     "worker": "tsx worker.ts",
     "full-lifecycle": "tsx full-lifecycle.ts",
-    "signal-demo": "tsx signal-demo.ts"
+    "signal-demo": "tsx signal-demo.ts",
+    "steps": "tsx steps.ts"
   },
   "dependencies": {
     "@valka/sdk": "file:../../sdks/typescript"

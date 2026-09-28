@@ -6,6 +6,7 @@
 //! snapshots plus WAL replay. See `docs/wal/DESIGN.md`.
 
 pub mod apply;
+mod checkpoints;
 pub mod clock;
 pub mod engine;
 pub mod ingest;
@@ -22,12 +23,13 @@ pub mod timers;
 pub mod view;
 mod write_path;
 
+pub use checkpoints::{MAX_CHECKPOINT_BYTES, MAX_CHECKPOINTS_PER_TASK, MAX_STEP_NAME_LEN};
 pub use clock::{Clock, TokioClock};
 pub use engine::{CreateTask, DispatchInfo, Engine, EngineConfig, EngineEvent, FailResult};
 pub use ingest::LogIngester;
 pub use sink::{DispatchableTask, NoopSink, OfferOutcome, TaskSink};
 pub use stats::{NodeStats, ShardDetail, ShardStats, TaskCounts};
-pub use view::{DeadLetterView, RunView, SignalView, TaskView};
+pub use view::{CheckpointView, DeadLetterView, RunView, SignalView, TaskView};
 
 #[cfg(test)]
 mod tests;

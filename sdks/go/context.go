@@ -3,6 +3,7 @@ package valka
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"time"
 
 	pb "github.com/valka-queue/valka/sdks/go/proto/valkav1"
@@ -40,6 +41,53 @@ type TaskContext struct {
 	cancel   context.CancelFunc
 	signalCh chan *pb.TaskSignal
 	sigBuf   []*pb.TaskSignal
+
+	checkpointFn  func(ctx context.Context, step, output string) error
+	checkpointsMu sync.Mutex
+	checkpoints   map[string]string
+}
+
+// Step runs fn as the step name, or returns its result from an earlier attempt that
+// already checkpointed it. The result is checkpointed before Step returns, so a retry of
+// the task skips the step. T must round-trip through encoding/json.
+func Step[T any](c *TaskContext, name string, fn func() (T, error)) (T, error) {
+	var value T
+	found, err := c.CheckpointValue(name, &value)
+	if err != nil || found {
+		return value, err
+	}
+	value, err = fn()
+	if err != nil {
+		return value, err
+	}
+	return value, c.Checkpoint(name, value)
+}
+
+// Checkpoint durably records value as the result of step for this task.
+func (c *TaskContext) Checkpoint(step string, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	if err := c.checkpointFn(c, step, string(data)); err != nil {
+		return err
+	}
+	c.checkpointsMu.Lock()
+	defer c.checkpointsMu.Unlock()
+	c.checkpoints[step] = string(data)
+	return nil
+}
+
+// CheckpointValue decodes the checkpointed result of step into dest and reports whether
+// any attempt of this task recorded one.
+func (c *TaskContext) CheckpointValue(step string, dest any) (bool, error) {
+	c.checkpointsMu.Lock()
+	output, ok := c.checkpoints[step]
+	c.checkpointsMu.Unlock()
+	if !ok {
+		return false, nil
+	}
+	return true, json.Unmarshal([]byte(output), dest)
 }
 
 // Input parses the task input JSON into the provided destination.

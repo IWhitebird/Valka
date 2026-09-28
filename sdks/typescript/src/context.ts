@@ -1,7 +1,12 @@
-import type { DeepPartial, WorkerRequest } from "./generated/valka/v1/worker.js";
+import type {
+  DeepPartial,
+  StepCheckpoint,
+  WorkerRequest,
+} from "./generated/valka/v1/worker.js";
 import { LogLevel } from "./types.js";
 
 type SendFn = (msg: DeepPartial<WorkerRequest>) => void;
+type CheckpointFn = (step: string, output: string) => Promise<void>;
 
 export interface SignalData {
   signalId: string;
@@ -24,6 +29,8 @@ export class TaskContext {
   private readonly rawInput: string;
   private readonly rawMetadata: string;
   private readonly sendFn: SendFn;
+  private readonly checkpointFn: CheckpointFn;
+  private readonly checkpoints: Map<string, string>;
   private readonly signalBuffer: SignalData[] = [];
   private readonly signalWaiters: SignalWaiter[] = [];
 
@@ -37,6 +44,8 @@ export class TaskContext {
     input: string,
     metadata: string,
     sendFn: SendFn,
+    checkpoints: StepCheckpoint[],
+    checkpointFn: CheckpointFn,
   ) {
     this.taskId = taskId;
     this.taskRunId = taskRunId;
@@ -46,6 +55,35 @@ export class TaskContext {
     this.rawInput = input;
     this.rawMetadata = metadata;
     this.sendFn = sendFn;
+    this.checkpoints = new Map(checkpoints.map((c) => [c.step, c.output]));
+    this.checkpointFn = checkpointFn;
+  }
+
+  /**
+   * Run `fn` as the step `name`, or return its result from an earlier attempt that already
+   * checkpointed it. The result must be JSON-serializable and is checkpointed before this
+   * resolves, so a retry of the task skips the step.
+   */
+  async step<T>(name: string, fn: () => T | Promise<T>): Promise<T> {
+    if (this.checkpoints.has(name)) {
+      return this.checkpointValue<T>(name) as T;
+    }
+    const value = await fn();
+    await this.checkpoint(name, value);
+    return value;
+  }
+
+  /** Durably record `value` as the result of `step` for this task. */
+  async checkpoint(step: string, value: unknown): Promise<void> {
+    const output = JSON.stringify(value ?? null);
+    await this.checkpointFn(step, output);
+    this.checkpoints.set(step, output);
+  }
+
+  /** The checkpointed result of `step`, or `undefined` if no attempt recorded one. */
+  checkpointValue<T = unknown>(step: string): T | undefined {
+    const output = this.checkpoints.get(step);
+    return output === undefined ? undefined : (JSON.parse(output) as T);
   }
 
   /** Parse the task input JSON. */

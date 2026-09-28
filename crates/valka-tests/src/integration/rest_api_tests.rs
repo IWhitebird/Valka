@@ -547,6 +547,48 @@ async fn test_rest_get_task_runs_empty() {
     assert_eq!(body, serde_json::json!([]));
 }
 
+#[tokio::test(start_paused = true)]
+async fn test_rest_get_task_checkpoints() {
+    let node = TestNode::new().await;
+    let t = node.create("q", "t").await;
+    let uri = format!("/api/v1/tasks/{}/checkpoints", t.id);
+    let body = parse_response_json(node.router().oneshot(get_req(&uri)).await.unwrap()).await;
+    assert_eq!(body, serde_json::json!([]));
+
+    let run = node.start(&t.id, "worker-1");
+    for (step, out) in [
+        ("fetch", serde_json::json!({"rows": 2})),
+        ("parse", serde_json::json!(null)),
+    ] {
+        node.engine
+            .checkpoint(&t.id, &run, step, out)
+            .await
+            .unwrap();
+    }
+    let body = parse_response_json(node.router().oneshot(get_req(&uri)).await.unwrap()).await;
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["step"], "fetch");
+    assert_eq!(arr[0]["output"], serde_json::json!({"rows": 2}));
+    assert_eq!(arr[0]["run_id"], run);
+    assert_eq!(arr[0]["attempt_number"], 1);
+    assert_eq!(arr[0]["task_id"], t.id);
+    assert!(arr[0]["created_at"].is_string());
+    assert_eq!(arr[1]["step"], "parse");
+    assert!(arr[1]["output"].is_null());
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_get_task_checkpoints_unknown_task() {
+    let node = TestNode::new().await;
+    let response = node
+        .router()
+        .oneshot(get_req("/api/v1/tasks/unknown/checkpoints"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
 async fn push_logs(node: &TestNode, run: &str, n: i64) {
     for i in 0..n {
         node.log_tx

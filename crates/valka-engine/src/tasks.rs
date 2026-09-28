@@ -234,6 +234,7 @@ impl Engine {
                     attempt,
                     lease_until,
                     task: dispatchable(t, attempt),
+                    checkpoints: t.checkpoint_views(),
                 };
                 Ok((
                     WalRecord::TaskDispatched {

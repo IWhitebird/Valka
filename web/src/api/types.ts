@@ -42,6 +42,15 @@ export interface TaskRun {
   last_heartbeat: string;
 }
 
+export interface TaskCheckpoint {
+  task_id: string;
+  step: string;
+  output: unknown;
+  run_id: string;
+  attempt_number: number;
+  created_at: string;
+}
+
 export interface TaskLog {
   id: number;
   task_run_id: string;

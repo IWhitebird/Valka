@@ -25,7 +25,7 @@ _sym_db = _symbol_database.Default()
 from . import common_pb2 as valka_dot_v1_dot_common__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x15valka/v1/worker.proto\x12\x08valka.v1\x1a\x15valka/v1/common.proto\"\x9d\x02\n\rWorkerRequest\x12&\n\x05hello\x18\x01 \x01(\x0b\x32\x15.valka.v1.WorkerHelloH\x00\x12+\n\x0btask_result\x18\x02 \x01(\x0b\x32\x14.valka.v1.TaskResultH\x00\x12(\n\theartbeat\x18\x03 \x01(\x0b\x32\x13.valka.v1.HeartbeatH\x00\x12\'\n\tlog_batch\x18\x04 \x01(\x0b\x32\x12.valka.v1.LogBatchH\x00\x12.\n\x08shutdown\x18\x05 \x01(\x0b\x32\x1a.valka.v1.GracefulShutdownH\x00\x12)\n\nsignal_ack\x18\x06 \x01(\x0b\x32\x13.valka.v1.SignalAckH\x00\x42\t\n\x07request\"\x9d\x02\n\x0eWorkerResponse\x12\x33\n\x0ftask_assignment\x18\x01 \x01(\x0b\x32\x18.valka.v1.TaskAssignmentH\x00\x12\x37\n\x11task_cancellation\x18\x02 \x01(\x0b\x32\x1a.valka.v1.TaskCancellationH\x00\x12/\n\rheartbeat_ack\x18\x03 \x01(\x0b\x32\x16.valka.v1.HeartbeatAckH\x00\x12\x33\n\x0fserver_shutdown\x18\x04 \x01(\x0b\x32\x18.valka.v1.ServerShutdownH\x00\x12+\n\x0btask_signal\x18\x05 \x01(\x0b\x32\x14.valka.v1.TaskSignalH\x00\x42\n\n\x08response\"l\n\x0bWorkerHello\x12\x11\n\tworker_id\x18\x01 \x01(\t\x12\x13\n\x0bworker_name\x18\x02 \x01(\t\x12\x0e\n\x06queues\x18\x03 \x03(\t\x12\x13\n\x0b\x63oncurrency\x18\x04 \x01(\x05\x12\x10\n\x08metadata\x18\x05 \x01(\t\"}\n\nTaskResult\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x13\n\x0btask_run_id\x18\x02 \x01(\t\x12\x0f\n\x07success\x18\x03 \x01(\x08\x12\x11\n\tretryable\x18\x04 \x01(\x08\x12\x0e\n\x06output\x18\x05 \x01(\t\x12\x15\n\rerror_message\x18\x06 \x01(\t\":\n\tHeartbeat\x12\x17\n\x0f\x61\x63tive_task_ids\x18\x01 \x03(\t\x12\x14\n\x0ctimestamp_ms\x18\x02 \x01(\x03\"/\n\x08LogBatch\x12#\n\x07\x65ntries\x18\x01 \x03(\x0b\x32\x12.valka.v1.LogEntry\"{\n\x08LogEntry\x12\x13\n\x0btask_run_id\x18\x01 \x01(\t\x12\x14\n\x0ctimestamp_ms\x18\x02 \x01(\x03\x12!\n\x05level\x18\x03 \x01(\x0e\x32\x12.valka.v1.LogLevel\x12\x0f\n\x07message\x18\x04 \x01(\t\x12\x10\n\x08metadata\x18\x05 \x01(\t\"\"\n\x10GracefulShutdown\x12\x0e\n\x06reason\x18\x01 \x01(\t\"\xaf\x01\n\x0eTaskAssignment\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x13\n\x0btask_run_id\x18\x02 \x01(\t\x12\x12\n\nqueue_name\x18\x03 \x01(\t\x12\x11\n\ttask_name\x18\x04 \x01(\t\x12\r\n\x05input\x18\x05 \x01(\t\x12\x16\n\x0e\x61ttempt_number\x18\x06 \x01(\x05\x12\x17\n\x0ftimeout_seconds\x18\x07 \x01(\x05\x12\x10\n\x08metadata\x18\x08 \x01(\t\"3\n\x10TaskCancellation\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x0e\n\x06reason\x18\x02 \x01(\t\"+\n\x0cHeartbeatAck\x12\x1b\n\x13server_timestamp_ms\x18\x01 \x01(\x03\"7\n\x0eServerShutdown\x12\x0e\n\x06reason\x18\x01 \x01(\t\x12\x15\n\rdrain_seconds\x18\x02 \x01(\x05\"l\n\nTaskSignal\x12\x11\n\tsignal_id\x18\x01 \x01(\t\x12\x0f\n\x07task_id\x18\x02 \x01(\t\x12\x13\n\x0bsignal_name\x18\x03 \x01(\t\x12\x0f\n\x07payload\x18\x04 \x01(\t\x12\x14\n\x0ctimestamp_ms\x18\x05 \x01(\x03\"\x1e\n\tSignalAck\x12\x11\n\tsignal_id\x18\x01 \x01(\t2Q\n\rWorkerService\x12@\n\x07Session\x12\x17.valka.v1.WorkerRequest\x1a\x18.valka.v1.WorkerResponse(\x01\x30\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x15valka/v1/worker.proto\x12\x08valka.v1\x1a\x15valka/v1/common.proto\"\x9d\x02\n\rWorkerRequest\x12&\n\x05hello\x18\x01 \x01(\x0b\x32\x15.valka.v1.WorkerHelloH\x00\x12+\n\x0btask_result\x18\x02 \x01(\x0b\x32\x14.valka.v1.TaskResultH\x00\x12(\n\theartbeat\x18\x03 \x01(\x0b\x32\x13.valka.v1.HeartbeatH\x00\x12\'\n\tlog_batch\x18\x04 \x01(\x0b\x32\x12.valka.v1.LogBatchH\x00\x12.\n\x08shutdown\x18\x05 \x01(\x0b\x32\x1a.valka.v1.GracefulShutdownH\x00\x12)\n\nsignal_ack\x18\x06 \x01(\x0b\x32\x13.valka.v1.SignalAckH\x00\x42\t\n\x07request\"\x9d\x02\n\x0eWorkerResponse\x12\x33\n\x0ftask_assignment\x18\x01 \x01(\x0b\x32\x18.valka.v1.TaskAssignmentH\x00\x12\x37\n\x11task_cancellation\x18\x02 \x01(\x0b\x32\x1a.valka.v1.TaskCancellationH\x00\x12/\n\rheartbeat_ack\x18\x03 \x01(\x0b\x32\x16.valka.v1.HeartbeatAckH\x00\x12\x33\n\x0fserver_shutdown\x18\x04 \x01(\x0b\x32\x18.valka.v1.ServerShutdownH\x00\x12+\n\x0btask_signal\x18\x05 \x01(\x0b\x32\x14.valka.v1.TaskSignalH\x00\x42\n\n\x08response\"l\n\x0bWorkerHello\x12\x11\n\tworker_id\x18\x01 \x01(\t\x12\x13\n\x0bworker_name\x18\x02 \x01(\t\x12\x0e\n\x06queues\x18\x03 \x03(\t\x12\x13\n\x0b\x63oncurrency\x18\x04 \x01(\x05\x12\x10\n\x08metadata\x18\x05 \x01(\t\"}\n\nTaskResult\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x13\n\x0btask_run_id\x18\x02 \x01(\t\x12\x0f\n\x07success\x18\x03 \x01(\x08\x12\x11\n\tretryable\x18\x04 \x01(\x08\x12\x0e\n\x06output\x18\x05 \x01(\t\x12\x15\n\rerror_message\x18\x06 \x01(\t\":\n\tHeartbeat\x12\x17\n\x0f\x61\x63tive_task_ids\x18\x01 \x03(\t\x12\x14\n\x0ctimestamp_ms\x18\x02 \x01(\x03\"/\n\x08LogBatch\x12#\n\x07\x65ntries\x18\x01 \x03(\x0b\x32\x12.valka.v1.LogEntry\"{\n\x08LogEntry\x12\x13\n\x0btask_run_id\x18\x01 \x01(\t\x12\x14\n\x0ctimestamp_ms\x18\x02 \x01(\x03\x12!\n\x05level\x18\x03 \x01(\x0e\x32\x12.valka.v1.LogLevel\x12\x0f\n\x07message\x18\x04 \x01(\t\x12\x10\n\x08metadata\x18\x05 \x01(\t\"\"\n\x10GracefulShutdown\x12\x0e\n\x06reason\x18\x01 \x01(\t\"\xde\x01\n\x0eTaskAssignment\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x13\n\x0btask_run_id\x18\x02 \x01(\t\x12\x12\n\nqueue_name\x18\x03 \x01(\t\x12\x11\n\ttask_name\x18\x04 \x01(\t\x12\r\n\x05input\x18\x05 \x01(\t\x12\x16\n\x0e\x61ttempt_number\x18\x06 \x01(\x05\x12\x17\n\x0ftimeout_seconds\x18\x07 \x01(\x05\x12\x10\n\x08metadata\x18\x08 \x01(\t\x12-\n\x0b\x63heckpoints\x18\t \x03(\x0b\x32\x18.valka.v1.StepCheckpoint\"]\n\x0eStepCheckpoint\x12\x0c\n\x04step\x18\x01 \x01(\t\x12\x0e\n\x06output\x18\x02 \x01(\t\x12\x16\n\x0e\x61ttempt_number\x18\x03 \x01(\x05\x12\x15\n\rcreated_at_ms\x18\x04 \x01(\x03\"3\n\x10TaskCancellation\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x0e\n\x06reason\x18\x02 \x01(\t\"+\n\x0cHeartbeatAck\x12\x1b\n\x13server_timestamp_ms\x18\x01 \x01(\x03\"7\n\x0eServerShutdown\x12\x0e\n\x06reason\x18\x01 \x01(\t\x12\x15\n\rdrain_seconds\x18\x02 \x01(\x05\"l\n\nTaskSignal\x12\x11\n\tsignal_id\x18\x01 \x01(\t\x12\x0f\n\x07task_id\x18\x02 \x01(\t\x12\x13\n\x0bsignal_name\x18\x03 \x01(\t\x12\x0f\n\x07payload\x18\x04 \x01(\t\x12\x14\n\x0ctimestamp_ms\x18\x05 \x01(\x03\"\x1e\n\tSignalAck\x12\x11\n\tsignal_id\x18\x01 \x01(\t\"W\n\x11\x43heckpointRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x13\n\x0btask_run_id\x18\x02 \x01(\t\x12\x0c\n\x04step\x18\x03 \x01(\t\x12\x0e\n\x06output\x18\x04 \x01(\t\"\x14\n\x12\x43heckpointResponse2\x9a\x01\n\rWorkerService\x12@\n\x07Session\x12\x17.valka.v1.WorkerRequest\x1a\x18.valka.v1.WorkerResponse(\x01\x30\x01\x12G\n\nCheckpoint\x12\x1b.valka.v1.CheckpointRequest\x1a\x1c.valka.v1.CheckpointResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -49,17 +49,23 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_GRACEFULSHUTDOWN']._serialized_start=1105
   _globals['_GRACEFULSHUTDOWN']._serialized_end=1139
   _globals['_TASKASSIGNMENT']._serialized_start=1142
-  _globals['_TASKASSIGNMENT']._serialized_end=1317
-  _globals['_TASKCANCELLATION']._serialized_start=1319
-  _globals['_TASKCANCELLATION']._serialized_end=1370
-  _globals['_HEARTBEATACK']._serialized_start=1372
-  _globals['_HEARTBEATACK']._serialized_end=1415
-  _globals['_SERVERSHUTDOWN']._serialized_start=1417
-  _globals['_SERVERSHUTDOWN']._serialized_end=1472
-  _globals['_TASKSIGNAL']._serialized_start=1474
-  _globals['_TASKSIGNAL']._serialized_end=1582
-  _globals['_SIGNALACK']._serialized_start=1584
-  _globals['_SIGNALACK']._serialized_end=1614
-  _globals['_WORKERSERVICE']._serialized_start=1616
-  _globals['_WORKERSERVICE']._serialized_end=1697
+  _globals['_TASKASSIGNMENT']._serialized_end=1364
+  _globals['_STEPCHECKPOINT']._serialized_start=1366
+  _globals['_STEPCHECKPOINT']._serialized_end=1459
+  _globals['_TASKCANCELLATION']._serialized_start=1461
+  _globals['_TASKCANCELLATION']._serialized_end=1512
+  _globals['_HEARTBEATACK']._serialized_start=1514
+  _globals['_HEARTBEATACK']._serialized_end=1557
+  _globals['_SERVERSHUTDOWN']._serialized_start=1559
+  _globals['_SERVERSHUTDOWN']._serialized_end=1614
+  _globals['_TASKSIGNAL']._serialized_start=1616
+  _globals['_TASKSIGNAL']._serialized_end=1724
+  _globals['_SIGNALACK']._serialized_start=1726
+  _globals['_SIGNALACK']._serialized_end=1756
+  _globals['_CHECKPOINTREQUEST']._serialized_start=1758
+  _globals['_CHECKPOINTREQUEST']._serialized_end=1845
+  _globals['_CHECKPOINTRESPONSE']._serialized_start=1847
+  _globals['_CHECKPOINTRESPONSE']._serialized_end=1867
+  _globals['_WORKERSERVICE']._serialized_start=1870
+  _globals['_WORKERSERVICE']._serialized_end=2024
 # @@protoc_insertion_point(module_scope)

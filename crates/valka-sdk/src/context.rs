@@ -1,7 +1,19 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::fmt::Display;
+use std::future::Future;
+use std::sync::Mutex;
 
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
-use valka_proto::{LogEntry, SignalAck, TaskSignal, WorkerRequest, worker_request};
+use tonic::transport::Channel;
+use valka_proto::worker_service_client::WorkerServiceClient;
+use valka_proto::{
+    CheckpointRequest, LogEntry, SignalAck, TaskAssignment, TaskSignal, WorkerRequest,
+    worker_request,
+};
+
+use crate::error::SdkError;
 
 /// Data from a received signal.
 pub struct SignalData {
@@ -17,7 +29,7 @@ impl SignalData {
     }
 }
 
-/// Context passed to task handlers, providing logging, metadata, and signal access.
+/// Context passed to task handlers, providing logging, metadata, signals and checkpoints.
 pub struct TaskContext {
     pub task_id: String,
     pub task_run_id: String,
@@ -29,38 +41,90 @@ pub struct TaskContext {
     request_tx: mpsc::Sender<WorkerRequest>,
     signal_rx: mpsc::Receiver<TaskSignal>,
     signal_buffer: VecDeque<TaskSignal>,
+    worker: WorkerServiceClient<Channel>,
+    checkpoints: Mutex<HashMap<String, String>>,
 }
 
 impl TaskContext {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        task_id: String,
-        task_run_id: String,
-        queue_name: String,
-        task_name: String,
-        attempt_number: i32,
-        input: String,
-        metadata: String,
+        assignment: TaskAssignment,
         request_tx: mpsc::Sender<WorkerRequest>,
         signal_rx: mpsc::Receiver<TaskSignal>,
+        worker: WorkerServiceClient<Channel>,
     ) -> Self {
+        let checkpoints = assignment
+            .checkpoints
+            .into_iter()
+            .map(|c| (c.step, c.output))
+            .collect();
         Self {
-            task_id,
-            task_run_id,
-            queue_name,
-            task_name,
-            attempt_number,
-            input,
-            metadata,
+            task_id: assignment.task_id,
+            task_run_id: assignment.task_run_id,
+            queue_name: assignment.queue_name,
+            task_name: assignment.task_name,
+            attempt_number: assignment.attempt_number,
+            input: assignment.input,
+            metadata: assignment.metadata,
             request_tx,
             signal_rx,
             signal_buffer: VecDeque::new(),
+            worker,
+            checkpoints: Mutex::new(checkpoints),
         }
     }
 
     /// Parse the input JSON
-    pub fn input<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+    pub fn input<T: DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_str(&self.input)
+    }
+
+    /// Run `f` as the step `name`, or return its result from an earlier attempt that already
+    /// checkpointed it. The result is checkpointed before this returns, so a retry of the
+    /// task skips the step. A step that fails before its checkpoint lands runs again.
+    pub async fn step<T, E, F, Fut>(&self, name: &str, f: F) -> Result<T, String>
+    where
+        T: Serialize + DeserializeOwned,
+        E: Display,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        if let Some(done) = self.checkpoint_value(name).map_err(|e| e.to_string())? {
+            return Ok(done);
+        }
+        let value = f().await.map_err(|e| e.to_string())?;
+        self.checkpoint(name, &value)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(value)
+    }
+
+    /// Durably record `value` as the result of `step` for this task.
+    pub async fn checkpoint<T: Serialize>(&self, step: &str, value: &T) -> Result<(), SdkError> {
+        let output = serde_json::to_string(value)?;
+        self.worker
+            .clone()
+            .checkpoint(CheckpointRequest {
+                task_id: self.task_id.clone(),
+                task_run_id: self.task_run_id.clone(),
+                step: step.to_string(),
+                output: output.clone(),
+            })
+            .await?;
+        self.checkpoints
+            .lock()
+            .expect("checkpoint map poisoned")
+            .insert(step.to_string(), output);
+        Ok(())
+    }
+
+    /// The checkpointed result of `step`, if any attempt of this task recorded one.
+    pub fn checkpoint_value<T: DeserializeOwned>(&self, step: &str) -> Result<Option<T>, SdkError> {
+        let checkpoints = self.checkpoints.lock().expect("checkpoint map poisoned");
+        checkpoints
+            .get(step)
+            .map(|output| serde_json::from_str(output))
+            .transpose()
+            .map_err(SdkError::from)
     }
 
     /// Wait for a signal with a specific name. Non-matching signals are buffered.

@@ -18,6 +18,10 @@ export function truncateId(id: string, length = 8): string {
   return id.slice(0, length);
 }
 
+export function formatJsonValue(value: unknown): string {
+  return value === null || value === undefined ? "--" : JSON.stringify(value);
+}
+
 export const STATUS_OPTIONS = [
   { value: "", label: "All Statuses" },
   { value: "PENDING", label: "Pending" },

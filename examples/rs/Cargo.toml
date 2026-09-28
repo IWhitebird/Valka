@@ -25,3 +25,7 @@ path = "full_lifecycle.rs"
 [[example]]
 name = "signal_demo"
 path = "signal_demo.rs"
+
+[[example]]
+name = "steps"
+path = "steps.rs"

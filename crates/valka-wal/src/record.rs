@@ -86,6 +86,14 @@ pub enum WalRecord {
         run_id: String,
         lease_until: DateTime<Utc>,
     },
+    /// A running run finished `step`; retries of the task resume after it.
+    TaskCheckpointed {
+        task_id: String,
+        run_id: String,
+        step: String,
+        #[serde(default)]
+        output: serde_json::Value,
+    },
     TaskPromoted {
         task_id: String,
     },
@@ -129,6 +137,7 @@ impl WalRecord {
             | RunFailed { task_id, .. }
             | LeaseExpired { task_id, .. }
             | LeaseExtended { task_id, .. }
+            | TaskCheckpointed { task_id, .. }
             | TaskPromoted { task_id }
             | TaskCancelled { task_id, .. }
             | TaskDeleted { task_id }
@@ -149,6 +158,7 @@ impl WalRecord {
             RunFailed { .. } => "run_failed",
             LeaseExpired { .. } => "lease_expired",
             LeaseExtended { .. } => "lease_extended",
+            TaskCheckpointed { .. } => "task_checkpointed",
             TaskPromoted { .. } => "task_promoted",
             TaskCancelled { .. } => "task_cancelled",
             TaskDeleted { .. } => "task_deleted",
@@ -222,6 +232,35 @@ mod tests {
         assert_eq!(v["task_id"], "t");
         let back: Envelope = serde_json::from_value(v).unwrap();
         assert_eq!(back, e);
+    }
+
+    #[test]
+    fn checkpoint_record_round_trips_and_defaults_output() {
+        let e = Envelope::new(
+            ShardId(2),
+            WalRecord::TaskCheckpointed {
+                task_id: "t".into(),
+                run_id: "r".into(),
+                step: "download".into(),
+                output: serde_json::json!({"bytes": 10}),
+            },
+        );
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["type"], "task_checkpointed");
+        assert_eq!(v["step"], "download");
+        let back: Envelope = serde_json::from_value(v).unwrap();
+        assert_eq!(back, e);
+        assert_eq!(back.record.kind(), "task_checkpointed");
+
+        let j = r#"{"shard":2,"record_id":"r","ts_ms":1,"type":"task_checkpointed","task_id":"t","run_id":"r","step":"s"}"#;
+        let e: Envelope = serde_json::from_str(j).unwrap();
+        assert!(matches!(
+            e.record,
+            WalRecord::TaskCheckpointed {
+                output: serde_json::Value::Null,
+                ..
+            }
+        ));
     }
 
     #[test]

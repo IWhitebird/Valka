@@ -274,6 +274,20 @@ impl worker_service_server::WorkerService for WorkerServiceImpl {
         let stream = ReceiverStream::new(response_rx).map(Ok);
         Ok(Response::new(Box::pin(stream)))
     }
+
+    async fn checkpoint(
+        &self,
+        request: Request<CheckpointRequest>,
+    ) -> Result<Response<CheckpointResponse>, Status> {
+        let req = request.into_inner();
+        let output = parse_json("output", &req.output)?.unwrap_or(serde_json::Value::Null);
+        self.dispatcher
+            .engine()
+            .checkpoint(&req.task_id, &req.task_run_id, &req.step, output)
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(CheckpointResponse {}))
+    }
 }
 
 pub async fn serve_grpc(

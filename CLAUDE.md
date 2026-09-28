@@ -46,8 +46,8 @@ cargo fmt --check                # Format check
 | `valka-server` | Binary: assembles all services (gRPC + REST + engine + log ingester) |
 | `valka-sdk` | Rust worker SDK: ValkaClient (task CRUD) + ValkaWorker (builder pattern, stream) |
 | `valka-cli` | CLI: `valka task create/get/list/cancel`, `valka logs tail` |
-| `valka-tests` | Unit + integration test suite (244 tests, plus MinIO-gated) |
-| `examples/rs` | Rust examples (producer, worker, full_lifecycle) |
+| `valka-tests` | Unit + integration test suite (257 tests, plus MinIO-gated) |
+| `examples/rs` | Rust examples (producer, worker, full_lifecycle, signal_demo, steps) |
 
 ## SDKs
 
@@ -97,6 +97,9 @@ any non-terminal → CANCELLED
 ```
 Every arrow is a `WalRecord` (`TaskCreated`, `TaskDispatched`, `RunCompleted`, `RunFailed`, `LeaseExpired`, `TaskPromoted`, `TaskCancelled`, ...). `DISPATCHING` still exists in the proto enum but is no longer a stored state.
 
+### Step Checkpoints
+A running run records completed steps via the unary `WorkerService.Checkpoint` RPC → `TaskCheckpointed` record (acked once durable). Only the task's current RUNNING run may checkpoint; `apply` re-checks this. Checkpoints live on `TaskState.checkpoints` (snapshotted with the task) and ride on every `TaskAssignment`, so SDK `step(name, fn)` skips steps a previous attempt finished. Limits in `valka_engine::MAX_*`. Spec: `docs/wal/DESIGN.md` §16. REST: `GET /api/v1/tasks/:id/checkpoints`.
+
 ### Task Signals
 Workers can receive signals on running tasks (e.g. progress requests, config updates). Signals flow through the dispatcher over the existing gRPC bidi stream:
 - `POST /api/v1/tasks/:id/signal` or gRPC `SendSignal` creates a signal
@@ -135,9 +138,9 @@ Dev default is `./data` via the `local` backend. MinIO for S3 semantics: `docker
 
 ```bash
 cargo test --workspace                                   # everything, no external services
-cargo test -p valka-wal                                  # 21: store, codec, writer under faults, snapshots, ownership
-cargo test -p valka-engine                               # 22: lifecycle, timers (paused time), recovery, crash/replay proptest
-cargo test -p valka-tests                                # 244: unit + REST + lifecycle + dispatcher + gRPC e2e with the SDK
+cargo test -p valka-wal                                  # 23: store, codec, writer under faults, snapshots, ownership
+cargo test -p valka-engine                               # 35: lifecycle, timers (paused time), recovery, checkpoints, crash/replay proptest
+cargo test -p valka-tests                                # 257: unit + REST + lifecycle + dispatcher + gRPC e2e with the SDK
 VALKA_TEST_S3_ENDPOINT=http://localhost:9000 AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
   cargo test -p valka-tests --features minio minio_    # real S3 conditional writes (bucket valka-test)
 ```
@@ -163,6 +166,6 @@ Production: `npm run build` produces `web/dist/`, served by axum fallback.
 
 Stack: React 19, TypeScript, Vite, Tailwind CSS, Radix UI, TanStack React Query.
 
-Pages: Dashboard, Tasks, Task Detail (with runs, logs, signals tabs), Workers, Cluster (overview, node detail, 4096-shard heatmap, storage), Events, Dead Letters.
+Pages: Dashboard, Tasks, Task Detail (with runs, logs, signals, steps), Workers, Cluster (overview, node detail, 4096-shard heatmap, storage), Events, Dead Letters.
 
 Web tests: `cd web && npm test` (vitest + Testing Library; helpers in `src/lib`, components in `src/components/cluster`).

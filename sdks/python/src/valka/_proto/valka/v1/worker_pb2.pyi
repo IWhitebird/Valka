@@ -102,7 +102,7 @@ class GracefulShutdown(_message.Message):
     def __init__(self, reason: _Optional[str] = ...) -> None: ...
 
 class TaskAssignment(_message.Message):
-    __slots__ = ("task_id", "task_run_id", "queue_name", "task_name", "input", "attempt_number", "timeout_seconds", "metadata")
+    __slots__ = ("task_id", "task_run_id", "queue_name", "task_name", "input", "attempt_number", "timeout_seconds", "metadata", "checkpoints")
     TASK_ID_FIELD_NUMBER: _ClassVar[int]
     TASK_RUN_ID_FIELD_NUMBER: _ClassVar[int]
     QUEUE_NAME_FIELD_NUMBER: _ClassVar[int]
@@ -111,6 +111,7 @@ class TaskAssignment(_message.Message):
     ATTEMPT_NUMBER_FIELD_NUMBER: _ClassVar[int]
     TIMEOUT_SECONDS_FIELD_NUMBER: _ClassVar[int]
     METADATA_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINTS_FIELD_NUMBER: _ClassVar[int]
     task_id: str
     task_run_id: str
     queue_name: str
@@ -119,7 +120,20 @@ class TaskAssignment(_message.Message):
     attempt_number: int
     timeout_seconds: int
     metadata: str
-    def __init__(self, task_id: _Optional[str] = ..., task_run_id: _Optional[str] = ..., queue_name: _Optional[str] = ..., task_name: _Optional[str] = ..., input: _Optional[str] = ..., attempt_number: _Optional[int] = ..., timeout_seconds: _Optional[int] = ..., metadata: _Optional[str] = ...) -> None: ...
+    checkpoints: _containers.RepeatedCompositeFieldContainer[StepCheckpoint]
+    def __init__(self, task_id: _Optional[str] = ..., task_run_id: _Optional[str] = ..., queue_name: _Optional[str] = ..., task_name: _Optional[str] = ..., input: _Optional[str] = ..., attempt_number: _Optional[int] = ..., timeout_seconds: _Optional[int] = ..., metadata: _Optional[str] = ..., checkpoints: _Optional[_Iterable[_Union[StepCheckpoint, _Mapping]]] = ...) -> None: ...
+
+class StepCheckpoint(_message.Message):
+    __slots__ = ("step", "output", "attempt_number", "created_at_ms")
+    STEP_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_NUMBER_FIELD_NUMBER: _ClassVar[int]
+    CREATED_AT_MS_FIELD_NUMBER: _ClassVar[int]
+    step: str
+    output: str
+    attempt_number: int
+    created_at_ms: int
+    def __init__(self, step: _Optional[str] = ..., output: _Optional[str] = ..., attempt_number: _Optional[int] = ..., created_at_ms: _Optional[int] = ...) -> None: ...
 
 class TaskCancellation(_message.Message):
     __slots__ = ("task_id", "reason")
@@ -162,3 +176,19 @@ class SignalAck(_message.Message):
     SIGNAL_ID_FIELD_NUMBER: _ClassVar[int]
     signal_id: str
     def __init__(self, signal_id: _Optional[str] = ...) -> None: ...
+
+class CheckpointRequest(_message.Message):
+    __slots__ = ("task_id", "task_run_id", "step", "output")
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    TASK_RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    STEP_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_FIELD_NUMBER: _ClassVar[int]
+    task_id: str
+    task_run_id: str
+    step: str
+    output: str
+    def __init__(self, task_id: _Optional[str] = ..., task_run_id: _Optional[str] = ..., step: _Optional[str] = ..., output: _Optional[str] = ...) -> None: ...
+
+class CheckpointResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
