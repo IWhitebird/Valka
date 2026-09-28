@@ -285,6 +285,10 @@ impl Engine {
         self.inner.writer.poisoned()
     }
 
+    pub fn poison_watch(&self) -> watch::Receiver<Option<String>> {
+        self.inner.writer.poison_watch()
+    }
+
     pub fn owns(&self, shard: ShardId) -> bool {
         match &self.inner.ownership {
             Some(o) => o.owns(shard),

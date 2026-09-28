@@ -2,7 +2,7 @@
 //! suite needs no external services. The `minio` feature adds tests against a real
 //! S3-compatible endpoint.
 
-mod helpers;
+pub(crate) mod helpers;
 
 mod cluster_api_tests;
 mod dispatcher_tests;

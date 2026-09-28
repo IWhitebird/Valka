@@ -21,3 +21,5 @@ mod proto_tests;
 mod retry_tests;
 #[cfg(test)]
 mod sdk_tests;
+#[cfg(test)]
+mod server_exit_tests;

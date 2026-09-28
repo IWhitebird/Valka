@@ -95,7 +95,7 @@ pub struct WalWriter {
     next_lsn: Arc<AtomicU64>,
     epoch: u32,
     /// Set when the committer gave up on a segment; the engine must restart.
-    poisoned: Arc<Mutex<Option<String>>>,
+    poisoned: Arc<watch::Sender<Option<String>>>,
     backlog: Arc<Mutex<Backlog>>,
 }
 
@@ -114,7 +114,7 @@ impl WalWriter {
             watch::channel(Lsn::new(start_lsn.epoch, start_lsn.seq.saturating_sub(1)));
         let (flight_tx, flight_rx) = mpsc::channel::<InFlight>(cfg.max_inflight * 2 + 1);
         let next_lsn = Arc::new(AtomicU64::new(start_lsn.seq));
-        let poisoned = Arc::new(Mutex::new(None));
+        let poisoned = Arc::new(watch::Sender::new(None));
 
         tokio::spawn(collector(
             rx,
@@ -147,7 +147,7 @@ impl WalWriter {
     /// Queue records for the next segment. Returns a future that resolves when durable.
     pub fn append(&self, records: Vec<Envelope>) -> Durable {
         let (ack_tx, ack_rx) = oneshot::channel();
-        if let Some(reason) = self.poisoned.lock().clone() {
+        if let Some(reason) = self.poisoned.borrow().clone() {
             let _ = ack_tx.send(Err(WalError::NotDurable(reason)));
             return Durable(ack_rx);
         }
@@ -206,7 +206,12 @@ impl WalWriter {
     }
 
     pub fn poisoned(&self) -> Option<String> {
-        self.poisoned.lock().clone()
+        self.poisoned.borrow().clone()
+    }
+
+    /// Changes once, from `None` to the reason, when the writer is poisoned.
+    pub fn poison_watch(&self) -> watch::Receiver<Option<String>> {
+        self.poisoned.subscribe()
     }
 
     /// Wait until everything appended so far is durable.
@@ -418,7 +423,7 @@ async fn committer(
     mut rx: mpsc::Receiver<InFlight>,
     durable_tx: watch::Sender<Lsn>,
     ownership: Arc<dyn OwnershipCheck>,
-    poisoned: Arc<Mutex<Option<String>>>,
+    poisoned: Arc<watch::Sender<Option<String>>>,
     backlog: Arc<Mutex<Backlog>>,
 ) {
     while let Some(f) = rx.recv().await {
@@ -451,7 +456,7 @@ async fn committer(
             Err(e) => {
                 error!(lsn = %f.lsn, error = %e, "segment not committed; writer poisoned");
                 let msg = e.to_string();
-                *poisoned.lock() = Some(msg.clone());
+                poisoned.send_replace(Some(msg.clone()));
                 for a in f.acks {
                     let _ = a.send(Err(WalError::NotDurable(msg.clone())));
                 }
@@ -657,10 +662,14 @@ mod tests {
             c,
             Arc::new(SingleNodeOwnership),
         );
+        let mut poison = w.poison_watch();
+        assert!(poison.borrow().is_none());
         faults.set_puts_down(true);
         let err = w.append(vec![rec(1)]).wait().await.unwrap_err();
         assert!(matches!(err, WalError::NotDurable(_)));
         assert!(w.poisoned().is_some());
+        poison.changed().await.unwrap();
+        assert_eq!(*poison.borrow(), w.poisoned());
         // subsequent appends fail fast
         assert!(w.append(vec![rec(2)]).wait().await.is_err());
         faults.set_puts_down(false);

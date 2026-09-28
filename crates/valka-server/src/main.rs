@@ -5,13 +5,13 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tracing::info;
+use tracing::{error, info};
 
 mod shutdown;
 
 use valka_server::grpc;
 use valka_server::rest;
-use valka_server::server::Node;
+use valka_server::server::{ExitReason, Node, wait_for_exit};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -127,8 +127,20 @@ async fn main() -> Result<()> {
         "Valka server started"
     );
 
-    shutdown::wait_for_shutdown().await;
-    info!("Shutdown signal received, draining...");
+    let reason = wait_for_exit(
+        shutdown::wait_for_shutdown(),
+        node.engine.poison_watch(),
+        node.shutdown_rx.clone(),
+    )
+    .await;
+    match &reason {
+        ExitReason::Signal => info!("Shutdown signal received, draining..."),
+        ExitReason::Poisoned(why) => error!(
+            reason = %why,
+            "WAL writer poisoned; exiting so the node restarts from the bucket"
+        ),
+        ExitReason::Failed => error!("a server task failed; exiting"),
+    }
     let _ = node.shutdown_tx.send(true);
 
     let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -146,6 +158,10 @@ async fn main() -> Result<()> {
         cluster.shutdown().await;
     }
 
-    info!("Valka server stopped");
-    Ok(())
+    if reason.is_clean() {
+        info!("Valka server stopped");
+        Ok(())
+    } else {
+        anyhow::bail!("Valka server stopped: {reason:?}")
+    }
 }

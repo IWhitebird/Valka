@@ -101,3 +101,41 @@ impl Node {
         })
     }
 }
+
+/// Why the node is stopping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitReason {
+    /// SIGTERM or Ctrl-C: drain and exit cleanly.
+    Signal,
+    /// The WAL writer can no longer commit; RAM may be ahead of the bucket, so the node
+    /// must restart and rebuild from it.
+    Poisoned(String),
+    /// A server task failed and requested shutdown.
+    Failed,
+}
+
+impl ExitReason {
+    pub fn is_clean(&self) -> bool {
+        matches!(self, ExitReason::Signal)
+    }
+}
+
+/// Resolve as soon as any stop condition occurs. A closed channel only disables its branch.
+pub async fn wait_for_exit(
+    signal: impl std::future::Future<Output = ()>,
+    mut poison: watch::Receiver<Option<String>>,
+    mut shutdown: watch::Receiver<bool>,
+) -> ExitReason {
+    let poisoned = async move {
+        poison
+            .wait_for(|p| p.is_some())
+            .await
+            .map(|p| p.clone().unwrap_or_default())
+    };
+    let failed = async move { shutdown.wait_for(|s| *s).await.map(|_| ()) };
+    tokio::select! {
+        _ = signal => ExitReason::Signal,
+        Ok(reason) = poisoned => ExitReason::Poisoned(reason),
+        Ok(()) = failed => ExitReason::Failed,
+    }
+}
