@@ -366,7 +366,9 @@ async fn flush(
 
 /// Segments are written create-if-absent: a segment position is written exactly once, so
 /// a late PUT from a fenced-out writer can never overwrite a sealed position (phase 2).
-/// `AlreadyExists` after a retry means our own earlier attempt landed but its ack was lost.
+/// `AlreadyExists` after a retry is ours only if the stored bytes are ours: an earlier
+/// attempt may have landed with its response lost, or someone else may have taken the
+/// position meanwhile.
 async fn put_with_retry(
     store: &Store,
     key: &str,
@@ -376,22 +378,31 @@ async fn put_with_retry(
     let mut attempt = 0u32;
     let mut delay = Duration::from_millis(20);
     loop {
-        match store.put_create(key, bytes.clone()).await {
+        let err = match store.put_create(key, bytes.clone()).await {
             Ok(Some(_)) => return Ok(()),
-            Ok(None) if attempt > 0 => return Ok(()),
-            Ok(None) => {
+            Ok(None) if attempt == 0 => {
                 return Err(WalError::NotDurable(format!(
                     "{key}: segment already exists (another writer holds this log)"
                 )));
             }
-            Err(e) if attempt < retries => {
-                attempt += 1;
-                warn!(key, attempt, error = %e, "segment PUT failed, retrying");
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_secs(2));
-            }
-            Err(e) => return Err(WalError::NotDurable(format!("{key}: {e}"))),
+            Ok(None) => match store.get(key).await {
+                Ok(Some((stored, _))) if stored == bytes => return Ok(()),
+                Ok(_) => {
+                    return Err(WalError::NotDurable(format!(
+                        "{key}: position taken by another writer"
+                    )));
+                }
+                Err(e) => e,
+            },
+            Err(e) => e,
+        };
+        if attempt >= retries {
+            return Err(WalError::NotDurable(format!("{key}: {err}")));
         }
+        attempt += 1;
+        warn!(key, attempt, error = %err, "segment PUT failed, retrying");
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(2));
     }
 }
 
@@ -482,6 +493,47 @@ mod tests {
             flush_interval: Duration::from_millis(10),
             ..Default::default()
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retried_put_accepts_its_own_landed_bytes() {
+        let (store, faults) = faulty_memory_store(3);
+        let key = "wal/n/00000001-0000000000000001.seg";
+        let ours = Bytes::from_static(b"ours");
+        faults.set_lost_put_ack_rate(1000);
+        let s = store.clone();
+        let put = tokio::spawn({
+            let ours = ours.clone();
+            async move { put_with_retry(&s, key, ours, 5).await }
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        faults.set_lost_put_ack_rate(0);
+        put.await.unwrap().expect("the landed bytes are ours");
+        assert_eq!(store.get(key).await.unwrap().unwrap().0, ours);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retried_put_rejects_a_position_taken_by_another_writer() {
+        let (store, faults) = faulty_memory_store(4);
+        let key = "wal/n/00000001-0000000000000001.seg";
+        faults.set_puts_down(true);
+        let s = store.clone();
+        let put =
+            tokio::spawn(
+                async move { put_with_retry(&s, key, Bytes::from_static(b"ours"), 5).await },
+            );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        faults.set_puts_down(false);
+        store
+            .put_create(key, Bytes::from_static(b"seal"))
+            .await
+            .unwrap()
+            .expect("the sealer takes the free position");
+        let err = put.await.unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("taken by another writer"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
