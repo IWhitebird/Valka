@@ -45,6 +45,7 @@ Most task queues bolt together a message broker, a database, and a cache. Every 
 - 4096 fixed storage shards with single-writer ownership (multi-node takeover: phase 2, see `docs/wal/PLAN.md`)
 - Task signals — send real-time signals to running workers
 - Step checkpoints — a failed task retries from the last completed step, not from scratch
+- Results acknowledged end to end — workers keep a result until it is recorded, and ride through server restarts
 - Automatic retries with exponential backoff + dead letter queue
 - Structured log streaming per task run
 - Event broadcasting via gRPC streams and SSE

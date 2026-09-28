@@ -103,6 +103,24 @@ func handleTask(ctx *valka.TaskContext) (interface{}, error) {
 }
 ```
 
+## Step Checkpoints
+
+`valka.Step(ctx, name, fn)` runs `fn` once per task: its result is checkpointed, and a
+retry of the task returns the recorded result instead of running `fn` again.
+
+```go
+func handleTask(ctx *valka.TaskContext) (interface{}, error) {
+    rows, err := valka.Step(ctx, "fetch", func() ([]Row, error) { return fetchRows(ctx) })
+    if err != nil {
+        return nil, err
+    }
+    return valka.Step(ctx, "upload", func() (string, error) { return upload(ctx, rows) })
+}
+```
+
+Step results must round-trip through `encoding/json`. `ctx.Checkpoint(step, value)` and
+`ctx.CheckpointValue(step, &dest)` record and read checkpoints directly.
+
 ## Client
 
 ```go

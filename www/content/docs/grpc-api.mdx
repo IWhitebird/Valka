@@ -62,10 +62,13 @@ The bidirectional streaming service used by workers.
 ```protobuf
 service WorkerService {
     rpc Session(stream WorkerRequest) returns (stream WorkerResponse);
+    // Persist the result of a completed step of a running task. Returns once durable.
+    rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
 }
 ```
 
 A single `Session` stream carries all communication between a worker and the server.
+`Checkpoint` is a separate unary call so a handler can wait for its step to be durable.
 
 ### Worker → Server Messages
 
@@ -83,21 +86,54 @@ A single `Session` stream carries all communication between a worker and the ser
 | Message | When Sent | Description |
 |---------|-----------|-------------|
 | `WorkerHello` | On connect | Worker name, queues, concurrency |
-| `TaskResult` | Task done | Success/failure with output/error |
-| `Heartbeat` | Every 30s | Active task IDs for lease extension |
+| `TaskResult` | Task done | Success/failure with output/error; resent until a `ResultAck` says APPLIED or STALE |
+| `Heartbeat` | Every 10s | IDs of tasks running or awaiting a result ack, for lease extension |
 | `LogBatch` | During task | Structured log entries |
-| `GracefulShutdown` | Shutting down | Signals drain mode |
+| `GracefulShutdown` | Shutting down | Stop sending tasks; the stream stays open until in-flight results are acknowledged |
 | `SignalAck` | Signal received | Confirms signal delivery |
 
 ### Server → Worker Messages
 
 | Message | When Sent | Description |
 |---------|-----------|-------------|
-| `TaskAssignment` | Task matched | New task to execute |
+| `TaskAssignment` | Task matched | New task to execute, with checkpoints from earlier attempts |
 | `TaskCancellation` | Cancel request | Cancel a running task |
 | `HeartbeatAck` | After heartbeat | Confirms heartbeat received |
-| `ServerShutdown` | Server stopping | Tells worker to drain |
+| `ServerShutdown` | Server stopping | The stream is about to close; the worker reconnects with backoff |
 | `TaskSignal` | Signal sent | Real-time signal for a task |
+| `ResultAck` | After a `TaskResult` | `APPLIED`, `STALE` or `RETRY` (see below) |
+
+### Result acknowledgement
+
+Every `TaskResult` is answered with a `ResultAck`:
+
+| Status | Meaning | Worker action |
+|--------|---------|---------------|
+| `RESULT_STATUS_APPLIED` | The result is durable, now or from an earlier delivery of the same result | Forget it |
+| `RESULT_STATUS_STALE` | The run already ended another way (lease expired, cancelled, deleted); the result was not recorded | Forget it |
+| `RESULT_STATUS_RETRY` | Not recorded yet (storage trouble) | Send it again later |
+
+Results are idempotent: sending the same result twice is safe. Every SDK keeps a result
+until it is APPLIED or STALE, resends it after a reconnect, and keeps heartbeating the
+task meanwhile, so a handler that finishes while the server is restarting still has its
+result recorded, without the task running again.
+
+### Step checkpoints
+
+```protobuf
+message CheckpointRequest {
+    string task_id = 1;
+    string task_run_id = 2;
+    string step = 3;
+    string output = 4;   // JSON
+}
+```
+
+Only the task's current running run may checkpoint. The call returns once the checkpoint
+is durable. Every later `TaskAssignment` for the task carries its checkpoints
+(`repeated StepCheckpoint checkpoints`), which the SDKs' `step` helpers use to skip steps
+an earlier attempt completed. Limits: step names up to 256 bytes, outputs up to 256 KiB of
+JSON, at most 256 distinct steps per task.
 
 ## InternalService
 

@@ -74,6 +74,23 @@ async function handleTask(ctx: TaskContext): Promise<unknown> {
 }
 ```
 
+## Step Checkpoints
+
+`ctx.step(name, fn)` runs `fn` once per task: its result is checkpointed, and a retry of the
+task returns the recorded result instead of running `fn` again.
+
+```typescript
+async function handleTask(ctx: TaskContext) {
+  const rows = await ctx.step("fetch", () => fetchRows());
+  const report = await ctx.step("transform", () => buildReport(rows));
+  await ctx.step("upload", () => upload(report));
+  return { rows: rows.length };
+}
+```
+
+Step results must be JSON-serializable. `ctx.checkpoint(step, value)` and
+`ctx.checkpointValue(step)` record and read checkpoints directly.
+
 ## Client
 
 ```typescript

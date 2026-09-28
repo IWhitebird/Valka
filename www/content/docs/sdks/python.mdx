@@ -79,6 +79,22 @@ async def handle_task(ctx: TaskContext) -> dict:
     return {"result": "done"}
 ```
 
+## Step Checkpoints
+
+`ctx.step(name, fn)` runs `fn` once per task: its result is checkpointed, and a retry of the
+task returns the recorded result instead of running `fn` again. `fn` may be sync or async.
+
+```python
+async def handle_task(ctx: TaskContext) -> dict:
+    rows = await ctx.step("fetch", fetch_rows)
+    report = await ctx.step("transform", lambda: build_report(rows))
+    await ctx.step("upload", lambda: upload(report))
+    return {"rows": len(rows)}
+```
+
+Step results must be JSON-serializable. `await ctx.checkpoint(step, value)` and
+`ctx.checkpoint_value(step, default)` record and read checkpoints directly.
+
 ## Client
 
 ```python

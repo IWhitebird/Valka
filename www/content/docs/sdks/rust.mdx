@@ -89,6 +89,24 @@ async fn handle_task(ctx: TaskContext) -> Result<serde_json::Value, String> {
 }
 ```
 
+## Step Checkpoints
+
+`ctx.step(name, f)` runs `f` once per task: its result is checkpointed, and a retry of the
+task returns the recorded result instead of running `f` again.
+
+```rust
+async fn handle_task(ctx: TaskContext) -> Result<serde_json::Value, String> {
+    let rows: Vec<Row> = ctx.step("fetch", || fetch_rows()).await?;
+    let report: Report = ctx.step("transform", || build_report(&rows)).await?;
+    ctx.step("upload", || upload(&report)).await?;
+    Ok(serde_json::json!({ "rows": rows.len() }))
+}
+```
+
+The step's value must implement `Serialize` and `DeserializeOwned`; its error type must
+implement `Display`. `ctx.checkpoint(step, &value)` and `ctx.checkpoint_value::<T>(step)`
+record and read checkpoints directly.
+
 ## Client
 
 Use `ValkaClient` to manage tasks programmatically:

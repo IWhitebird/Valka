@@ -82,35 +82,59 @@ When a task exhausts all retries, it moves to `DEAD_LETTER` status and is record
 
 ## Lease Management
 
-When a task moves to `RUNNING`, it is assigned a lease with a deadline. Workers must send periodic heartbeats to extend the lease.
+When a task moves to `RUNNING`, it gets a lease: its timeout plus a 30 s grace. Workers
+heartbeat every 10 s; each heartbeat extends the lease to 60 s from now.
 
 If a worker crashes or disconnects:
-1. The **lease reaper** detects the expired lease
+1. The engine's timer fires when the lease expires (checked every 100 ms)
 2. The task moves to `RETRY` (if retries remain) or `DEAD_LETTER`
 3. Another worker can pick up the retried task
 
 <Mermaid chart={`sequenceDiagram
     participant W as Worker
     participant S as Server
-    participant R as Lease Reaper
 
-    S->>W: TaskAssignment (lease: 5min)
+    S->>W: TaskAssignment (lease: timeout + 30s)
 
-    loop Every 30s
+    loop Every 10s
         W->>S: Heartbeat
-        S->>S: Extend lease +60s
+        S->>S: Extend lease to now + 60s
     end
 
     Note over W: Worker crashes!
 
-    rect rgb(40, 40, 40)
-        Note over R: Reaper checks every 30s
-        R->>R: Find expired leases
-        R->>R: Move to RETRY or DEAD_LETTER
-    end
+    Note over S: Lease timer fires
+    S->>S: LeaseExpired → RETRY or DEAD_LETTER
 
     Note over S: Task available for another worker
 `} />
+
+## Result Delivery
+
+A worker's result is acknowledged end to end. The server answers every result with
+`APPLIED` (recorded, now or by an earlier delivery), `STALE` (the run already ended another
+way, e.g. its lease expired) or `RETRY`. The SDKs keep each result until it is APPLIED or
+STALE and keep heartbeating the task meanwhile, so:
+
+- a result is never lost because the server was busy, restarting, or briefly unreachable;
+- a task whose handler finished during a server restart completes once, without re-running;
+- sending the same result twice is harmless.
+
+## Step Checkpoints
+
+A handler can split its work into named steps. Each step's result is checkpointed before
+the step returns, and every retry of the task (after a failure, a lease expiry or a server
+crash) receives the recorded results, so completed steps are skipped:
+
+```rust
+let rows: Vec<Row> = ctx.step("fetch", || fetch_rows()).await?;
+let report: Report = ctx.step("transform", || build_report(&rows)).await?;
+ctx.step("upload", || upload(&report)).await?;
+```
+
+A checkpointed step never runs again. The step in progress when an attempt dies does run
+again (at-least-once), so steps with external side effects should still be idempotent. See
+the SDK pages for each language, and `GET /api/v1/tasks/{id}/checkpoints` to inspect them.
 
 ## Task Signals
 

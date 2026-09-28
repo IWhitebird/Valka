@@ -30,7 +30,7 @@ end-to-end with the Rust SDK, incl. server crash/restart), MinIO-gated 2.
       `GET /api/v1/tasks/{id}/checkpoints`, Steps table on the task page. DESIGN.md §16.
 - [x] SDKs: `step`/`checkpoint` in Rust, TypeScript, Go and Python; `steps` example per language.
 
-Test inventory now: valka-wal 25, valka-engine 42, valka-tests 265, web 22, Go SDK 9, Python SDK 11.
+Test inventory now: valka-wal 25, valka-engine 42, valka-tests 266, web 22, Go SDK 9, Python SDK 12.
 
 ## Phase 2 — cluster
 

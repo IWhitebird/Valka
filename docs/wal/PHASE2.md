@@ -400,8 +400,8 @@ These replace the PG-era `ForwardTask`, `ForwardEvent`, hash ring and partitions
 - Completion becomes **idempotent**. Completing an already-completed run with the same
   run id returns success. A result for a stale run (cancelled, lease expired, another run
   won) returns a definitive `Stale`, and the SDK stops retrying.
-- This closes a phase-1 hole too: today a result whose write fails is dropped with a
-  warning and the task reruns after its lease expires.
+- **Done in M0** for a single node: `ResultAck`, idempotent `Engine::report_result`, and
+  resending in all four SDKs (DESIGN.md §17). Phase 2 adds the forwarding to the owner.
 
 ### 11.4 Worker reattach
 
@@ -591,7 +591,7 @@ it.
 
 | # | Milestone | Contents | Done when | Est. |
 |---|---|---|---|---|
-| **M0** | **Phase-1 hardening** (ships now, independent) | Snapshot durability fix (§12.4); `AlreadyExists` read-back (§12.2); idempotent completion + `ResultAck` + SDK result retry in all four SDKs (§11.3); SDK must not block its receive loop while waiting for a slot; exit on writer poison (today only `/healthz` reports it); log budget (§12.5) | New regression tests for each; crash/replay proptest extended with sync failures | 1.5 wk |
+| **M0** | **Phase-1 hardening** (ships now, independent) — **done** | Snapshot durability fix (§12.4); `AlreadyExists` read-back (§12.2); idempotent completion + `ResultAck` + SDK result retry in all four SDKs (§11.3); SDK must not block its receive loop while waiting for a slot; exit on writer poison (today only `/healthz` reports it); log budget (§12.5) | New regression tests for each; crash/replay proptest extended with sync failures | 1.5 wk |
 | **M1** | **Protocol model** | TLA+ spec (§15.1); TLC in CI; this document revised with anything the model finds | All invariants hold at the model sizes; spec reviewed | 2 wk |
 | **M2** | **Formats** (§6) | `cluster.json`; 16-bit shard ids; `gen` in envelopes; segment flags and shard list; new snapshot keys; `owners/` and `nodes/` objects; hashed prefixes; storage self-test; clustered mode refuses local/memory | One node runs on the new layout; all existing tests pass | 1.5 wk |
 | **M3** | **One node, full protocol** | Incarnation start (§7.2); lease renew and self-fence (§7.3); own-lease fencing check (§12.3); engine per-shard lifecycle (Unowned → Loading → Serving → Releasing); claim, release, split and replay on N = 1; restart = split own previous incarnation + claim | Multi-engine tests: restarts, released and re-claimed shards, crash at every step of claim, release and split | 2.5 wk |

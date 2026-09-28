@@ -124,6 +124,7 @@ impl Engine {
                         .dirty_since_lsn
                         .is_some_and(|d| d > self.inner.writer.durable_lsn())
                 {
+                    // Not enough records yet and nothing durable to cover: wait.
                     continue;
                 }
                 let lsn = self.inner.writer.next_lsn();

@@ -595,10 +595,26 @@ readinessProbe:
 
 ## Graceful Shutdown
 
-Valka supports graceful shutdown for both the server and workers:
+Stopping a **server** (`SIGTERM` or Ctrl-C):
 
-1. Server receives `SIGTERM`
-2. Server sends `ServerShutdown` message to all connected workers
-3. Workers stop accepting new tasks and drain in-progress work
-4. Server waits for all workers to disconnect (or timeout after 30s)
-5. Server shuts down cleanly
+1. Every connected worker receives `ServerShutdown` and its stream is closed, so the server
+   never waits on open streams.
+2. Workers keep running their in-flight tasks and reconnect with backoff, to another node
+   or to the restarted one. Results that finish in the meantime are kept and delivered
+   after the reconnect.
+3. The server flushes its WAL, snapshots dirty shards and exits.
+
+Stopping a **worker**:
+
+1. The worker sends `GracefulShutdown`: the server stops sending it tasks but keeps the
+   stream open.
+2. In-flight handlers finish and their results are acknowledged (the worker waits up to
+   5 s for the acks).
+3. The worker closes the stream and exits.
+
+### When the bucket fails
+
+If the WAL cannot be written after its retries, the server answers `503` for writes and then
+**exits with a non-zero status**. Run it under a supervisor that restarts it (Kubernetes,
+systemd, Docker `restart: unless-stopped`): on start it rebuilds its state from the bucket.
+Nothing it acknowledged is lost.
