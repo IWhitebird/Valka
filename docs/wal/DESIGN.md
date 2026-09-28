@@ -171,6 +171,10 @@ state (their history remains in the WAL/snapshots in the bucket).
 
 ## 12. Fencing *(phase 2)*
 
+Superseded by [`PHASE2.md`](PHASE2.md): per-shard owner records and generations, fencing by
+each node's own lease, sealing at the first gap, and log splitting. This section describes
+the phase-1 single-object design that PHASE2.md replaces.
+
 - `assignment` is a single JSON object `{version, shards: [{node, epoch}; 4096]}` written
   with `If-Match` (object_store `PutMode::Update`).
 - Flush protocol: PUT segment → GET `assignment` with `If-None-Match: <cached etag>` →

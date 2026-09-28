@@ -34,10 +34,19 @@ Test inventory now: valka-wal 23, valka-engine 35, valka-tests 257, web 22, Go S
 
 ## Phase 2 — cluster
 
-- [ ] Assignment CAS + epochs, flush-time ownership verification.
-- [ ] Node lease + gossip-triggered takeover; snapshot + tail replay of dead node.
-- [ ] Worker reconnect handshake (`running_task_ids` in `WorkerHello`); reconciliation window before re-dispatch.
-- [ ] Forwarding by shard owner (replace hash ring partitions with assignment table).
-- [ ] turmoil simulation tests: partitions, split-brain, zombie writer.
-- [ ] Restore multi-node deploy assets (`deploy/docker/docker-compose.cluster.yml`, Helm `replicaCount > 1`).
-- [ ] Payload blob externalisation (`blobs/…`) above a size threshold; `ack=fast` per-task mode.
+Design, decisions and milestones: [`PHASE2.md`](PHASE2.md).
+
+- [ ] M0 Phase-1 hardening: snapshot durability fix, `AlreadyExists` read-back, end-to-end result acks, exit on poison, log budget.
+- [ ] M1 TLA+ model of leases, ownership, sealing, splitting and GC; TLC in CI.
+- [ ] M2 Formats: `cluster.json`, 16-bit shard ids, `gen` in records, sealable segments, `owners/`, `nodes/`, new snapshot keys.
+- [ ] M3 One node on the full protocol: incarnations, lease fencing, per-shard claim/release/split.
+- [ ] M4 Membership, guardian tombstones, rendezvous placement, takeover, GC; turmoil harness starts.
+- [ ] M5 Queue partitions and request routing; internal RPCs with token + mTLS.
+- [ ] M6 Cross-node matching (offers, claims, grants); result, heartbeat, cancel and signal routing.
+- [ ] M7 Worker reattach in the proto and all four SDKs.
+- [ ] M8 Drain, rebalance limits, admin API, version gates, metrics, runbooks.
+- [ ] M9 Full simulation suite, chaos rig, 24 h soak; release gates green.
+- [ ] M10 Helm, systemd, docker-compose cluster, cluster UI phase 2 half, docs.
+
+Independent of phase 2: payload blob externalisation (`blobs/…`) above a size threshold;
+`ack=fast` per-task mode.
