@@ -301,6 +301,65 @@ async fn rest_works_through_any_node_of_three() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cluster_views_come_from_every_node() {
+    let c = cluster(3).await;
+    let (status, body) = call(
+        &c.nodes[0],
+        post(
+            "/api/v1/tasks",
+            serde_json::json!({"queue_name": "views", "task_name": "t"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().unwrap().to_string();
+    let owner = c.owner_of(&id).expect("owned");
+    let shard = c.nodes[owner].engine.shard_of(&id).unwrap();
+    let owner_id = c.nodes[owner].engine.node_id().to_string();
+
+    for node in &c.nodes {
+        // A shard's detail comes from its owner, through any node.
+        let (status, d) = call(node, get(&format!("/api/v1/cluster/shards/{}", shard.0))).await;
+        assert_eq!(status, StatusCode::OK, "{d}");
+        assert_eq!(d["owner"], owner_id.as_str());
+        assert_eq!(d["phase"], "serving");
+        assert!(d["gen"].as_u64().unwrap() >= 1);
+        assert_eq!(d["queues"]["views"]["pending"], 1);
+
+        // The shard map covers every shard, each with its owner.
+        let (_, rows) = call(node, get("/api/v1/cluster/shards")).await;
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), SHARDS as usize);
+        assert!(
+            rows.iter().all(|r| r["owner"].is_string()),
+            "every shard owned"
+        );
+
+        // The overview lists every node with its incarnation and shard count.
+        let (_, o) = call(node, get("/api/v1/cluster")).await;
+        assert_eq!(o["num_shards"], SHARDS);
+        assert_eq!(o["health"]["unowned_shards"], 0);
+        let nodes = o["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 3);
+        let owned: u64 = nodes
+            .iter()
+            .map(|n| n["shards_owned"].as_u64().unwrap())
+            .sum();
+        assert_eq!(owned, SHARDS as u64);
+        assert!(nodes.iter().all(|n| n["inc"].as_u64() == Some(1)));
+
+        // Membership: this node's view of every lease.
+        let (_, m) = call(node, get("/api/v1/cluster/members")).await;
+        let m = m.as_array().unwrap();
+        assert_eq!(m.len(), 3, "{m:?}");
+        assert!(
+            m.iter()
+                .all(|r| r["status"] == "alive" && r["eligible"] == true)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn idempotency_key_dedupes_across_entry_nodes() {
     let c = cluster(3).await;
     let req = serde_json::json!({"queue_name": "orders", "task_name": "t", "idempotency_key": "order-42"});

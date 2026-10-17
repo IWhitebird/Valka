@@ -164,7 +164,8 @@ export interface TaskCounts {
 }
 
 export interface WalStats {
-  epoch: number;
+  /** The node process's incarnation (bumped on every start). */
+  inc: number;
   durable_lsn: string;
   next_lsn: string;
   unflushed_records: number;
@@ -179,16 +180,35 @@ export interface SnapshotStats {
   shards_with_snapshot: number;
 }
 
-export type NodeStatus = "alive" | "poisoned" | "suspect" | "dead" | "draining";
+/**
+ * alive / draining: serving; fenced: lost its lease or too old to serve; poisoned: WAL writer
+ * failed; suspect: lease not renewed lately; dead: tombstoned or exited; unknown: lease seen,
+ * node not answering.
+ */
+export type NodeStatus =
+  | "alive"
+  | "draining"
+  | "fenced"
+  | "poisoned"
+  | "suspect"
+  | "dead"
+  | "unknown";
 
-export interface ClusterNode {
+/** What every node row carries, from the node itself or from its lease in the bucket. */
+export interface ClusterNodeBase {
   node_id: string;
-  epoch: number;
+  inc: number;
   status: NodeStatus;
-  grpc_addr: string;
-  http_addr: string;
+  grpc_addr: string | null;
+  http_addr: string | null;
   version: string;
-  started_at: string;
+  started_at: string | null;
+  lease_age_ms: number | null;
+  eligible: boolean;
+}
+
+/** A node that answered with its stats. */
+export interface ClusterNodeStats extends ClusterNodeBase {
   storage_backend: string;
   shards_owned: number;
   shards_with_tasks: number;
@@ -199,11 +219,26 @@ export interface ClusterNode {
   snapshots: SnapshotStats;
 }
 
+/** A node known only from its lease (dead, suspect, or not answering). */
+export interface ClusterNodeLease extends ClusterNodeBase {
+  internal_addr: string | null;
+  protocol: number;
+  unsplit: number[];
+}
+
+export type ClusterNode = ClusterNodeStats | ClusterNodeLease;
+
+export function hasStats(node: ClusterNode): node is ClusterNodeStats {
+  return "wal" in node && node.wal !== undefined;
+}
+
 export interface ClusterHealth {
   status: "ok" | "degraded" | "critical";
-  unowned_shards: number;
+  /** Null when some node did not answer: ownership is then unknown. */
+  unowned_shards: number | null;
   poisoned_nodes: string[];
   suspect_nodes: string[];
+  partial?: boolean;
 }
 
 export interface ClusterOverview {
@@ -215,10 +250,42 @@ export interface ClusterOverview {
   nodes: ClusterNode[];
 }
 
+/** One lease in the bucket, as this node sees it (`GET /api/v1/cluster/members`). */
+export interface ClusterMember {
+  node_id: string;
+  inc: number;
+  /** The lease's own state: alive, draining or dead. */
+  state: string;
+  status: NodeStatus;
+  live: boolean;
+  suspect: boolean;
+  eligible: boolean;
+  lease_age_ms: number;
+  grpc_addr: string | null;
+  http_addr: string | null;
+  internal_addr: string | null;
+  version: string;
+  protocol: number;
+  started_at: string | null;
+  /** Earlier incarnations whose logs are not split yet. */
+  unsplit: number[];
+}
+
+export interface ClusterPlacement {
+  /** Operator pins: shard → node. */
+  pins: Record<string, string>;
+  effective_protocol: number;
+  eligible_nodes: string[];
+}
+
+export type ShardPhase = "unowned" | "loading" | "serving" | "releasing";
+
 export interface ShardStats {
   shard: number;
   owner: string | null;
-  epoch: number;
+  /** Ownership generation, bumped on every move (0 when not served). */
+  gen: number;
+  phase: ShardPhase | string;
   tasks: number;
   pending: number;
   running: number;
@@ -227,7 +294,8 @@ export interface ShardStats {
   dead_letters: number;
   shard_seq: number;
   snapshot_seq: number;
-  snapshot_lsn: string | null;
+  /** Bucket key of the newest snapshot, ending in `{gen}-{seq}-{ptr}.snap`. */
+  snapshot_key: string | null;
   snapshot_at: string | null;
   records_since_snapshot: number;
   dirty_since_lsn: string | null;

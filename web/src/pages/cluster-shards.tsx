@@ -10,7 +10,8 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { useShard, useShards } from "@/hooks/use-cluster";
+import { useClusterOverview, useShard, useShards } from "@/hooks/use-cluster";
+import { DEFAULT_NUM_SHARDS, snapshotName } from "@/lib/cluster";
 import { formatDate, formatRelative } from "@/lib/utils";
 
 const MODES: { value: HeatmapMode; label: string }[] = [
@@ -48,6 +49,8 @@ export function ClusterShardsPage() {
     dirty: dirtyOnly || undefined,
   });
   const { data: detail } = useShard(selected);
+  const { data: overview } = useClusterOverview();
+  const numShards = overview?.num_shards ?? DEFAULT_NUM_SHARDS;
   // Ages are measured against the time the shard data was fetched, keeping render pure.
   const nowMs = dataUpdatedAt || 0;
   const owners = useMemo(() => Array.from(ownerIndexOf(shards).keys()), [shards]);
@@ -69,7 +72,9 @@ export function ClusterShardsPage() {
       <div>
         <h1 className="text-2xl font-semibold tracking-tight text-foreground">Shards</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          4096 fixed storage shards. Each has exactly one writer; snapshots and replay happen per shard.
+          {numShards.toLocaleString()} storage shards, fixed when the bucket was created. Each is
+          served by exactly one node at a time; ownership moves by compare-and-swap on the
+          shard's owner record, and its generation goes up with every move.
         </p>
       </div>
       <ClusterTabs />
@@ -125,7 +130,14 @@ export function ClusterShardsPage() {
           {isLoading ? (
             <Skeleton className="aspect-square w-full max-w-[768px]" />
           ) : (
-            <ShardHeatmap shards={shards} mode={mode} selected={selected} onSelect={setSelected} nowMs={nowMs} />
+            <ShardHeatmap
+              shards={shards}
+              numShards={numShards}
+              mode={mode}
+              selected={selected}
+              onSelect={setSelected}
+              nowMs={nowMs}
+            />
           )}
           <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
             {mode === "owner" &&
@@ -161,12 +173,13 @@ export function ClusterShardsPage() {
             {detail && (
               <>
                 <Row label="Owner" value={detail.owner ?? <span className="text-red-400">none</span>} />
-                <Row label="Epoch" value={detail.epoch} />
+                <Row label="Generation" value={detail.gen} />
+                <Row label="Phase" value={detail.phase} />
                 <Row label="Tasks in RAM" value={detail.tasks} />
                 <Row label="Pending / Running / Retry" value={`${detail.pending} / ${detail.running} / ${detail.retry}`} />
                 <Row label="Signals · Dead letters" value={`${detail.signals} · ${detail.dead_letters}`} />
                 <Row label="Shard seq" value={detail.shard_seq} />
-                <Row label="Snapshot" value={detail.snapshot_lsn ? `${detail.snapshot_lsn} (seq ${detail.snapshot_seq})` : "never"} />
+                <Row label="Snapshot" value={detail.snapshot_key ? snapshotName(detail.snapshot_key) : "never"} />
                 <Row label="Snapshot taken" value={detail.snapshot_at ? formatRelative(detail.snapshot_at) : "—"} />
                 <Row label="Records since snapshot" value={detail.records_since_snapshot} />
                 <Row label="Dirty since LSN" value={detail.dirty_since_lsn ?? "—"} />

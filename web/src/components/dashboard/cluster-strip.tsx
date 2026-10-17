@@ -2,7 +2,7 @@ import { Link } from "react-router-dom";
 import { Server } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { useClusterOverview } from "@/hooks/use-cluster";
-import { healthTone } from "@/lib/cluster";
+import { healthTone, sumStats } from "@/lib/cluster";
 import { cn } from "@/lib/utils";
 
 export function ClusterStrip() {
@@ -10,9 +10,9 @@ export function ClusterStrip() {
   if (!data) return null;
   const tone = healthTone(data.health.status);
   const alive = data.nodes.filter((n) => n.status === "alive").length;
-  const owned = data.nodes.reduce((s, n) => s + n.shards_owned, 0);
-  const unflushed = data.nodes.reduce((s, n) => s + n.wal.unflushed_records, 0);
-  const dirty = data.nodes.reduce((s, n) => s + n.snapshots.dirty_shards, 0);
+  const owned = sumStats(data.nodes, (n) => n.shards_owned);
+  const unflushed = sumStats(data.nodes, (n) => n.wal.unflushed_records);
+  const dirty = sumStats(data.nodes, (n) => n.snapshots.dirty_shards);
   return (
     <Link
       to="/cluster"

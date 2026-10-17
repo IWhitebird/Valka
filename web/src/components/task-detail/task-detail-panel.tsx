@@ -13,6 +13,7 @@ import {
 import type { Task } from "@/api/types";
 import { formatDate } from "@/lib/utils";
 import { useCancelTask } from "@/hooks/use-tasks";
+import { useClusterOverview } from "@/hooks/use-cluster";
 import { TaskStatusBadge } from "@/components/tasks/task-status-badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -62,7 +63,8 @@ function JsonBlock({ label, data }: { label: string; data: unknown }) {
 }
 
 export function TaskDetailPanel({ task }: TaskDetailPanelProps) {
-  const shard = shardOfTaskId(task.id);
+  const { data: overview } = useClusterOverview();
+  const shard = overview ? shardOfTaskId(task.id, overview.num_shards) : null;
   const cancelTask = useCancelTask();
 
   const canCancel =

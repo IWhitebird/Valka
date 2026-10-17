@@ -1,15 +1,15 @@
 import { ShieldAlert, ShieldCheck } from "lucide-react";
 import type { ClusterOverview } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
-import { healthProblems, healthTone } from "@/lib/cluster";
+import { healthProblems, healthTone, sumStats } from "@/lib/cluster";
 import { cn } from "@/lib/utils";
 
 export function HealthBanner({ overview }: { overview: ClusterOverview }) {
   const tone = healthTone(overview.health.status);
   const problems = healthProblems(overview.health, overview.num_shards);
   const alive = overview.nodes.filter((n) => n.status === "alive").length;
-  const owned = overview.nodes.reduce((s, n) => s + n.shards_owned, 0);
-  const unflushed = overview.nodes.reduce((s, n) => s + n.wal.unflushed_records, 0);
+  const owned = sumStats(overview.nodes, (n) => n.shards_owned);
+  const unflushed = sumStats(overview.nodes, (n) => n.wal.unflushed_records);
   const Icon = problems.length === 0 ? ShieldCheck : ShieldAlert;
 
   return (
@@ -35,8 +35,9 @@ export function HealthBanner({ overview }: { overview: ClusterOverview }) {
         )}
         {!overview.clustered && (
           <p className="mt-2 text-xs text-muted-foreground">
-            Single-node mode: this node owns every shard. Multi-node ownership arrives with
-            the cluster phase.
+            Single-node mode: a cluster of one that owns every shard. Set{" "}
+            <code className="font-mono">VALKA_CLUSTER__ENABLED=true</code> (S3 backend) to let other
+            nodes join this bucket.
           </p>
         )}
       </div>

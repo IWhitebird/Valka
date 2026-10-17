@@ -27,6 +27,22 @@ export function useShard(shard: number | null) {
   });
 }
 
+export function useMembers() {
+  return useQuery({
+    queryKey: ["cluster", "members"],
+    queryFn: clusterApi.members,
+    refetchInterval: 3_000,
+  });
+}
+
+export function usePlacement() {
+  return useQuery({
+    queryKey: ["cluster", "placement"],
+    queryFn: clusterApi.placement,
+    refetchInterval: 10_000,
+  });
+}
+
 export function useStorage() {
   return useQuery({
     queryKey: ["cluster", "storage"],

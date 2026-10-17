@@ -5,14 +5,19 @@ import {
   formatDurationMs,
   healthProblems,
   shardOfTaskId,
+  snapshotName,
+  sumStats,
 } from "../cluster";
+import type { ClusterNode } from "@/api/types";
 
 describe("shardOfTaskId", () => {
-  it("matches the server's embedded shard (low 12 bits of the uuid)", () => {
-    // This task id was created by valka-server and its snapshot landed under snapshots/2634/.
+  it("matches the server's embedded shard (low 16 bits, masked to the shard count)", () => {
     expect(shardOfTaskId("01a06ae4-e721-73a3-8dcb-b48ecb400a4a")).toBe(2634);
-    expect(shardOfTaskId("00000000-0000-7000-8000-000000000fff")).toBe(4095);
+    expect(shardOfTaskId("00000000-0000-7000-8000-00000000ffff")).toBe(4095);
+    expect(shardOfTaskId("00000000-0000-7000-8000-00000000ffff", 65536)).toBe(65535);
+    expect(shardOfTaskId("00000000-0000-7000-8000-00000000ffff", 256)).toBe(255);
     expect(shardOfTaskId("00000000-0000-7000-8000-00000000f000")).toBe(0);
+    expect(shardOfTaskId("00000000-0000-7000-8000-00000000f000", 65536)).toBe(0xf000);
   });
   it("rejects non-uuids", () => {
     expect(shardOfTaskId("not-a-uuid")).toBeNull();
@@ -47,6 +52,22 @@ describe("formatting", () => {
   });
 });
 
+describe("snapshotName", () => {
+  it("keeps the file name of a snapshot key", () => {
+    expect(snapshotName("snapshots/3f/00042/000000000002-00000000000000000017-final.snap")).toBe(
+      "000000000002-00000000000000000017-final.snap",
+    );
+  });
+});
+
+describe("sumStats", () => {
+  it("skips nodes known only from their lease", () => {
+    const answered = { node_id: "a", wal: { unflushed_records: 2 }, shards_owned: 10 } as unknown as ClusterNode;
+    const lease = { node_id: "b", inc: 3, status: "dead", protocol: 2, unsplit: [] } as unknown as ClusterNode;
+    expect(sumStats([answered, lease], (n) => n.shards_owned)).toBe(10);
+  });
+});
+
 describe("healthProblems", () => {
   it("is empty when healthy", () => {
     expect(
@@ -65,5 +86,12 @@ describe("healthProblems", () => {
     expect(p[0]).toContain("poisoned on a");
     expect(p[1]).toContain("12 of 4096");
     expect(p[2]).toContain("b missed heartbeats");
+  });
+  it("says ownership is unknown when a node did not answer", () => {
+    const p = healthProblems(
+      { status: "degraded", unowned_shards: null, poisoned_nodes: [], suspect_nodes: [], partial: true },
+      4096,
+    );
+    expect(p).toEqual(["Some nodes did not answer: shard ownership is unknown"]);
   });
 });

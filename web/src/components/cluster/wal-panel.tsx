@@ -1,4 +1,4 @@
-import type { ClusterNode } from "@/api/types";
+import type { ClusterNodeStats } from "@/api/types";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { formatDurationMs } from "@/lib/cluster";
 import { cn } from "@/lib/utils";
@@ -14,7 +14,7 @@ function Row({ label, value, tone }: { label: string; value: React.ReactNode; to
   );
 }
 
-export function WalPanel({ node }: { node: ClusterNode }) {
+export function WalPanel({ node }: { node: ClusterNodeStats }) {
   const w = node.wal;
   return (
     <Card className="gap-0 py-0">
@@ -24,7 +24,7 @@ export function WalPanel({ node }: { node: ClusterNode }) {
         </CardTitle>
       </CardHeader>
       <CardContent className="px-5 pb-3 pt-2">
-        <Row label="Epoch" value={w.epoch} />
+        <Row label="Incarnation" value={w.inc} />
         <Row label="Durable LSN" value={w.durable_lsn} />
         <Row label="Next LSN" value={w.next_lsn} />
         <Row label="Unflushed records" value={w.unflushed_records} tone={w.unflushed_records > 0 ? "warn" : undefined} />

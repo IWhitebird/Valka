@@ -1,5 +1,5 @@
 import { Camera } from "lucide-react";
-import type { ClusterNode } from "@/api/types";
+import type { ClusterNodeStats } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useSnapshotNow } from "@/hooks/use-cluster";
@@ -14,7 +14,16 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
   );
 }
 
-export function SnapshotPanel({ node, numShards }: { node: ClusterNode; numShards: number }) {
+/** `local`: the node serving this dashboard (the snapshot button acts on that node only). */
+export function SnapshotPanel({
+  node,
+  numShards,
+  local = true,
+}: {
+  node: ClusterNodeStats;
+  numShards: number;
+  local?: boolean;
+}) {
   const s = node.snapshots;
   const snapshot = useSnapshotNow();
   return (
@@ -23,10 +32,12 @@ export function SnapshotPanel({ node, numShards }: { node: ClusterNode; numShard
         <CardTitle className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
           Snapshots
         </CardTitle>
-        <Button size="sm" variant="outline" onClick={() => snapshot.mutate()} disabled={snapshot.isPending}>
-          <Camera className="mr-1.5 h-3.5 w-3.5" />
-          {snapshot.isPending ? "Snapshotting…" : "Snapshot now"}
-        </Button>
+        {local && (
+          <Button size="sm" variant="outline" onClick={() => snapshot.mutate()} disabled={snapshot.isPending}>
+            <Camera className="mr-1.5 h-3.5 w-3.5" />
+            {snapshot.isPending ? "Snapshotting…" : "Snapshot now"}
+          </Button>
+        )}
       </CardHeader>
       <CardContent className="px-5 pb-3 pt-2">
         <Row label="Last round" value={s.last_round_at ? formatRelative(s.last_round_at) : "not yet this run"} />

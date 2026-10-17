@@ -61,13 +61,21 @@ export function cellColor(
   }
 }
 
-/** Grid geometry shared by the canvas painter and the hit test. */
-export const GRID = 64;
+/**
+ * Grid geometry shared by the canvas painter and the hit test: as square as a power-of-two
+ * shard count allows (4096 → 64×64, 2048 → 64×32, 256 → 16×16).
+ */
+export function gridDims(numShards: number): { cols: number; rows: number } {
+  const n = Math.max(1, numShards);
+  const cols = 2 ** Math.ceil(Math.log2(n) / 2);
+  return { cols, rows: Math.ceil(n / cols) };
+}
 
-export function shardAtPoint(x: number, y: number, size: number): number {
-  if (size <= 0) return 0;
-  const cell = size / GRID;
-  const col = Math.min(GRID - 1, Math.max(0, Math.floor(x / cell)));
-  const row = Math.min(GRID - 1, Math.max(0, Math.floor(y / cell)));
-  return row * GRID + col;
+export function shardAtPoint(x: number, y: number, width: number, numShards: number): number {
+  if (width <= 0) return 0;
+  const { cols, rows } = gridDims(numShards);
+  const cell = width / cols;
+  const col = Math.min(cols - 1, Math.max(0, Math.floor(x / cell)));
+  const row = Math.min(rows - 1, Math.max(0, Math.floor(y / cell)));
+  return Math.min(numShards - 1, row * cols + col);
 }

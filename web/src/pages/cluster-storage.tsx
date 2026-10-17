@@ -39,11 +39,15 @@ export function ClusterStoragePage() {
             </CardHeader>
             <CardContent className="px-5 pb-5 pt-2">
               <pre className="overflow-x-auto rounded-md bg-muted/40 p-3 font-mono text-xs leading-relaxed text-muted-foreground">
-{`backend            ${storage.backend}
-assignment         shard → {node, epoch}, compare-and-swap
-wal/{node}/        ${storage.wal.segments} segment(s) — group-committed records, header + CRC-framed zstd JSON
-snapshots/{shard}/ ${storage.snapshots.count} snapshot(s) — per-shard state, replay starts here
-logs/{run}/        ${storage.logs.chunks} chunk(s) — task log lines`}
+{`backend                  ${storage.backend}
+cluster.json             cluster id, shard count (written once)
+nodes/{node}/lease       liveness and write fence per node: incarnation, state, renew counter
+owners/{hh}/{shard}      which incarnation owns a shard, at which generation (compare-and-swap)
+wal/{node}/              ${storage.wal.segments} segment(s) of this node — group-committed records, CRC-framed zstd JSON
+snapshots/{hh}/{shard}/  ${storage.snapshots.count} snapshot(s) — per-shard state, {gen}-{seq}-{ptr}
+splits/{node}/{inc}      dead incarnations whose logs were split into snapshots
+queues/{hh}/{queue}      queue partition counts
+logs/{hh}/{run}/         ${storage.logs.chunks} chunk(s) — task log lines`}
               </pre>
               <p className="mt-3 text-xs text-muted-foreground">
                 Computed {formatRelative(storage.computed_at)} (cached 30 s).

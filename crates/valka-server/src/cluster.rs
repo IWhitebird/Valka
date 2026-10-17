@@ -245,20 +245,29 @@ pub async fn list_shards(
     Ok(Json(rows))
 }
 
+/// One shard, from the node serving it; a shard nobody serves right now is shown from
+/// this node's (empty) view with no owner.
 pub async fn get_shard(
     State(state): State<AppState>,
     Path(shard): Path<u16>,
 ) -> Result<impl IntoResponse, ApiError> {
-    state
-        .engine
-        .shard_detail(ShardId(shard))
-        .map(Json)
-        .ok_or_else(|| {
-            ApiError::NotFound(format!(
-                "shard {shard} out of range (0..{})",
-                state.engine.num_shards()
-            ))
-        })
+    let id = ShardId(shard);
+    let Some(mut local) = state.engine.shard_detail(id) else {
+        return Err(ApiError::NotFound(format!(
+            "shard {shard} out of range (0..{})",
+            state.engine.num_shards()
+        )));
+    };
+    if state.engine.owns(id) {
+        return Ok(Json(local));
+    }
+    match state.api.shard_detail(id).await {
+        Ok(d) => Ok(Json(d)),
+        Err(_) => {
+            local.stats.owner = None;
+            Ok(Json(local))
+        }
+    }
 }
 
 pub async fn storage(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {

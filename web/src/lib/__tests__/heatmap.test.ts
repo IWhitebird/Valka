@@ -7,6 +7,7 @@ import {
   COLOR_UNOWNED,
   OWNER_PALETTE,
   cellColor,
+  gridDims,
   ownerIndexOf,
   shardAtPoint,
 } from "../heatmap";
@@ -15,7 +16,8 @@ function shard(overrides: Partial<ShardStats> = {}): ShardStats {
   return {
     shard: 1,
     owner: "a",
-    epoch: 1,
+    gen: 1,
+    phase: "serving",
     tasks: 0,
     pending: 0,
     running: 0,
@@ -24,7 +26,7 @@ function shard(overrides: Partial<ShardStats> = {}): ShardStats {
     dead_letters: 0,
     shard_seq: 0,
     snapshot_seq: 0,
-    snapshot_lsn: null,
+    snapshot_key: null,
     snapshot_at: null,
     records_since_snapshot: 0,
     dirty_since_lsn: null,
@@ -73,12 +75,30 @@ describe("cellColor", () => {
   });
 });
 
+describe("gridDims", () => {
+  it("is as square as the shard count allows", () => {
+    expect(gridDims(4096)).toEqual({ cols: 64, rows: 64 });
+    expect(gridDims(2048)).toEqual({ cols: 64, rows: 32 });
+    expect(gridDims(256)).toEqual({ cols: 16, rows: 16 });
+    expect(gridDims(16)).toEqual({ cols: 4, rows: 4 });
+    expect(gridDims(65536)).toEqual({ cols: 256, rows: 256 });
+  });
+});
+
 describe("shardAtPoint", () => {
-  it("maps pixels to the 64×64 grid and clamps at the edges", () => {
-    expect(shardAtPoint(0, 0, 640)).toBe(0);
-    expect(shardAtPoint(15, 0, 640)).toBe(1);
-    expect(shardAtPoint(0, 10, 640)).toBe(64);
-    expect(shardAtPoint(639, 639, 640)).toBe(4095);
-    expect(shardAtPoint(-5, 10_000, 640)).toBe(4032);
+  it("maps pixels to the 64×64 grid of 4096 shards and clamps at the edges", () => {
+    expect(shardAtPoint(0, 0, 640, 4096)).toBe(0);
+    expect(shardAtPoint(15, 0, 640, 4096)).toBe(1);
+    expect(shardAtPoint(0, 10, 640, 4096)).toBe(64);
+    expect(shardAtPoint(639, 639, 640, 4096)).toBe(4095);
+    expect(shardAtPoint(-5, 10_000, 640, 4096)).toBe(4032);
+  });
+  it("follows the grid of other shard counts", () => {
+    // 256 shards: 16×16 cells of 40 px.
+    expect(shardAtPoint(45, 0, 640, 256)).toBe(1);
+    expect(shardAtPoint(0, 45, 640, 256)).toBe(16);
+    expect(shardAtPoint(639, 639, 640, 256)).toBe(255);
+    // 2048 shards: 64 columns, 32 rows.
+    expect(shardAtPoint(639, 10_000, 640, 2048)).toBe(2047);
   });
 });

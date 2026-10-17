@@ -1,7 +1,11 @@
 # Cluster management UI — plan
 
-Status: **"buildable now" column shipped** (single-node observability); phase 2 items pending
-the ownership protocol. Companion to `DESIGN.md` (architecture) and `PLAN.md` (phases).
+Status: **"buildable now" column shipped; phase 2 read side shipped** (multi-node node
+cards from every live node, lease-only rows for dead or silent nodes, membership table,
+placement and pins, any shard count, generations and phases on the shard map, shard detail
+fetched from its owner). Phase 2 **actions in the UI** (drain, move shard) are not built: the
+admin API exists (`RUNBOOKS.md`), the buttons do not. Companion to `DESIGN.md`, `PHASE2.md`
+and `PLAN.md`.
 
 Shipped: `GET /api/v1/cluster`, `/cluster/shards[?node&dirty&min_tasks]`, `/cluster/shards/:id`,
 `/cluster/storage`, `POST /cluster/snapshot`; UI routes `/cluster`, `/cluster/nodes/:id`,
@@ -30,15 +34,15 @@ visible anywhere except logs and `/api/v1/cluster`, which returns six fields.
 
 | Capability | Buildable now (single owner) | Needs phase 2 (ownership protocol) |
 |---|---|---|
-| Node card: id, epoch, uptime, version, storage backend, durable LSN, unflushed records, poisoned | ✅ | |
-| Shard heatmap: owner, task counts, snapshot age, records since snapshot | ✅ (one owner) | multi-owner coloring |
+| Node card: id, incarnation, uptime, version, storage backend, durable LSN, unflushed records, poisoned | ✅ | ✅ lease-only rows for dead / silent nodes |
+| Shard heatmap: owner, task counts, snapshot age, records since snapshot | ✅ (one owner) | ✅ multi-owner coloring, generation, phase, any shard count |
 | Storage panel: segments, snapshots, bytes, truncation lag, est. request cost | ✅ | |
 | Workers table "Node" column; task detail shows shard + owner node | ✅ | cross-node link |
 | Cluster health banner (unowned shards, poisoned writer, suspect nodes) | ✅ (partial) | membership signals |
-| Membership list from gossip with alive / suspect / dead | | ✅ |
-| Takeover timeline, epoch history per shard | | ✅ |
-| Actions: drain node, force takeover, move shard, rebalance | | ✅ |
-| Cluster-wide task list / counts (scatter-gather) | | ✅ |
+| Membership list (from the leases in the bucket) with alive / suspect / dead, eligibility, unsplit logs, pins | | ✅ shipped |
+| Takeover timeline, generation history per shard | | not built |
+| Actions: drain node, move shard (admin API exists; no UI buttons yet) | | API ✅, UI not built |
+| Cluster-wide task list / counts (scatter-gather) | | ✅ shipped |
 | Cluster events SSE (NodeJoined/Left, ShardsMoved, TakeoverDone, WriterPoisoned) | partial (poisoned) | ✅ |
 
 Recommendation: build the "now" column first. It gives the observability the WAL design
@@ -178,8 +182,9 @@ sparklines (inline SVG).
 2. **UI: Cluster page + Node detail + Storage** on the single node. ~1–2 days.
 3. **Shard heatmap** + filters + drawer. ~1 day.
 4. **Existing-page integrations** (dashboard strip, Node column, task detail rows). ~½ day.
-5. **Phase 2 hooks**: membership from gossip, cluster events SSE, admin token + actions,
-   scatter-gather lists. Lands with the ownership protocol work.
+5. **Phase 2 hooks**: membership from the bucket's leases ✅, scatter-gather lists ✅,
+   cluster-wide task events (relay) ✅; admin actions in the UI and a takeover timeline: not
+   built yet.
 
 ## 5. Open questions
 

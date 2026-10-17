@@ -6,7 +6,8 @@ use serde_json::Value;
 use valka_core::{ServerError, TaskStatus};
 use valka_engine::{
     CheckpointView, CreateTask, DeadLetterView, DispatchInfo, DispatchableTask, NodeStats,
-    ReattachOutcome, ResultOutcome, RunResult, RunView, ShardStats, SignalView, TaskView,
+    ReattachOutcome, ResultOutcome, RunResult, RunView, ShardDetail, ShardStats, SignalView,
+    TaskView,
 };
 
 /// A command for another node: most are about one task and run on the owner of its
@@ -49,6 +50,10 @@ pub enum Command {
     FindIdempotent {
         probe_id: String,
         key: String,
+    },
+    /// Stats and per-queue task counts of `probe_id`'s shard (operator view).
+    ShardDetail {
+        probe_id: String,
     },
 
     // ── worker side, routed to the task's owner ──
@@ -151,7 +156,9 @@ impl Command {
             | Command::Checkpoint { task_id, .. }
             | Command::Reattach { task_id, .. }
             | Command::ResetSignals { task_id } => Target::Shard(task_id),
-            Command::FindIdempotent { probe_id, .. } => Target::Shard(probe_id),
+            Command::FindIdempotent { probe_id, .. } | Command::ShardDetail { probe_id } => {
+                Target::Shard(probe_id)
+            }
             Command::SignalDelivered { signal_id } | Command::SignalAcked { signal_id } => {
                 Target::Shard(signal_id)
             }
@@ -183,6 +190,7 @@ impl Command {
             Command::Runs { .. } => "runs",
             Command::Checkpoints { .. } => "checkpoints",
             Command::FindIdempotent { .. } => "find_idempotent",
+            Command::ShardDetail { .. } => "shard_detail",
             Command::Dispatch { .. } => "dispatch",
             Command::ReturnRun { .. } => "return_run",
             Command::Unoffer { .. } => "unoffer",
@@ -215,6 +223,7 @@ pub enum Reply {
     Signals(Vec<SignalView>),
     Runs(Option<Vec<RunView>>),
     Checkpoints(Option<Vec<CheckpointView>>),
+    ShardDetail(Box<ShardDetail>),
     Dispatched(Box<DispatchInfo>),
     Result(ResultOutcome),
     Checkpoint(CheckpointView),

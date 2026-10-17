@@ -22,7 +22,7 @@ use valka_dispatcher::TaskRouter;
 use valka_engine::state::SignalStatus;
 use valka_engine::{
     CheckpointView, CreateTask, DeadLetterView, DispatchInfo, Engine, NodeStats, ResultOutcome,
-    RunResult, RunView, SignalView, TaskView,
+    RunResult, RunView, ShardDetail, SignalView, TaskView,
 };
 use valka_wal::owners::{self, OwnerState};
 
@@ -256,6 +256,15 @@ impl Api {
         }
     }
 
+    /// A shard's stats and per-queue counts, from the node serving it.
+    pub async fn shard_detail(&self, shard: ShardId) -> Result<ShardDetail, ServerError> {
+        let probe_id = valka_core::new_id_in_shard(shard).to_string();
+        match self.route(Command::ShardDetail { probe_id }).await? {
+            Reply::ShardDetail(d) => Ok(*d),
+            r => Err(unexpected(r)),
+        }
+    }
+
     fn known(&self, task_id: &str) -> Result<ShardId, ServerError> {
         self.inner
             .engine
@@ -449,6 +458,13 @@ impl Api {
             Command::Checkpoints { task_id } => {
                 self.ensure_readable(&task_id)?;
                 Ok(Reply::Checkpoints(e.checkpoints_for_task(&task_id)))
+            }
+            Command::ShardDetail { probe_id } => {
+                let shard = self.ensure_readable(&probe_id)?;
+                let detail = e
+                    .shard_detail(shard)
+                    .ok_or(ServerError::NotOwner(shard.0))?;
+                Ok(Reply::ShardDetail(Box::new(detail)))
             }
             Command::FindIdempotent { probe_id, key } => {
                 let shard = self.ensure_readable(&probe_id)?;

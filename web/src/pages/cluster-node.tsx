@@ -6,12 +6,13 @@ import { ClusterTabs } from "@/components/cluster/cluster-tabs";
 import { SnapshotPanel } from "@/components/cluster/snapshot-panel";
 import { Stat } from "@/components/cluster/stat";
 import { WalPanel } from "@/components/cluster/wal-panel";
+import { hasStats } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { WorkerTable } from "@/components/workers/worker-table";
-import { useClusterOverview, useShards } from "@/hooks/use-cluster";
-import { compressRanges, nodeStatusDot } from "@/lib/cluster";
+import { useClusterOverview, useMembers, useShards } from "@/hooks/use-cluster";
+import { compressRanges, formatDurationMs, nodeStatusDot } from "@/lib/cluster";
 import { cn, formatDate } from "@/lib/utils";
 
 export function ClusterNodePage() {
@@ -23,7 +24,10 @@ export function ClusterNodePage() {
     queryFn: workersApi.list,
     refetchInterval: 5_000,
   });
+  const { data: members = [] } = useMembers();
   const node = overview?.nodes.find((n) => n.node_id === nodeId);
+  const member = members.find((m) => m.node_id === nodeId);
+  const stats = node && hasStats(node) ? node : null;
   const nodeWorkers = workers.filter((w) => !w.node_id || w.node_id === nodeId);
 
   return (
@@ -44,32 +48,61 @@ export function ClusterNodePage() {
               <div className="flex items-center gap-2">
                 <span className={cn("h-2.5 w-2.5 rounded-full", nodeStatusDot(node.status))} />
                 <h1 className="text-2xl font-semibold tracking-tight text-foreground">{node.node_id}</h1>
-                <Badge variant="outline" className="font-mono">epoch {node.epoch}</Badge>
+                <Badge variant="outline" className="font-mono" title="Incarnation: bumped on every start">
+                  inc {node.inc}
+                </Badge>
                 <Badge variant="outline">{node.status}</Badge>
+                {node.eligible && <Badge variant="outline">eligible for placement</Badge>}
               </div>
               <p className="mt-1 font-mono text-xs text-muted-foreground">
-                gRPC {node.grpc_addr} · HTTP {node.http_addr} · v{node.version} · {node.storage_backend} · started{" "}
-                {formatDate(node.started_at)}
+                gRPC {node.grpc_addr ?? "—"} · HTTP {node.http_addr ?? "—"}
+                {member?.internal_addr && ` · internal ${member.internal_addr}`}
+                {node.version && ` · v${node.version}`}
+                {stats && ` · ${stats.storage_backend}`}
+                {member && ` · protocol ${member.protocol}`}
+                {node.started_at && ` · started ${formatDate(node.started_at)}`}
               </p>
+              {node.lease_age_ms !== null && (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Lease last changed {formatDurationMs(node.lease_age_ms)} ago
+                  {member && member.unsplit.length > 0 && ` · earlier incarnations not split yet: ${member.unsplit.join(", ")}`}
+                </p>
+              )}
             </div>
           </div>
 
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-            <Stat label="Shards owned" value={`${node.shards_owned.toLocaleString()} / ${overview.num_shards.toLocaleString()}`} hint={`${node.shards_with_tasks} hold tasks`} />
-            <Stat label="Pending / Running" value={`${node.tasks.pending} / ${node.tasks.running}`} hint={`${node.tasks.retry} awaiting retry · ${node.tasks.total} in RAM`} />
-            <Stat label="Workers" value={node.workers_connected} hint={`${node.queues.length} queue${node.queues.length === 1 ? "" : "s"}`} />
-            <Stat
-              label="Unflushed records"
-              value={node.wal.unflushed_records}
-              hint="appended, not yet durable"
-              tone={node.wal.poisoned ? "bad" : node.wal.unflushed_records > 0 ? "warn" : "default"}
-            />
-          </div>
+          {!stats && (
+            <p className="rounded-lg border p-4 text-sm text-muted-foreground">
+              {node.status === "dead"
+                ? "This node is gone: its lease was tombstoned or it exited. Its log was split and its shards were claimed by live nodes."
+                : "This node is not answering. It is known only from its lease in the bucket; if its lease stops changing for the lease timeout, a live node declares it dead and takes its shards over."}
+            </p>
+          )}
 
-          <div className="grid gap-6 lg:grid-cols-2">
-            <WalPanel node={node} />
-            <SnapshotPanel node={node} numShards={overview.num_shards} />
-          </div>
+          {stats && (
+            <>
+              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                <Stat label="Shards owned" value={`${stats.shards_owned.toLocaleString()} / ${overview.num_shards.toLocaleString()}`} hint={`${stats.shards_with_tasks} hold tasks`} />
+                <Stat label="Pending / Running" value={`${stats.tasks.pending} / ${stats.tasks.running}`} hint={`${stats.tasks.retry} awaiting retry · ${stats.tasks.total} in RAM`} />
+                <Stat label="Workers" value={stats.workers_connected} hint={`${stats.queues.length} queue${stats.queues.length === 1 ? "" : "s"}`} />
+                <Stat
+                  label="Unflushed records"
+                  value={stats.wal.unflushed_records}
+                  hint="appended, not yet durable"
+                  tone={stats.wal.poisoned ? "bad" : stats.wal.unflushed_records > 0 ? "warn" : "default"}
+                />
+              </div>
+
+              <div className="grid gap-6 lg:grid-cols-2">
+                <WalPanel node={stats} />
+                <SnapshotPanel
+                  node={stats}
+                  numShards={overview.num_shards}
+                  local={stats.node_id === overview.this_node}
+                />
+              </div>
+            </>
+          )}
 
           <Card className="gap-0 py-0">
             <CardHeader className="px-5 pt-5 pb-0">

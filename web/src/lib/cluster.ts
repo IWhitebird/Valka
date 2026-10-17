@@ -1,16 +1,28 @@
-import type { ClusterHealth, NodeStatus } from "@/api/types";
+import type { ClusterHealth, ClusterNode, ClusterNodeStats, NodeStatus } from "@/api/types";
+import { hasStats } from "@/api/types";
 
-/** Storage shards are fixed; mirrors `valka_core::NUM_SHARDS`. */
-export const NUM_SHARDS = 4096;
+/** Shard count of a new bucket; a cluster's real count is `ClusterOverview.num_shards`. */
+export const DEFAULT_NUM_SHARDS = 4096;
 
 /**
- * The shard a task lives in is embedded in the low 12 bits of its UUIDv7
- * (see `valka_core::shard::embed_shard`). Returns null for non-UUID ids.
+ * The shard a task lives in is embedded in the low 16 bits of its UUIDv7, masked to the
+ * cluster's shard count, a power of two (see `valka_core::shard::embed_shard`). Returns null
+ * for non-UUID ids.
  */
-export function shardOfTaskId(taskId: string): number | null {
+export function shardOfTaskId(taskId: string, numShards = DEFAULT_NUM_SHARDS): number | null {
   const hex = taskId.replace(/-/g, "");
   if (!/^[0-9a-fA-F]{32}$/.test(hex)) return null;
-  return parseInt(hex.slice(28, 32), 16) & 0x0fff;
+  return parseInt(hex.slice(28, 32), 16) & (numShards - 1);
+}
+
+/** Sum a per-node figure over the nodes that answered with their stats. */
+export function sumStats(nodes: ClusterNode[], f: (n: ClusterNodeStats) => number): number {
+  return nodes.reduce((s, n) => s + (hasStats(n) ? f(n) : 0), 0);
+}
+
+/** The tail of a snapshot key: `{gen}-{seq}-{ptr}.snap`. */
+export function snapshotName(key: string): string {
+  return key.slice(key.lastIndexOf("/") + 1);
 }
 
 /** "0–1365, 2731–4095" style summary of a sorted list of shard ids. */
@@ -69,6 +81,7 @@ export function nodeStatusDot(status: NodeStatus): string {
       return "bg-amber-400";
     case "suspect":
       return "bg-orange-400";
+    case "fenced":
     case "poisoned":
     case "dead":
       return "bg-red-400";
@@ -115,7 +128,9 @@ export function healthProblems(
       `WAL writer poisoned on ${health.poisoned_nodes.join(", ")} — the node cannot commit and must restart`,
     );
   }
-  if (health.unowned_shards > 0) {
+  if (health.unowned_shards === null) {
+    problems.push("Some nodes did not answer: shard ownership is unknown");
+  } else if (health.unowned_shards > 0) {
     problems.push(
       `${health.unowned_shards} of ${numShards} shards have no live owner`,
     );

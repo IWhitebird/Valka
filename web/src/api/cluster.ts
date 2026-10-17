@@ -1,6 +1,8 @@
 import { fetchAPI } from "./client";
 import type {
+  ClusterMember,
   ClusterOverview,
+  ClusterPlacement,
   ListShardsParams,
   ShardDetail,
   ShardStats,
@@ -27,6 +29,14 @@ export const clusterApi = {
 
   shard(shard: number): Promise<ShardDetail> {
     return fetchAPI<ShardDetail>(`/api/v1/cluster/shards/${shard}`);
+  },
+
+  members(): Promise<ClusterMember[]> {
+    return fetchAPI<ClusterMember[]>("/api/v1/cluster/members");
+  },
+
+  placement(): Promise<ClusterPlacement> {
+    return fetchAPI<ClusterPlacement>("/api/v1/cluster/placement");
   },
 
   storage(): Promise<StorageStats> {

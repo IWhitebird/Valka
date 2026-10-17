@@ -1,13 +1,16 @@
 import { RefreshCw } from "lucide-react";
 import { ClusterTabs } from "@/components/cluster/cluster-tabs";
 import { HealthBanner } from "@/components/cluster/health-banner";
+import { MembersTable } from "@/components/cluster/members-table";
 import { NodeCard } from "@/components/cluster/node-card";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { useClusterOverview } from "@/hooks/use-cluster";
+import { useClusterOverview, useMembers, usePlacement } from "@/hooks/use-cluster";
 
 export function ClusterPage() {
   const { data, isLoading, isError, error, refetch } = useClusterOverview();
+  const { data: members } = useMembers();
+  const { data: placement } = usePlacement();
 
   return (
     <div className="space-y-6">
@@ -15,7 +18,8 @@ export function ClusterPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight text-foreground">Cluster</h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            Nodes, shard ownership and write-ahead log health
+            Nodes, shard ownership, membership and write-ahead log health. Any node serves this
+            page; node stats are gathered from every live node.
           </p>
         </div>
         <Button variant="outline" size="icon" onClick={() => refetch()}>
@@ -39,6 +43,9 @@ export function ClusterPage() {
               <NodeCard key={n.node_id} node={n} numShards={data.num_shards} />
             ))}
           </div>
+          {members && members.length > 0 && (
+            <MembersTable members={members} placement={placement} thisNode={data.this_node} />
+          )}
         </>
       )}
     </div>
