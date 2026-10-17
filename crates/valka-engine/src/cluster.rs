@@ -54,6 +54,7 @@ pub struct MemberInfo {
     pub version: String,
     pub protocol: u32,
     pub started_at: Option<DateTime<Utc>>,
+    /// Earlier incarnations of the node whose logs are not split yet.
     pub unsplit: Vec<u32>,
 }
 
@@ -304,7 +305,7 @@ impl Engine {
                 version: l.version.clone(),
                 protocol: l.protocol,
                 started_at: Some(l.started_at),
-                unsplit: l.incarnations().iter().map(|u| u.inc).collect(),
+                unsplit: l.unsplit.iter().map(|u| u.inc).collect(),
             });
         }
         out

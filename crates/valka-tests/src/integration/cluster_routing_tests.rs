@@ -356,6 +356,11 @@ async fn cluster_views_come_from_every_node() {
             m.iter()
                 .all(|r| r["status"] == "alive" && r["eligible"] == true)
         );
+        assert!(
+            m.iter()
+                .all(|r| r["unsplit"].as_array().unwrap().is_empty()),
+            "a live incarnation is not an unsplit log: {m:?}"
+        );
     }
 }
 
