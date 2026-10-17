@@ -23,7 +23,7 @@ cargo install valka-cli
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--server` | `http://localhost:50051` | gRPC server address |
+| `--server` | `http://[::1]:50051` | gRPC server address. In a cluster, any node works |
 
 ## Task Commands
 
@@ -65,7 +65,7 @@ valka task list --queue emails --status RUNNING --limit 20
 | `--status` | - | Filter by status |
 | `--limit` | `20` | Max results |
 
-**Status values**: `PENDING`, `DISPATCHING`, `RUNNING`, `COMPLETED`, `FAILED`, `RETRY`, `DEAD_LETTER`, `CANCELLED`
+**Status values**: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`, `RETRY`, `DEAD_LETTER`, `CANCELLED`
 
 ### Cancel a Task
 
@@ -97,7 +97,7 @@ Output format:
 ```bash
 # Create a task
 TASK_ID=$(valka task create --queue emails --name send-email \
-  --input '{"to": "hello@example.com"}' | jq -r '.id')
+  --input '{"to": "hello@example.com"}' | awk '/ID:/ {print $2; exit}')
 
 echo "Created task: $TASK_ID"
 

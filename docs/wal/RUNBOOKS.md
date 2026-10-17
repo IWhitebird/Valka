@@ -68,7 +68,8 @@ newer process started with the same node id.
 1. `GET /api/v1/cluster/members`: the node shows `dead`, `dead_by` names the guardian.
 2. Its shards come back within ~10–15 s: split (`valka_splits_total`), then claims
    (`valka_shard_claims_total{result="claimed"}`). Workers attached to the dead node reconnect
-   to another node and reattach their running tasks (`valka_reattach_total`).
+   to another node and reattach their running tasks (`valka_reattach_total`; `retrying` while
+   a task's shard is still moving, `failed` only if its owner stayed unreachable for 60 s).
 3. Replace or restart the machine. A restart with the same node id takes a new incarnation and
    simply joins again.
 
@@ -89,7 +90,7 @@ cannot be claimed (a claim needs the split marker `splits/{node}/{inc}`).
 
 `sum(valka_shards_owned)` below the shard count for more than two minutes.
 
-1. `GET /api/v1/cluster/shards?node=` lists unowned rows (`owner: null`).
+1. `GET /api/v1/cluster/shards?unowned=true` lists the shards nobody serves.
 2. Usually a split is in progress or stuck ([Stuck split](#stuck-split)), or no node is
    eligible (all draining, or every node younger than `join_delay` after a full restart).
 3. `GET /api/v1/cluster/placement`: a pin to a node that is not eligible is ignored; check

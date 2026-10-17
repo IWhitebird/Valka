@@ -1,75 +1,82 @@
 ---
 title: Installation & Configuration
-description: Deploy Valka with Docker and configure it for your environment.
+description: Install Valka, choose where it stores its data, and configure it.
 ---
+
+Valka is one binary, `valka-server`, plus one place to store data. There is no database to set
+up and no migrations to run: the first node to start on an empty bucket creates what it needs.
+
+## Storage backends
+
+Everything durable lives in the storage backend: the write-ahead log, snapshots and task logs.
+
+| Backend | Use it for | Notes |
+|---------|-----------|-------|
+| `local` | A single node, development | A directory (default `./data`). Single node only |
+| `s3` | Production, and any cluster | Any S3-compatible bucket with conditional writes: AWS S3, MinIO, ... |
+| `memory` | Tests and demos | Lost when the process exits |
+
+The default is `local`. A cluster of several nodes needs the `s3` backend; see
+[Clustering](/docs/clustering).
 
 ## Docker Compose (Recommended)
 
-Create a `docker-compose.yml` file and start the services:
-
-```yaml title="docker-compose.yml"
-services:
-  postgres:
-    image: postgres:17
-    environment:
-      POSTGRES_USER: valka
-      POSTGRES_PASSWORD: valka
-      POSTGRES_DB: valka
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U valka"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-    shm_size: 128mb
-
-  valka:
-    image: ghcr.io/iwhitebird/valka:latest
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      VALKA_DATABASE_URL: postgresql://valka:valka@postgres:5432/valka
-      VALKA_GRPC_ADDR: "0.0.0.0:50051"
-      VALKA_HTTP_ADDR: "0.0.0.0:8989"
-      RUST_LOG: valka=info,tower_http=info
-    ports:
-      - "50051:50051"
-      - "8989:8989"
-    restart: unless-stopped
-
-volumes:
-  pgdata:
-```
+The repository's `docker-compose.yml` starts an S3-compatible store and one Valka node:
 
 ```bash
+git clone https://github.com/IWhitebird/Valka.git && cd Valka
 docker compose up -d
 ```
-
-This starts PostgreSQL 17 and the Valka server. The REST API, web dashboard, and gRPC endpoint are ready immediately.
 
 | Service | Default Port | Description |
 |---------|-------------|-------------|
 | HTTP (REST + Dashboard) | `8989` | REST API, SSE events, Prometheus metrics, web dashboard |
-| gRPC | `50051` | Worker connections, client SDKs, event/log streams |
+| gRPC | `50051` | Worker connections, client SDKs, event and log streams |
+| Object store | `9000`, `9001` | S3 API and web console (`minioadmin` / `minioadmin`) |
+
+The store is `pgsty/silo`, an S3-compatible MinIO fork. A one-shot `minio-init` service creates
+the `valka` bucket. For production, point Valka at a real bucket and drop the store services.
 
 ## Docker Image
 
-You can also run the Valka server image directly with an external PostgreSQL instance:
+You can also run the server image directly. With no settings it uses the `local` backend under
+`/var/lib/valka/data`, so mount a volume there:
 
 ```bash
 docker run -d \
-  -e VALKA_DATABASE_URL=postgresql://user:pass@host:5432/valka \
+  -p 8989:8989 \
+  -p 50051:50051 \
+  -v valka-data:/var/lib/valka \
+  ghcr.io/iwhitebird/valka:latest
+```
+
+Or point it at a bucket:
+
+```bash
+docker run -d \
+  -e VALKA_NODE_ID=valka-1 \
+  -e VALKA_STORAGE__BACKEND=s3 \
+  -e VALKA_STORAGE__BUCKET=my-valka-bucket \
+  -e VALKA_STORAGE__REGION=us-east-1 \
   -p 8989:8989 \
   -p 50051:50051 \
   ghcr.io/iwhitebird/valka:latest
 ```
 
-The image includes the Valka server, CLI tool, and the web dashboard. It runs as a non-root user (UID 1001) and includes `curl` for health checks.
+The image includes the Valka server, the `valka` CLI and the web dashboard. It runs as a non-root
+user (UID 1001), includes `curl` for health checks and has a built-in `HEALTHCHECK` on
+`/healthz`. It exposes `50051` (gRPC), `8989` (REST and dashboard) and `50052` (node-to-node,
+used only by clusters; never expose it publicly).
+
+## From Source
+
+```bash
+cargo build --release -p valka-server -p valka-cli
+./target/release/valka-server            # optionally: a path to valka.toml
+```
+
+Building needs Rust 1.89+ and the protobuf compiler (`protoc`). The server serves the dashboard
+from `web/dist` by default; build it with `cd web && npm install && npm run build`.
 
 ## Configuration
 
@@ -81,17 +88,24 @@ Valka uses layered configuration via [Figment](https://github.com/SergioBenitez/
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VALKA_DATABASE_URL` | - | PostgreSQL connection string (required) |
-| `VALKA_DATABASE__MAX_CONNECTIONS` | `20` | Connection pool size |
+| `VALKA_STORAGE__BACKEND` | `local` | `s3`, `local` (a directory) or `memory` |
+| `VALKA_STORAGE__PATH` | `./data` | Directory for the `local` backend |
+| `VALKA_STORAGE__BUCKET` | `valka` | Bucket for the `s3` backend |
+| `VALKA_STORAGE__ENDPOINT` | - | Custom S3 endpoint (MinIO and others). Omit for AWS |
+| `VALKA_STORAGE__ACCESS_KEY_ID`, `VALKA_STORAGE__SECRET_ACCESS_KEY` | - | Credentials. Unset: the AWS default chain (environment, profile, instance metadata) |
+| `VALKA_NODE_ID` | host name | Stable node id. A restart with the same id splits what the previous run left, so its shards are served again at once |
+| `VALKA_WAL__FLUSH_INTERVAL_MS` | `50` | Group-commit window: how long a write may wait before its batch is written |
 | `VALKA_GRPC_ADDR` | `0.0.0.0:50051` | gRPC listen address |
 | `VALKA_HTTP_ADDR` | `0.0.0.0:8989` | REST/HTTP listen address |
 | `RUST_LOG` | `valka=info,tower_http=info` | Log level filter |
 
-All configuration values can be set via environment variables with the `VALKA_` prefix and `__` for nested keys. See the [full configuration reference](/docs/deployment#configuration-reference) for all options.
+All configuration values can be set via environment variables with the `VALKA_` prefix and `__`
+for nested keys. See the [full configuration reference](/docs/deployment#configuration-reference)
+for every option, and [Clustering](/docs/clustering#configuration) for the cluster settings.
 
 ### Configuration File
 
-Mount a `valka.toml` into the container at `/etc/valka/` and pass its path as the first argument:
+Pass the path of a `valka.toml` as the first argument. With Docker, mount it into the container:
 
 ```bash
 docker run -d \
@@ -103,34 +117,44 @@ docker run -d \
 ```
 
 ```toml title="valka.toml"
-[database]
-url = "postgresql://valka:valka@postgres:5432/valka"
-max_connections = 20
-
-[server]
+node_id = "valka-1"
 grpc_addr = "0.0.0.0:50051"
 http_addr = "0.0.0.0:8989"
 
+[storage]
+backend = "s3"
+bucket = "valka"
+# endpoint = "http://minio:9000"   # S3-compatible stores; omit for AWS
+# region = "us-east-1"
+# allow_http = true                # plain-HTTP endpoints, development only
+
+[wal]
+flush_interval_ms = 50
+
 [scheduler]
-lease_duration_secs = 300
-reaper_interval_secs = 30
-retry_interval_secs = 10
+retry_base_delay_secs = 1
+retry_max_delay_secs = 3600
 ```
 
-## Database
+`deploy/valka.example.toml` in the repository lists every setting with its default.
 
-Valka requires **PostgreSQL 14+** (17 recommended). Migrations run automatically on server startup, no manual setup required.
+## What Valka Writes
 
-### Tables
+The first node to start on an empty bucket writes `cluster.json`, which fixes the shard count
+(default 4096) and the storage format. After that the bucket holds:
 
-| Table | Purpose |
-|-------|---------|
-| `tasks` | Task metadata, state, and input/output |
-| `task_runs` | Individual execution attempts |
-| `task_logs` | Structured log entries per run |
-| `dead_letter_queue` | Tasks that exhausted retries |
-| `workers` | Registered worker connections |
-| `task_signals` | Signals sent to running tasks |
+| Key | Holds |
+|-----|-------|
+| `nodes/{node}/lease` | Each node's lease: who is alive |
+| `owners/{hh}/{shard}` | Which node owns each shard |
+| `queues/{hh}/{queue}` | Each queue's partition count |
+| `wal/{node}/...` | Each node's write-ahead log segments |
+| `snapshots/{hh}/{shard}/...` | Per-shard state checkpoints |
+| `splits/...`, `placement.json`, `admin/...` | Takeover markers, operator pins, admin audit records |
+| `logs/{hh}/{run}/...` | Task log lines |
+
+Use one bucket, or one `prefix` inside a bucket (`VALKA_STORAGE__PREFIX`), per Valka cluster.
+See [Architecture](/docs/architecture) for what each object does.
 
 ## Health Check
 
@@ -138,5 +162,5 @@ The server exposes a health endpoint for container orchestrators:
 
 ```bash
 curl http://localhost:8989/healthz
-# Returns: "ok" (200)
+# Returns: "ok" (200), or "wal writer poisoned" (503) just before the node exits
 ```

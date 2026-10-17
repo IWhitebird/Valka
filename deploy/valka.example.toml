@@ -4,11 +4,16 @@
 # Nested env vars use double underscore: VALKA_STORAGE__BUCKET=valka
 # Pass config path as first CLI argument: valka-server /etc/valka/valka.toml
 
-# Unique node identifier. Auto-generated UUIDv7 if empty.
-# Set a STABLE value in production: a node replays its own WAL (wal/<node_id>/) on start.
+# Unique, stable node identifier. Defaults to the host name if empty.
+# A restarted node with the same id fences its previous run, splits what that run left in
+# wal/<node_id>/ and reclaims its shards. Every node of a cluster needs a distinct id.
 node_id = ""
 
-# gRPC listen address (workers + internal cluster forwarding)
+# Bearer token for the admin API (drain a node, move a shard, set queue partitions,
+# audit log). Unset = admin API disabled. Env: VALKA_ADMIN_TOKEN.
+# admin_token = ""
+
+# gRPC listen address (workers and API clients)
 grpc_addr = "0.0.0.0:50051"
 
 # HTTP/REST + WebUI listen address
@@ -66,26 +71,66 @@ snapshots_to_keep = 2
 # Their history stays in the bucket.
 completed_retention_secs = 86400
 
-# --- Gossip / Cluster -----------------------------------------------------
+# --- Cluster ---------------------------------------------------------------
+# One node is a cluster of one: the same lease / ownership protocol always runs.
+# See docs/ARCHITECTURE.md §8 and docs/wal/PHASE2.md.
 
-[gossip]
-# UDP listen address for chitchat gossip protocol
-listen_addr = "0.0.0.0:7280"
+[cluster]
+# Allow other nodes on this bucket. Needs the s3 backend (local/memory CAS only works
+# inside one process) and a token.
+enabled = false
 
-# Address advertised to peers. Defaults to listen_addr if empty.
-# advertise_addr = ""
+# Shared secret every node-to-node call carries. Required when enabled.
+# token = ""
 
-# Cluster name (must match across all nodes)
-cluster_id = "valka"
+# Shard count of a NEW bucket (written to cluster.json on first start; fixed afterwards).
+# Power of two, 16..=65536. 0 = whatever the bucket says, or 4096 for a new bucket.
+num_shards = 0
 
-# Seed nodes for gossip bootstrap. Empty = single-node mode.
-# NOTE: multi-node shard ownership lands in phase 2 (see docs/wal/PLAN.md); run one node.
-seed_nodes = []
+# Node-to-node listener. Never expose it publicly.
+internal_addr = "0.0.0.0:50052"
+# Addresses other nodes / clients use to reach this node (default: the listen addresses).
+# advertise_internal_addr = "10.0.0.1:50052"
+# advertise_grpc_addr = "10.0.0.1:50051"
+# advertise_http_addr = "10.0.0.1:8989"
+
+# Optional mTLS for internal traffic (PEM files). The token is still required.
+# tls_cert = "/etc/valka/tls/node.crt"
+# tls_key = "/etc/valka/tls/node.key"
+# tls_ca = "/etc/valka/tls/ca.crt"
+
+# Lease renewal period, and how long an unchanged lease takes to be declared dead
+# (by the observer's own clock). A node that has not renewed for
+# lease_timeout - lease_safety_margin stops serving on its own.
+lease_interval_ms = 2000
+lease_timeout_ms = 10000
+lease_safety_margin_ms = 3000
+
+# How often nodes/ is listed (membership).
+membership_interval_ms = 3000
+# A new node takes shards after this (all nodes at once on a cold start).
+join_delay_ms = 15000
+# Placement round period, claims in flight, shards handed over per round.
+placement_interval_ms = 3000
+claim_concurrency = 64
+handover_per_tick = 64
+# A shard stays where it is for at least this long after a move.
+min_residency_secs = 300
+# Another node may redo a dead node's log split after this.
+split_timeout_ms = 30000
+# After claiming shards, recovered PENDING tasks wait this long so reconnecting workers
+# can reattach their runs first.
+reconcile_grace_ms = 5000
+# Garbage collector cadence (dead logs, old snapshots, split markers).
+gc_interval_secs = 300
+# Refuse to start while another live process holds this node id.
+startup_lease_check = true
 
 # --- Matching / Task Routing -----------------------------------------------
 
 [matching]
-# In-RAM worker-routing partitions per queue (unrelated to the 4096 storage shards).
+# In-RAM worker-routing partitions per queue on one node (unrelated to storage shards
+# and to queue partitions, which live in the bucket: queues/{hh}/{queue}).
 num_partitions = 4
 
 # Internal tree branching factor (rarely needs tuning)

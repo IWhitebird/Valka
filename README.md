@@ -42,7 +42,9 @@ Most task queues bolt together a message broker, a database, and a cache. Every 
 - Write-ahead log on object storage: group commit, per-shard snapshots, exact replay
 - In-memory task matching fed from a RAM pending index (no polling, no DB on the hot path)
 - gRPC bidirectional streaming (single connection per worker, no polling)
-- 4096 fixed storage shards with single-writer ownership (multi-node takeover: phase 2, see `docs/wal/PLAN.md`)
+- Run one node or many on the same bucket: any node takes any request, workers on any node run any task, a dead node's work moves to the others in ~15 s with nothing acknowledged lost
+- Single-writer shards (default 4096) fenced by leases and CAS'd owner records; queue partitions spread a queue over nodes
+- Workers ride through node failures: they reconnect anywhere and reattach their running tasks
 - Task signals — send real-time signals to running workers
 - Step checkpoints — a failed task retries from the last completed step, not from scratch
 - Results acknowledged end to end — workers keep a result until it is recorded, and ride through server restarts
@@ -145,46 +147,44 @@ visible at `GET /api/v1/tasks/{id}/checkpoints` and on the task page. Runnable e
 ## Architecture
 
 ```
-                    ┌─────────────────────────────────────────────────┐
-                    │                  VALKA NODE                     │
-  REST clients ───► │  REST API ──┐                                   │
-  gRPC clients ───► │  gRPC API ──┴──► Engine (4096 shard state       │
-                    │                  machines in RAM)               │
-                    │                    │  validate → apply → append  │
-                    │                    ▼                            │
-                    │            WAL buffer (RAM, unacked only)       │
-                    │                    │ group commit 50 ms / 4 MB   │
-                    │                    ▼                            │
-                    │      ┌─────────────────────────────────┐        │
-                    │      │  BUCKET — the only truth        │        │
-                    │      │  wal/{node}/{epoch}-{seq}.seg   │        │
-                    │      │  snapshots/{shard}/{lsn}.snap   │        │
-                    │      │  logs/{run}/…   assignment      │        │
-                    │      └─────────────────────────────────┘        │
-                    │                    │ ack ← durable                │
-                    │   pending index ──► MatchingService ──► Dispatcher│
-                    │   timer wheel       (partition tree)   (gRPC bidi)│
-                    │   (leases, retries, delayed)                │    │
-                    └─────────────────────────────────────────────┼────┘
-                                                                  │
-                                              ┌───────────────────┼─────────────┐
-                                              ▼                   ▼             ▼
-                                          Worker A            Worker B      Worker C
-                                         (Rust SDK)          (Go SDK)    (Python SDK)
+  producers (REST / gRPC / CLI)                      workers (Rust, Go, Python, TS)
+          │                                                │ one gRPC stream each, any node
+          ▼                                                ▼
+ ┌──────── node A ─────────┐  internal gRPC   ┌──────── node B ─────────┐
+ │ API: run here / forward │◄────────────────►│ API: run here / forward │
+ │ shards A owns, in RAM   │  (token, mTLS)   │ shards B owns, in RAM   │
+ │ timers, pending index   │                  │ timers, pending index   │
+ │ WAL writer (group commit│                  │ WAL writer              │
+ └───────────┬─────────────┘                  └───────────┬─────────────┘
+             │ segments, snapshots, CAS on leases / owner records
+             ▼                                            ▼
+ ┌──────────────────────────── bucket: the only truth ───────────────────────────┐
+ │ nodes/{node}/lease   owners/{hh}/{shard}   wal/{node}/{inc}-{seq}.seg          │
+ │ snapshots/{hh}/{shard}/…   splits/…   queues/…   logs/…   cluster.json         │
+ └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Crash recovery: a new node loads the newest snapshot per shard, replays the WAL tail
-(exact, via per-shard sequence numbers), re-arms leases and timers, and serves. Workers
-keep executing throughout and reconnect. Full design: [`docs/wal/DESIGN.md`](docs/wal/DESIGN.md).
+- Every change is a record in a WAL segment; nothing is acknowledged before its segment is
+  in the bucket and the node has re-checked its own lease.
+- Each shard has exactly one owner at a time. Owners renew a lease in the bucket every 2 s;
+  a node whose lease stops changing for 10 s is declared dead by another node, its log is
+  split into per-shard snapshots, and its shards are claimed by the others.
+- One node is a cluster of one: the same protocol, no special case.
+
+**Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** for the full picture: life of a
+task, the ownership protocol, failure walkthroughs, guarantees, and a comparison with
+Cloudflare Durable Objects. Specs: [`DESIGN.md`](docs/wal/DESIGN.md) (one node),
+[`PHASE2.md`](docs/wal/PHASE2.md) (many nodes). Operations:
+[`RUNBOOKS.md`](docs/wal/RUNBOOKS.md).
 
 ### Task Lifecycle
 
 ```
-PENDING ──► DISPATCHING ──► RUNNING ──┬──► COMPLETED
-                                      ├──► FAILED
-                                      └──► RETRY ──┬──► PENDING (rescheduled)
-                                                    └──► DEAD_LETTER (exhausted)
-CANCELLED (via API at any time)
+PENDING ──► RUNNING ──┬──► COMPLETED
+                      ├──► FAILED
+                      └──► RETRY ──┬──► PENDING (after backoff)
+                                   └──► DEAD_LETTER (out of attempts)
+CANCELLED (via API, from any non-terminal state)
 ```
 
 ## Web Dashboard
@@ -205,8 +205,25 @@ Pages: Dashboard, Tasks, Task Detail (runs, logs, signals, steps), Workers, Clus
 docker compose up
 ```
 
-Starts MinIO + Valka server. REST + Dashboard on `:8989`, gRPC on `:50051`, MinIO console on `:9001`.
-For production, point `[storage]` at a real bucket and drop the MinIO services.
+Starts an S3-compatible store + one Valka server. REST + Dashboard on `:8989`, gRPC on `:50051`, store console on `:9001`.
+For production, point `[storage]` at a real bucket and drop the store services.
+
+### A three-node cluster
+
+```bash
+docker compose -f docker-compose.cluster.yml up -d --build
+```
+
+REST and the dashboard on `:8981`, `:8982`, `:8983`; gRPC on `:50061`–`:50063`. Any node
+takes any request. Watch a takeover on the Cluster page while you
+`docker compose -f docker-compose.cluster.yml kill -s SIGKILL valka-2`.
+
+`scripts/chaos.sh` runs a chaos test against it: random `kill -9`, freezes and restarts
+under load, then checks that every acknowledged task exists and finished.
+
+A cluster needs an S3-compatible bucket (the local-directory backend is single-node only),
+`VALKA_CLUSTER__ENABLED=true`, the same `VALKA_CLUSTER__TOKEN` on every node, a distinct
+`VALKA_NODE_ID` per node, and the internal port (`:50052`) reachable between nodes.
 
 ### From Source
 
@@ -225,7 +242,13 @@ Layered via [figment](https://github.com/SergioBenitez/Figment): defaults → `v
 | `VALKA_STORAGE__PATH` | `./data` | Directory for the `local` backend |
 | `VALKA_STORAGE__BUCKET` | `valka` | Bucket for the `s3` backend |
 | `VALKA_STORAGE__ENDPOINT` | — | Custom S3 endpoint (MinIO, R2). Omit for AWS |
-| `VALKA_NODE_ID` | random | Stable node id; a node replays its own WAL on restart |
+| `VALKA_NODE_ID` | host name | Stable node id; a restart splits what the previous run left, so its shards are served again at once |
+| `VALKA_CLUSTER__ENABLED` | `false` | Allow several nodes on one bucket (S3 backends only) |
+| `VALKA_CLUSTER__TOKEN` | — | Shared secret for node-to-node calls (required when clustered) |
+| `VALKA_CLUSTER__INTERNAL_ADDR` | `0.0.0.0:50052` | Node-to-node listener (never expose publicly) |
+| `VALKA_CLUSTER__ADVERTISE_INTERNAL_ADDR` | internal addr | Address peers use to reach this node |
+| `VALKA_CLUSTER__NUM_SHARDS` | `4096` | Shard count of a new bucket (fixed afterwards) |
+| `VALKA_ADMIN_TOKEN` | — | Enables the admin API (drain node, move shard, queue partitions) |
 | `VALKA_WAL__FLUSH_INTERVAL_MS` | `50` | Group-commit window (enqueue ack latency) |
 | `VALKA_GRPC_ADDR` | `0.0.0.0:50051` | gRPC listen address |
 | `VALKA_HTTP_ADDR` | `0.0.0.0:8989` | REST/HTTP listen address |
@@ -243,10 +266,12 @@ Layered via [figment](https://github.com/SergioBenitez/Figment): defaults → `v
 - [x] Step checkpoints (retries resume after the last completed step)
 - [x] Polyglot SDKs — Rust, TypeScript, Go, Python
 - [x] Object-storage WAL: diskless nodes, snapshots, exact replay, fault-injected tests
+- [x] Many nodes on one bucket: leases, owner records, log splitting, placement, routing, cross-node workers, worker reattach, admin API (TLA+-checked protocol, randomized simulation, chaos rig)
 
 ### Up Next
 
-- [ ] Multi-node shard ownership: CAS'd assignment, epochs, takeover, worker re-handshake (phase 2)
+- [ ] Helm chart and systemd units
+- [ ] Network-split chaos and a 24 h soak
 - [ ] Task priorities and weighted fair queuing
 - [ ] Cron / recurring task scheduling
 - [ ] Rate limiting per queue

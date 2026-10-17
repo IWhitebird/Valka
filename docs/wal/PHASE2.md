@@ -1,8 +1,10 @@
 # Phase 2: Valka on many nodes
 
-Status: **M0–M5 implemented**, M1 model checked in CI; M6–M10 pending. Companion to `DESIGN.md` (single-node architecture) and
-`PLAN.md` (checklist). Where this document and `DESIGN.md` disagree, this one is newer;
-`DESIGN.md` is rewritten as each milestone lands.
+Status: **M0–M8 implemented**; M9 done except the 24 h soak; M10 done for docker compose and
+docs (Helm and systemd are out of the current scope). The TLA+ model runs in CI. Companion
+to `DESIGN.md` (single-node architecture), `PLAN.md` (checklist) and the readable overview
+[`../ARCHITECTURE.md`](../ARCHITECTURE.md). Sections that were designed one way and built
+another say so; §19a lists every such change.
 
 Reading guide: §1–§4 are the contract (goals, fault model, guarantees, decisions). §5–§12
 are the architecture, one protocol per section, each with *why it is safe*. §13–§18 are
@@ -57,19 +59,19 @@ model (§15.1) checks G1 and G2 exhaustively for small clusters.
 
 | # | Decision | Chosen | Why | Owner |
 |---|---|---|---|---|
-| D1 | Task routing across nodes | **Node-to-node streams**, with two-phase slot claims (§10) | One ownership domain, no SDK fan-out | You |
+| D1 | Task routing across nodes | **Node-to-node RPCs**: idle workers' nodes long-poll owners (`Fetch`), owners record dispatches (§10; built pull-based instead of offer/claim/grant streams, §19a) | One ownership domain, no SDK fan-out | You |
 | D2 | Cluster size | **Unbounded by design**; the ceiling is `num_shards / 8` useful nodes | No shared hot object; per-node bucket traffic is O(1) | You |
 | D3 | Failover target | **10–15 s** (lease timeout 10 s) | Few false takeovers, cheap | You |
 | D4 | Verification | **TLA+ model + deterministic simulation + chaos** | Protocol bugs found before code | You |
 | D5 | Task placement | **Queue partitions** (§9) | Cross-node traffic bounded at any size; FIFO per partition | You |
-| D6 | Shard count | **Chosen at cluster creation**, 256–65,536, stored in `cluster.json` | Large clusters possible without a migration | You |
+| D6 | Shard count | **Chosen at cluster creation**, a power of two in 16–65,536 (default 4096), stored in `cluster.json` | Large clusters possible without a migration | You |
 | D7 | Deploy targets | **Kubernetes and VMs equally** | | You |
 | D8 | Node security | **Cluster token always, mTLS optional (recommended)** | Safe by default, easy to deploy | Delegated to me |
 | D9 | Shard ownership records | **One object per shard**, CAS'd only when the shard moves | No single hot object | Mine |
 | D10 | Write fencing | **Each flush checks the node's own lease** (1 conditional GET) | O(1) per node at any cluster size; needs no clock | Mine |
 | D11 | Snapshot and record ordering | **Per-shard ownership generation** (`gen`), bumped on every move | Orders snapshots across owners; per-node epochs cannot (see §19) | Mine |
 | D12 | Takeover replay | **Log splitting**: one node splits a dead node's log into per-shard snapshots | Each dead log is read once, not once per claiming node | Mine |
-| D13 | Membership | **Gossip for discovery and suspicion, bucket for authority** | Gossip scales; the bucket decides | Mine |
+| D13 | Membership | **The bucket for both** (revised from "gossip for suspicion": a LIST of `nodes/` is enough, §19a) | No second channel to secure; the bucket decides | Mine |
 | D14 | Placement | **Leaderless rendezvous hashing** plus CAS | No leader to fail over | Mine |
 | D15 | Local-disk backend | **Single node only**; clustered mode refuses it | Its CAS is an in-process lock | Mine |
 
@@ -85,14 +87,14 @@ model (§15.1) checks G1 and G2 exhaustively for small clusters.
                               ▼                                   ▼
           ┌──────────────── any node ────────────────────────────────────────────┐
           │  API layer ──routes by shard──►  local engine  or  forward to owner  │
-          │  Dispatcher: worker streams, capacity offers, result forwarding       │
+          │  Dispatcher: worker streams; remote feeder; result forwarding         │
           └───────┬──────────────────────────────────────────────┬───────────────┘
                   │ internal gRPC (token/mTLS)                   │
-     ┌────────────┴──────────┐   peer streams (offers, claims,   ┌┴──────────────────────┐
-     │ node A                │◄──assignments, forwarded calls)──►│ node B                │
-     │  shards it owns:      │                                   │  shards it owns:      │
-     │   state in RAM        │   gossip (chitchat): membership,  │   state in RAM        │
-     │   WAL writer (own log)│◄──suspicion, addresses, version──►│   WAL writer (own log)│
+     ┌────────────┴──────────┐   Execute (commands, fetch,       ┌┴──────────────────────┐
+     │ node A                │◄──dispatch, results), Scatter,───►│ node B                │
+     │  shards it owns:      │   Events                          │  shards it owns:      │
+     │   state in RAM        │                                   │   state in RAM        │
+     │   WAL writer (own log)│   membership: LIST nodes/ (bucket)│   WAL writer (own log)│
      └───────────┬───────────┘                                   └───────────┬───────────┘
                  │                                                           │
                  ▼                                                           ▼
@@ -127,7 +129,7 @@ are wiped.
 | Item | Phase 1 | Phase 2 |
 |---|---|---|
 | Shard id in task/run ids | low 12 bits of UUIDv7 `rand_b` | low **16** bits; `shard = bits & (num_shards − 1)` |
-| Shard count | const 4096 | `cluster.json.num_shards`, power of two, 256–65,536, default 4096 |
+| Shard count | const 4096 | `cluster.json.num_shards`, power of two, 16–65,536, default 4096 |
 | Log position | `(epoch, seq)` | `(inc, seq)` (renamed: it was always the incarnation) |
 | Record envelope | shard, shard_seq, record_id, ts | + **`gen`**: the owning generation that wrote it |
 | Segment header | epoch, seq, node hash | inc, seq, node id, **flags (SEALED)**, **sorted shard list** |
@@ -167,8 +169,9 @@ checks again. A lease is a few hundred bytes per node id ever used.
 3. read nodes/{me}/lease; CAS it to {inc: old.inc + 1, state: alive}        ← fences my previous run
    carrying every not-yet-split incarnation's watermark forward
 4. if my previous incarnations owned shards: split their logs (§8.3)    ← as any dead node's
-5. join gossip (seeds from config, else from the addresses in nodes/*/lease)
-6. wait join_delay, then take part in placement (§8.1)
+5. read the other leases (LIST nodes/): membership and peer addresses
+6. wait join_delay, then take part in placement (§8.1); on a cold start (no node past its
+   join delay) everyone takes part at once
 ```
 Step 3 is a CAS, so two processes started with the same node id cannot both succeed.
 The loser exits.
@@ -186,8 +189,10 @@ The loser exits.
 
 ### 7.4 Death detection and tombstone
 
-1. **Suspicion.** Gossip's failure detector flags a peer. A backstop LIST of `nodes/`
-   (every 30 s) catches anything gossip misses.
+1. **Suspicion.** Every `membership_interval` (3 s) each node LISTs `nodes/`, which returns
+   every lease's ETag; a lease whose ETag has not changed for `lease_timeout` by this
+   node's own monotonic clock is suspect. (Designed as gossip plus a backstop LIST; the
+   LIST alone meets the failover target, §19a.)
 2. **Confirmation.** The suspect's *guardian* polls its lease every `lease_interval`. The
    guardian is the first live node in rendezvous order for the suspect's id; any live node
    takes over this job after `2 × lease_timeout` if the guardian itself fails. The suspect is
@@ -382,32 +387,32 @@ every 5 minutes and applies the same rules. It is the backstop for crashed delet
 
 ## 10. Cross-node matching (D1)
 
+Built pull-based (the offer/claim/grant streams of the first draft were not needed, §19a):
+
 ```
-worker w7 ─ Session ─ node W                         node O (owns partition shard of task T)
-                      │ w7 idle, serves queue Q
-                      │── Offer{Q, idle: 3} ───────► O remembers: W can take Q work
-                                                     T becomes runnable, no local worker free
-                      ◄── Claim{Q, T} ────────────── (in memory, no WAL write)
-                      │ reserve w7 atomically
-                      │── Granted{w7} ─────────────►
-                                                     O records TaskDispatched{w7, node W}
-                      ◄── Assignment{T, run, checkpoints}
+worker w7 ─ Session ─ node W                          node O (owns a partition shard of Q)
+                      │ w7 idle on queue Q; O owns some of Q's partitions
+                      │── Fetch{Q, wait 2 s} ───────► O: a runnable task T in Q's partitions?
+                      │                                  reserve T for W (RAM only, lapses
+                      │                                  after REMOTE_OFFER_TTL = 30 s)
+                      ◄── T (spec, checkpoints) ─────
+                      │ offer T to a waiting local worker; w7 takes it, run id minted by W
+                      │── Dispatch{T, run, w7, node W} ► O records TaskDispatched{w7, node W}
+                      ◄── assignment ────────────────
                       │ push to w7
 ```
 
-- **Streams.** A node W opens one internal stream per peer that owns partitions of the
-  queues W's workers serve. That's at most `Σ P` over those queues, independent of cluster
-  size.
-- **Offers** are counts, non-exclusive, and refreshed as slots free up. **Claims** are
-  exclusive: W, which owns the workers, arbitrates in memory. A WAL write happens only after
-  `Granted`, so contention between owners costs RPCs, never records.
-- **Local first.** If O has an idle local worker, the existing sync-match hot path runs
-  unchanged.
-- **Races.** `Granted` but no `Assignment` within `claim_timeout` (O died): W frees the
-  slot. An `Assignment` arriving for a slot W already freed, or for a worker that vanished:
-  W answers `Returned`, and O writes a new `RunReturned` record, putting the task back to
-  PENDING **without spending an attempt**. Today that case waits for lease expiry.
-- **Fairness.** O rotates between the Ws that offered; W grants in arrival order.
+- **Who fetches.** W runs one fetch loop per (queue, owner node) while some local worker
+  waits for that queue, for the owners of that queue's partitions: at most `Σ P` loops over
+  the queues W's workers serve, independent of cluster size.
+- **Local first.** On O, a task that becomes runnable is offered to O's own waiting workers
+  first (the sync-match hot path). Matching takes a task only when a worker is waiting, so a
+  task nobody takes stays in O's pending index for local and remote takers alike.
+- **No double hand-out.** A reservation is exclusive in O's RAM. A fetched task no local
+  worker takes goes straight back (`Unoffer`); an unused reservation lapses after 30 s.
+- **Dispatch is idempotent** on the run id W minted (a retried `Dispatch` returns the same
+  run). A dispatch whose worker vanished before the assignment reached it is returned with
+  a `RunReturned` record: back to PENDING **without spending an attempt**.
 
 ### 10.1 Everything that crosses nodes after dispatch
 
@@ -435,18 +440,21 @@ worker w7 ─ Session ─ node W                         node O (owns partition 
 | Cluster stats and shard map | every node, merged |
 
 Owner lookup uses `desired_owner` plus a small cache of actual owners learned from
-`NotOwner{owner}` redirects and from gossip. A forwarded call that lands on a non-owner is
-redirected at most twice, then fails with `Unavailable` and the caller retries.
+`NotOwner{owner}` redirects; after two redirects the owner record in the bucket decides. A
+call that still finds no serving owner fails with `Unavailable` and the caller retries.
 
 ### 11.2 Internal RPCs
 
-These replace the PG-era `ForwardTask`, `ForwardEvent`, hash ring and partitions:
-- `Execute(command)`: id-routed commands (get, cancel, delete, signal, checkpoint, result,
-  heartbeat batch, reattach)
-- `CreateTask(id, request)`: the id is pre-generated for the chosen shard
-- `Scatter(query)`: list, count, stats
-- `Peer` bidi stream: offers, claims, grants, assignments, returns, cancel and signal
-  delivery, split-done notifications
+`proto/valka/v1/internal.proto`, served on `cluster.internal_addr`. These replaced the
+PG-era `ForwardTask`, `ForwardEvent`, hash ring and partitions:
+- `Execute(command)`: one JSON-encoded `valka_cluster::Command` addressed to a shard or to a
+  node. Shard commands: create, get, cancel, delete, signal, runs, checkpoints, idempotency
+  lookup, fetch, dispatch, return, unoffer, result, checkpoint, signal delivered/acked/reset,
+  reattach, heartbeat batch. Node commands: cancel or deliver a signal to a local worker,
+  drain, invalidate a queue's cached config.
+- `Scatter(query)`: list, count, stats, workers, shard map, merged by the caller.
+- `Events`: a server stream of this node's task events (the event relay).
+- `Ping`: a reachability probe (`PeerClients::ping`, used by tests and tooling).
 
 ### 11.3 Result delivery (end to end)
 
@@ -461,7 +469,8 @@ These replace the PG-era `ForwardTask`, `ForwardEvent`, hash ring and partitions
 
 ### 11.4 Worker reattach
 
-- `WorkerHello` gains `running: [{task_id, run_id, attempt}]` and re-sends unacked results.
+- `WorkerHello` gains `running: [{task_id, run_id, attempt}]` (all four SDKs); unacked
+  results are re-sent on the new stream.
 - W forwards each entry to the owner:
   - run known and RUNNING → record the worker's new node (`RunReattached`, asynchronous)
   - run unknown, task PENDING, `attempt = attempts + 1` → its dispatch record was lost in
@@ -472,9 +481,11 @@ These replace the PG-era `ForwardTask`, `ForwardEvent`, hash ring and partitions
 
 ### 11.5 Events
 
-- Per-task and per-queue subscriptions are routed to the owners involved, so they scale.
-- The cluster-wide firehose (`/api/v1/events` with no filter) fans in from every node. It is
-  supported up to about 50 nodes; beyond that, tail the WAL from the bucket (CDC).
+- Every node relays every other live node's task events (`InternalService.Events`) into its
+  own broadcast channel, so a subscriber on any node sees the whole cluster's events; filters
+  apply on the subscriber's node.
+- This fan-in is fine up to a few dozen nodes; beyond that, route per-task and per-queue
+  subscriptions to the owners involved, or tail the WAL from the bucket (CDC).
 
 ### 11.6 Internal security (D8)
 
@@ -482,9 +493,9 @@ These replace the PG-era `ForwardTask`, `ForwardEvent`, hash ring and partitions
   publicly.
 - Every internal call carries `cluster.token` (compared in constant time). Clustered mode
   refuses to start without a token.
-- Optional mTLS (`cluster.tls.{cert,key,ca}`, rustls). With mTLS the token is still
-  required, as defence in depth. Recommended for production; the Helm chart supports
-  cert-manager.
+- Optional mTLS (`cluster.tls_cert`, `cluster.tls_key`, `cluster.tls_ca`: PEM files,
+  rustls). With mTLS the token is still required, as defence in depth. Recommended for
+  production.
 
 ## 12. Correctness mechanisms in detail
 
@@ -603,20 +614,25 @@ G1 or G2.
 2–5 engines on one shared in-memory store behind `FaultyStore`, with paused tokio time.
 Most of M2–M7 is tested here: fast, reproducible, no network.
 
-### 15.3 Simulation (turmoil)
+### 15.3 Simulation
 
-Simulated hosts and links for gossip and internal gRPC. A store shim adds latency, errors,
-lost PUT responses and reordered completions. There are scripted scenarios (every row of
-§13) plus randomized fault schedules. Every run records the history of acked operations and
-checks it against G1, G2 and a per-task linearizable state machine. Seeds are
-reproducible. CI runs hundreds per commit and thousands nightly.
+`valka-engine/src/sim_tests.rs`, in-process instead of turmoil (gossip is gone, and node-to-
+node RPCs do not affect ownership): 3–4 engines on one in-memory bucket, each behind its own
+`FaultyStore`, with paused time. Randomized schedules of creates, results, kills, freezes and
+thaws, drains, restarts, lost PUT responses and bucket errors; every acknowledged operation
+goes into a history that is checked against G1 (every acked task is present with its acked
+state), G2 (one owner per shard) and liveness (every shard served again). Seeds are
+reproducible (`VALKA_SIM_SEED`, `VALKA_SIM_SEEDS`; 8 per test run, 400 checked before release). It found the
+three claim bugs in §19a.
 
 ### 15.4 Chaos on real processes
 
-docker-compose with 5 nodes, MinIO and toxiproxy. Faults: random `kill -9`, SIGSTOP pauses,
-iptables network splits, and bucket slowdowns and errors. The load generator records a
-history, and the same checker runs over it. A 24 h soak runs nightly. This rig is also the
-blog's `kill -9` demo.
+`docker-compose.cluster.yml` (3 nodes and an S3-compatible store) driven by
+`scripts/chaos.sh`: random `kill -9`, SIGSTOP freezes and SIGTERM restarts while
+`examples/rs/chaos.rs` creates tasks through every node and runs workers on every node. It
+checks that every acknowledged create exists and reaches a terminal state, and that no
+idempotency key produced two tasks. Network splits and bucket slowdowns (toxiproxy) and the
+24 h soak are not part of it yet.
 
 ### 15.5 Release gates for phase 2
 
@@ -631,14 +647,15 @@ blog's `kill -9` demo.
 
 Coordination overhead per node, steady state (defaults): 0.5 lease PUT/s, one own-lease
 GET per flush (mostly 304s; phase 1 already does one assignment GET per flush), one
-`nodes/` LIST per 30 s. Nothing grows with cluster size. WAL segment PUTs come on top and
+`nodes/` LIST per `membership_interval` (3 s) plus a GET per changed lease. Apart from that
+LIST's size, nothing grows with cluster size. WAL segment PUTs come on top and
 are unchanged from phase 1.
 
 | Nodes | Coordination requests / s | ≈ S3 Standard cost / day | Notes |
 |---|---|---|---|
 | 10 | ~210 | ~$10 | dominated by per-flush checks at 20 flushes/s |
 | 100 | ~2,100 | ~$100 | |
-| 1,000 | ~21,000 | ~$1,000 | needs `num_shards ≥ 8,192`; gossip state is O(N) |
+| 1,000 | ~21,000 | ~$1,000 | needs `num_shards ≥ 8,192`; the `nodes/` LIST is O(N) per node |
 
 A takeover costs one CAS, a LIST and a range read of at most `log_budget` for the dead log,
 plus per shard one GET and one or two snapshot PUTs.
@@ -646,7 +663,8 @@ plus per shard one GET and one or two snapshot PUTs.
 Scale ceilings, stated honestly:
 - Useful nodes ≈ `num_shards / 8`.
 - A queue partition's throughput is bounded by one shard (one owner, one lock).
-- The unfiltered event firehose tops out around 50 nodes.
+- The event relay (every node streams every other node's events) tops out around a few
+  dozen nodes.
 
 ## 17. Build plan
 
@@ -681,7 +699,7 @@ Dependencies: M0 → M1 → M2 → M3 → M4 → {M5 → M6 → M7} → M8 → M
 | Split takes too long under heavy write load | Log budget bounds it; split duration metric and alert; parallel range GETs |
 | Hot partition limited by one shard | Documented P sizing; per-partition throughput metric; automatic P scaling in phase 3 |
 | Protocol bug that the tests miss | TLA+ first; simulation with history checking; chaos; release gates |
-| Gossip scaling past ~1,000 nodes | Gossip only drives suspicion; the bucket is authoritative; guardian polling is O(1) per suspect |
+| Membership LIST cost at very large N | One LIST per node per interval; lengthen the interval, or add gossip as a suspicion accelerator |
 | Request cost at very large N | Mostly per-flush checks; can be relaxed to one check per group of flushes, still in order |
 | Operational complexity | One code path for N = 1 and N = many; runbooks; UI shows every takeover |
 
@@ -761,6 +779,39 @@ The model's findings (§19) are all implemented, each with a regression test
   for the guardian's split rather than splitting inline: after the claim's own CAS the
   owner record names the claimer, so an inline split would skip the very shard.
 
+## 19b. Changes made while implementing M6–M9
+
+- **Cross-node matching is pull-based (§10).** Idle workers' nodes long-poll the owners of
+  their queues' partitions; owners reserve in RAM and record the dispatch. No peer streams,
+  no grants: the owner's pending index is the single place a runnable task waits, and a
+  reservation that is never used simply lapses.
+- **Matching accepts a task only for a waiting worker.** Buffering tasks in a node's matching
+  layer would hide them from remote fetchers and strand them on a node that has no worker.
+- **Heartbeats are batched per owner** each tick; cancels and signal deliveries go to the
+  node recorded on the run (`TaskDispatched.node_id`, updated by `RunReattached`).
+- **Reattach outcomes** are `Reattached` (record the new node), `Adopted` (the dispatch
+  record was lost: record it now under the worker's run id) and `Stale` (send the worker a
+  `TaskCancellation`). The SDKs' hello carries every running run.
+- **Operations.** The admin API (drain, move/pin, unpin, partitions, audit) needs
+  `VALKA_ADMIN_TOKEN` and writes an audit object per action; pins live in `placement.json`.
+  The version gate refuses to start a node whose protocol is older than the effective
+  protocol of the live cluster.
+- **Verification.** The randomized simulation (§15.3) replaced the planned turmoil harness;
+  the chaos rig (§15.4) runs three real processes in docker compose.
+- **Found by the chaos rig: a drain must keep renewing its lease.** SIGTERM stopped every
+  background loop, the lease keeper included, before handing shards over. Releasing ~1,400
+  shards one at a time outlasted the lease timeout, a guardian tombstoned the draining node,
+  and the rest of its shards went through a split instead of a handover (safe, but not the
+  near-zero unavailability a drain promises). Lease renewal now stops only once the lease is
+  marked dead, and releases run in parallel (`claim_concurrency`). Regression test:
+  `cluster_tests::a_drain_slower_than_the_lease_timeout_keeps_its_lease`.
+- **Also seen in the chaos logs: a reattach that hits a moving shard is retried.** A worker
+  that reconnects while its task's shard is changing owner got `Unavailable` for its
+  reattach, and the dispatcher gave up: the owner kept the run's old node (cancels and
+  signals went there), and a lost dispatch was not adopted, so the task would run twice
+  once the claim's grace ended. The dispatcher now retries in the background (backoff up to
+  5 s, for 60 s) while the worker still runs the task.
+
 ## 20. Open questions
 
 - Automatic partition scaling and load-aware placement: phase 3.
@@ -770,3 +821,5 @@ The model's findings (§19) are all implemented, each with a regression test
 - Cloudflare R2's conditional-write and LIST semantics: confirm with the self-test before
   listing it as supported.
 - `ack=fast` and payload blobs: independent of this plan; they fit after M5.
+- Helm chart and systemd units (M10), network-split and bucket-slowdown chaos, the 24 h soak
+  (M9): next.

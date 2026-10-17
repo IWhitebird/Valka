@@ -1,68 +1,54 @@
 ---
 title: Quick Start
-description: Get Valka running in minutes with Docker Compose.
+description: Get Valka running in minutes, with nothing but Docker.
 ---
 
 ## Prerequisites
 
-- [Docker](https://docs.docker.com/get-docker/) and Docker Compose
+- [Docker](https://docs.docker.com/get-docker/) and Docker Compose, or a Rust toolchain (1.89+)
+
+Valka needs no database and no broker. It stores everything in an S3-compatible bucket, or in a
+local directory when you run a single node.
 
 ## 1. Start Valka
 
-Create a `docker-compose.yml` file:
+Pick one of these.
 
-```yaml title="docker-compose.yml"
-services:
-  postgres:
-    image: postgres:17
-    environment:
-      POSTGRES_USER: valka
-      POSTGRES_PASSWORD: valka
-      POSTGRES_DB: valka
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U valka"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  valka:
-    image: ghcr.io/iwhitebird/valka:latest
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      VALKA_DATABASE_URL: postgresql://valka:valka@postgres:5432/valka
-      VALKA_GRPC_ADDR: "0.0.0.0:50051"
-      VALKA_HTTP_ADDR: "0.0.0.0:8989"
-      RUST_LOG: valka=info,tower_http=info
-    ports:
-      - "50051:50051"
-      - "8989:8989"
-
-volumes:
-  pgdata:
-```
-
-Start the services:
+**Docker Compose (recommended).** Starts an S3-compatible store and one Valka node built from
+source:
 
 ```bash
+git clone https://github.com/IWhitebird/Valka.git && cd Valka
 docker compose up -d
 ```
 
-This starts PostgreSQL and the Valka server. Migrations run automatically on first boot.
+**One container, local directory.** No object store at all; the data lives in a Docker volume:
+
+```bash
+docker run -d --name valka \
+  -p 8989:8989 -p 50051:50051 \
+  -v valka-data:/var/lib/valka \
+  ghcr.io/iwhitebird/valka:latest
+```
+
+**From source.** Stores its data in `./data`:
+
+```bash
+cargo run -p valka-server
+```
 
 | Service | Port | Description |
 |---------|------|-------------|
-| REST API + Dashboard | `8989` | HTTP API and web UI |
-| gRPC API | `50051` | Worker connections and client SDK |
+| REST API + Dashboard | `8989` | HTTP API, web UI, health and metrics |
+| gRPC API | `50051` | Worker connections and client SDKs |
+
+With Docker Compose you also get the store's S3 API on `9000` and its web console on `9001`
+(`minioadmin` / `minioadmin`).
 
 ## 2. Open the Dashboard
 
-Visit [http://localhost:8989](http://localhost:8989) to access the web dashboard. You'll see real-time monitoring of tasks, workers, and events.
+Visit [http://localhost:8989](http://localhost:8989) to open the web dashboard. It shows tasks,
+workers, events and the cluster in real time.
 
 ## 3. Create a Task
 
@@ -78,7 +64,8 @@ curl -X POST http://localhost:8989/api/v1/tasks \
   }'
 ```
 
-The task will appear in the dashboard with status `PENDING`.
+The answer comes back once the task is durable. It shows up in the dashboard with status
+`PENDING`.
 
 ## 4. Write a Worker
 
@@ -103,14 +90,24 @@ const worker = ValkaWorker.builder()
 await worker.run();
 ```
 
-See the [SDK documentation](/docs/sdks/rust) for Rust, Python, and Go examples.
+See the [SDK documentation](/docs/sdks/rust) for Rust, Python, and Go examples. From a clone of
+the repository you can also run the Rust examples:
+
+```bash
+cargo run -p valka-examples --example worker     # in one terminal
+cargo run -p valka-examples --example producer   # in another
+```
 
 ## 5. Monitor
 
-Head back to the dashboard at [http://localhost:8989](http://localhost:8989) to watch tasks flow through the system in real time, from `PENDING` to `RUNNING` to `COMPLETED`.
+Head back to the dashboard at [http://localhost:8989](http://localhost:8989) to watch tasks flow
+through the system in real time, from `PENDING` to `RUNNING` to `COMPLETED`.
 
 ## Next Steps
 
-- [Installation & Configuration](/docs/installation): configuration options and environment variables
-- [Deployment](/docs/deployment): production deployment with clustering, PgBouncer, and Kubernetes
+- [Installation & Configuration](/docs/installation): storage backends, the Docker image and
+  configuration
+- [Clustering](/docs/clustering): run several nodes on one bucket
+- [Deployment](/docs/deployment): production setups, health checks, alerts and the full
+  configuration reference
 - [SDK Documentation](/docs/sdks/rust): choose your language and start building

@@ -1,581 +1,229 @@
 ---
 title: Deployment
-description: Production deployment with Docker Compose, Kubernetes, and best practices.
+description: Run Valka in production. One node or a cluster on Docker Compose, VMs or Kubernetes, with health checks, alerts and the full configuration reference.
 ---
 
-## Single Node (Docker Compose)
+A Valka deployment is one or more `valka-server` processes and one bucket. Nodes keep nothing
+on their own disks that the bucket doesn't also have, so you can replace, restart or kill them
+at any time. Run every node under a supervisor that restarts it when it exits (Docker
+`restart: unless-stopped`, systemd, Kubernetes): a node exits on purpose when it can't write to
+the bucket or finds itself fenced, and a fresh process rebuilds from the bucket.
 
-Create a `docker-compose.yml` and start the services:
+| Port | Serves | Expose to |
+|------|--------|-----------|
+| `50051` | Public gRPC: workers, SDK clients, CLI | Workers and clients |
+| `8989` | REST API, dashboard, SSE events, `/healthz`, `/metrics` | Clients, operators, Prometheus |
+| `50052` | Internal node-to-node gRPC (cluster only) | Other Valka nodes only. Never public |
 
-```yaml title="docker-compose.yml"
-services:
-  postgres:
-    image: postgres:17
-    environment:
-      POSTGRES_USER: valka
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-valka}
-      POSTGRES_DB: valka
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U valka"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-    shm_size: 128mb
+The public REST and gRPC APIs have no authentication of their own (only the admin endpoints
+need a token). Keep them on a private network or behind an authenticating proxy.
 
-  valka:
-    image: ghcr.io/iwhitebird/valka:latest
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      VALKA_DATABASE_URL: postgresql://valka:${POSTGRES_PASSWORD:-valka}@postgres:5432/valka
-      VALKA_GRPC_ADDR: "0.0.0.0:50051"
-      VALKA_HTTP_ADDR: "0.0.0.0:8989"
-      RUST_LOG: valka=info,tower_http=info
-    ports:
-      - "50051:50051"
-      - "8989:8989"
-    restart: unless-stopped
+---
 
-volumes:
-  pgdata:
-```
+## Single node
+
+A single node can use any storage backend. It runs the same protocol as a cluster, alone.
+
+### With a local directory
+
+The simplest setup: the `local` backend stores everything in one directory. The Docker image
+defaults to it, under `/var/lib/valka/data`.
 
 ```bash
-# Set a strong password (or export POSTGRES_PASSWORD)
-docker compose up -d
-```
-
-This starts PostgreSQL 17 and the Valka server with the web dashboard on `:8989` and gRPC on `:50051`. Migrations run automatically on first boot.
-
-### Using an External Database
-
-If you already have a PostgreSQL instance, run the Valka image directly:
-
-```bash
-docker run -d \
-  -e VALKA_DATABASE_URL=postgresql://user:pass@your-db-host:5432/valka \
-  -p 8989:8989 \
-  -p 50051:50051 \
+docker run -d --name valka --restart unless-stopped \
+  -p 8989:8989 -p 50051:50051 \
+  -v valka-data:/var/lib/valka \
   ghcr.io/iwhitebird/valka:latest
 ```
 
-The Docker image:
-- Runs as a non-root user (UID 1001)
-- Includes `curl` for health checks
-- Bundles the web dashboard and CLI tool
-- Exposes ports 8989 (HTTP), 50051 (gRPC), 7280/udp (gossip)
-
----
-
-## Cluster (Docker Compose)
-
-A 3-node cluster with PgBouncer connection pooling. This setup uses one migration leader (valka-1) while follower nodes wait for it to become healthy before starting.
-
-You need two files: a shared config file and the compose file.
-
-### 1. Create the cluster config
-
-```toml title="cluster.toml"
-# Shared config for 3-node cluster.
-# Node-specific values (node_id, advertise_addr) are set via env vars.
-
-[database]
-max_connections = 5
-
-[gossip]
-listen_addr = "0.0.0.0:7280"
-cluster_id = "valka"
-seed_nodes = ["valka-1:7280", "valka-2:7280", "valka-3:7280"]
-
-[matching]
-num_partitions = 12
-```
-
-### 2. Create the compose file
-
-```yaml title="docker-compose.yml"
-# 3-node cluster: PostgreSQL + PgBouncer + 3x Valka
-#
-# valka-1 is the migration leader. Runs migrations on a direct PG connection.
-# valka-2 and valka-3 wait for valka-1 to be healthy before starting.
-#
-# Access:
-#   Node 1: gRPC :50061, REST :8991
-#   Node 2: gRPC :50062, REST :8992
-#   Node 3: gRPC :50063, REST :8993
-
-x-valka-follower: &valka-follower
-  image: ghcr.io/iwhitebird/valka:latest
-  depends_on:
-    valka-1:
-      condition: service_healthy
-    pgbouncer:
-      condition: service_started
-  volumes:
-    - ./cluster.toml:/etc/valka/valka.toml:ro
-  command: ["/etc/valka/valka.toml"]
-
-services:
-  postgres:
-    image: postgres:17
-    container_name: valka-postgres
-    environment:
-      POSTGRES_USER: valka
-      POSTGRES_PASSWORD: valka
-      POSTGRES_DB: valka
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U valka"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    shm_size: 128mb
-
-  pgbouncer:
-    image: edoburu/pgbouncer:latest
-    container_name: valka-pgbouncer
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql://valka:valka@postgres:5432/valka
-      AUTH_TYPE: scram-sha-256
-      MAX_CLIENT_CONN: "100"
-      DEFAULT_POOL_SIZE: "20"
-      POOL_MODE: transaction
-      MAX_PREPARED_STATEMENTS: "100"
-
-  # Migration leader: runs migrations on direct PG, then starts normally.
-  valka-1:
-    image: ghcr.io/iwhitebird/valka:latest
-    container_name: valka-1
-    depends_on:
-      pgbouncer:
-        condition: service_started
-    volumes:
-      - ./cluster.toml:/etc/valka/valka.toml:ro
-    command: ["/etc/valka/valka.toml"]
-    environment:
-      VALKA_NODE_ID: valka-1
-      VALKA_DATABASE_URL: postgresql://valka:valka@pgbouncer:5432/valka
-      VALKA_MIGRATION_DATABASE_URL: postgresql://valka:valka@postgres:5432/valka
-      VALKA_GOSSIP__ADVERTISE_ADDR: "valka-1:7280"
-      RUST_LOG: valka=info
-    ports:
-      - "50061:50051"
-      - "8991:8989"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8989/healthz || exit 1"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-
-  valka-2:
-    <<: *valka-follower
-    container_name: valka-2
-    environment:
-      VALKA_NODE_ID: valka-2
-      VALKA_DATABASE_URL: postgresql://valka:valka@pgbouncer:5432/valka
-      VALKA_SKIP_MIGRATIONS: "true"
-      VALKA_GOSSIP__ADVERTISE_ADDR: "valka-2:7280"
-      RUST_LOG: valka=info
-    ports:
-      - "50062:50051"
-      - "8992:8989"
-
-  valka-3:
-    <<: *valka-follower
-    container_name: valka-3
-    environment:
-      VALKA_NODE_ID: valka-3
-      VALKA_DATABASE_URL: postgresql://valka:valka@pgbouncer:5432/valka
-      VALKA_SKIP_MIGRATIONS: "true"
-      VALKA_GOSSIP__ADVERTISE_ADDR: "valka-3:7280"
-      RUST_LOG: valka=info
-    ports:
-      - "50063:50051"
-      - "8993:8989"
-
-volumes:
-  pgdata:
-```
-
-### 3. Start the cluster
+Or run the binary directly; it uses `./data` by default:
 
 ```bash
+valka-server            # or: valka-server /etc/valka/valka.toml
+```
+
+That directory **is** the bucket: the WAL, snapshots and task logs live there. Back it up like a
+database, and never point two processes at it. The `local` backend is single-node only; a
+cluster needs an S3-compatible bucket.
+
+### With an S3-compatible bucket
+
+Point the node at a bucket with the `s3` backend:
+
+```bash
+docker run -d --name valka --restart unless-stopped \
+  -p 8989:8989 -p 50051:50051 \
+  -e VALKA_NODE_ID=valka-1 \
+  -e VALKA_STORAGE__BACKEND=s3 \
+  -e VALKA_STORAGE__BUCKET=my-valka-bucket \
+  -e VALKA_STORAGE__REGION=us-east-1 \
+  ghcr.io/iwhitebird/valka:latest
+```
+
+Credentials come from `VALKA_STORAGE__ACCESS_KEY_ID` and `VALKA_STORAGE__SECRET_ACCESS_KEY`, or,
+when those are unset, from the AWS default chain (environment, profile, instance metadata, IRSA).
+For MinIO and other S3-compatible stores, also set `VALKA_STORAGE__ENDPOINT` (and
+`VALKA_STORAGE__ALLOW_HTTP=true` for a plain-HTTP endpoint in development).
+
+Set a fixed `VALKA_NODE_ID`. It defaults to the host name, which changes with every new
+container unless you set a hostname. A restarted node with the same id fences its previous run,
+splits what that run left in the log and reclaims its shards at once.
+
+### With Docker Compose
+
+The repository's `docker-compose.yml` starts an S3-compatible store and one node built from
+source:
+
+```bash
+git clone https://github.com/IWhitebird/Valka.git && cd Valka
 docker compose up -d
 ```
 
-### Cluster endpoints
+| Service | Port | Description |
+|---------|------|-------------|
+| `valka-server` | `8989`, `50051` | REST, dashboard, gRPC. Node id `valka-1` |
+| `minio` | `9000`, `9001` | S3 API and web console (`minioadmin` / `minioadmin`) |
+| `minio-init` | - | Creates the `valka` and `valka-test` buckets, then exits |
 
-| Node | REST API / Dashboard | gRPC |
-|------|---------------------|------|
-| valka-1 | `http://localhost:8991` | `localhost:50061` |
-| valka-2 | `http://localhost:8992` | `localhost:50062` |
-| valka-3 | `http://localhost:8993` | `localhost:50063` |
-
-Workers and clients can connect to any node. Tasks are automatically forwarded to the correct partition owner.
-
-### How it works
-
-- **valka-1** runs database migrations on a direct PostgreSQL connection, then connects through PgBouncer for normal operation
-- **valka-2** and **valka-3** skip migrations and wait for valka-1 to be healthy
-- All nodes connect through **PgBouncer** for connection pooling
-- Nodes discover each other via **chitchat gossip** over UDP port 7280
-- The **scheduler** (lease reaper, retry engine, DLQ) runs on a single leader elected via PostgreSQL advisory locks
-
-### PgBouncer settings
-
-These settings are critical for sqlx compatibility:
-- `AUTH_TYPE=scram-sha-256`: required for PostgreSQL 17
-- `MAX_PREPARED_STATEMENTS=100`: required for sqlx prepared statement support
-- Use the `edoburu/pgbouncer` image (not `pgbouncer/pgbouncer` which is outdated)
+The store is `pgsty/silo`, an S3-compatible MinIO fork (the `minio/minio` images are no longer
+published on Docker Hub). In production, point `[storage]` at a real bucket and drop the store
+services. `deploy/docker/docker-compose.yml` is a variant of the same setup whose bucket,
+endpoint and credentials can be overridden with environment variables (`S3_BUCKET`,
+`S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, ...).
 
 ---
 
-## Kubernetes (Helm)
+## A three-node cluster with Docker Compose
 
-Valka provides a Helm chart for production Kubernetes deployments. The chart uses a **StatefulSet** (not Deployment) for stable pod DNS names required by the gossip protocol.
-
-### Prerequisites
-
-- Kubernetes 1.24+
-- Helm 3.x
-- A PostgreSQL instance accessible from the cluster
-
-### Install the chart
+`docker-compose.cluster.yml` runs three nodes on one S3-compatible store:
 
 ```bash
-helm install valka oci://ghcr.io/iwhitebird/charts/valka \
-  --set postgresql.host=your-pg-host \
-  --set postgresql.password=your-pg-password \
-  --set replicaCount=3
+docker compose -f docker-compose.cluster.yml up -d --build
 ```
 
-### values.yaml Reference
+| Node | REST API and dashboard | gRPC |
+|------|------------------------|------|
+| valka-1 | `http://localhost:8981` | `localhost:50061` |
+| valka-2 | `http://localhost:8982` | `localhost:50062` |
+| valka-3 | `http://localhost:8983` | `localhost:50063` |
 
-Create a `values.yaml` to customize your deployment:
+Every node gets the same storage settings, `VALKA_CLUSTER__ENABLED=true`, the same cluster token
+and an admin token, plus its own `VALKA_NODE_ID` and advertised addresses. Change both tokens
+before using it beyond a laptop. The build is limited to 4 parallel compile jobs to keep a laptop
+usable; it takes a while the first time.
 
-```yaml title="values.yaml"
-replicaCount: 3
+See [Clustering](/docs/clustering#watching-a-takeover) to watch a takeover on it.
 
-image:
-  repository: ghcr.io/iwhitebird/valka
-  pullPolicy: IfNotPresent
-  tag: ""  # defaults to Chart.appVersion
+---
 
-resources:
-  requests:
-    cpu: 250m
-    memory: 256Mi
-  limits:
-    cpu: "1"
-    memory: 1Gi
+## VMs and bare metal
 
-service:
-  type: ClusterIP
-  grpcPort: 50051
-  httpPort: 8989
+Run one `valka-server` per machine, all pointing at the same bucket. Every node needs:
 
-# -- Valka configuration (rendered into ConfigMap as valka.toml)
-config:
-  numPartitions: 12  # should be a multiple of replicaCount
+- the same `[storage]` settings (bucket, prefix, endpoint, region);
+- `VALKA_CLUSTER__ENABLED=true` and the **same** `VALKA_CLUSTER__TOKEN`;
+- a **distinct**, stable `VALKA_NODE_ID`;
+- advertised addresses the other nodes and clients can reach.
 
-  gossip:
-    clusterName: valka
-    port: 7280
-
-  database:
-    maxConnections: 5  # per-node, keep low with PgBouncer
-
-  matching:
-    maxBufferPerPartition: 1000
-    taskReaderBatchSize: 50
-
-  scheduler:
-    leaseTimeoutSecs: 60
-    reaperIntervalSecs: 10
-
-  logIngester:
-    batchSize: 100
-    flushIntervalMs: 500
-
-# -- Database connection
-database:
-  existingSecret: ""    # use an existing Secret instead of creating one
-  secretKey: database-url
-  url: ""               # only used if existingSecret is empty
-
-# -- PgBouncer sidecar
-pgbouncer:
-  enabled: true
-  poolMode: transaction
-  maxClientConn: 200
-  defaultPoolSize: 25
-  image:
-    repository: edoburu/pgbouncer
-    tag: "latest"
-  resources:
-    requests:
-      cpu: 50m
-      memory: 64Mi
-    limits:
-      cpu: 200m
-      memory: 128Mi
-
-# -- External PostgreSQL (used by PgBouncer sidecar and migration job)
-postgresql:
-  host: ""              # required
-  port: 5432
-  database: valka
-  username: valka
-  password: ""
-  existingSecret: ""    # Secret with key "password"
-
-# -- Horizontal Pod Autoscaler
-autoscaling:
-  enabled: false
-  minReplicas: 2
-  maxReplicas: 10
-  targetCPUUtilizationPercentage: 70
-
-# -- Prometheus ServiceMonitor
-serviceMonitor:
-  enabled: false
-  interval: 30s
-  scrapeTimeout: 10s
-
-# -- Security
-podSecurityContext:
-  runAsNonRoot: true
-  runAsUser: 1001
-  fsGroup: 1001
-
-securityContext:
-  allowPrivilegeEscalation: false
-  readOnlyRootFilesystem: true
-  capabilities:
-    drop: ["ALL"]
-
-# -- Pod anti-affinity (prefer spreading across nodes)
-affinity:
-  podAntiAffinity:
-    preferredDuringSchedulingIgnoredDuringExecution:
-      - weight: 100
-        podAffinityTerm:
-          labelSelector:
-            matchExpressions:
-              - key: app.kubernetes.io/name
-                operator: In
-                values:
-                  - valka
-          topologyKey: kubernetes.io/hostname
+```bash title="/etc/valka/valka.env (node 1 of 3)"
+VALKA_NODE_ID=valka-1
+VALKA_STORAGE__BACKEND=s3
+VALKA_STORAGE__BUCKET=my-valka-bucket
+VALKA_STORAGE__REGION=eu-west-1
+VALKA_CLUSTER__ENABLED=true
+VALKA_CLUSTER__TOKEN=<a long random secret, the same on every node>
+VALKA_CLUSTER__INTERNAL_ADDR=0.0.0.0:50052
+VALKA_CLUSTER__ADVERTISE_INTERNAL_ADDR=10.0.0.1:50052
+VALKA_CLUSTER__ADVERTISE_GRPC_ADDR=10.0.0.1:50051
+VALKA_CLUSTER__ADVERTISE_HTTP_ADDR=10.0.0.1:8989
+VALKA_ADMIN_TOKEN=<another secret, only if you want the admin API>
 ```
 
-### Install with custom values
+Nodes 2 and 3 differ only in `VALKA_NODE_ID` and their addresses. Open `50052` between the nodes
+and nowhere else. For mTLS on the internal port, see [Clustering](/docs/clustering#security).
+
+Point workers and clients at any node, or at a load balancer or DNS name in front of all of them,
+so a worker that loses its node reconnects to another one.
+
+No systemd units ship yet. Any supervisor works, as long as it restarts the process when it
+exits and gives it time to stop (see [Graceful shutdown](#graceful-shutdown)).
+
+### Bucket requirements
+
+The protocol relies on the bucket's consistency, so a cluster needs a store with:
+
+- **conditional writes**: create-if-absent PUT and `If-Match` PUT;
+- **strong read-after-write** and **strong LIST** consistency;
+- stable ETags.
+
+AWS S3 and recent MinIO provide these. A clustered node runs a **storage self-test** at start:
+it creates a probe object twice (the second create must fail), CASes with a wrong ETag (must
+fail) and with the right one (must succeed), and checks that LIST shows the probe at once. If any
+check fails, the node refuses to start.
+
+Use one bucket, or one `prefix` inside a bucket, per cluster. The first node writes
+`cluster.json` with the shard count and the storage format; every later node must agree with it.
+
+### Capacity
+
+A node holds the live tasks of the shards it owns in RAM, plus finished tasks for
+`completed_retention_secs` (24 h by default); their history stays in the bucket. Adding a node
+adds capacity: placement moves about 1/N of the shards to it after the join delay. Useful nodes
+top out around `num_shards / 8`, so choose the shard count of a new bucket with growth in mind.
+
+---
+
+## Kubernetes
+
+The Helm chart in `deploy/helm` predates the WAL architecture and is being reworked. Don't use
+it with this version. Until the new chart lands, run the container yourself as a StatefulSet-like
+deployment, or use Docker Compose or VMs:
+
+- one pod per node, with a **stable node id**: in a StatefulSet the pod name is the host name,
+  so the default node id is already stable;
+- a headless service, with `VALKA_CLUSTER__ADVERTISE_INTERNAL_ADDR` set to each pod's stable DNS
+  name and port `50052`;
+- the same storage settings and cluster token for every pod (the token from a Secret);
+- no volume needed with the `s3` backend;
+- a termination grace period long enough for the node to hand its shards over on `SIGTERM`;
+- liveness and readiness probes on `GET /healthz` (port 8989);
+- port `50052` reachable only from the other pods.
+
+---
+
+## Chaos test
+
+`scripts/chaos.sh` breaks the three-node compose cluster while a load generator runs:
 
 ```bash
-helm install valka oci://ghcr.io/iwhitebird/charts/valka \
-  -f values.yaml
+scripts/chaos.sh                     # 5 minutes of chaos
+DURATION=1800 scripts/chaos.sh       # a 30-minute soak
+NO_BUILD=1 scripts/chaos.sh          # reuse the valka:local image
 ```
 
-### What the chart deploys
-
-| Resource | Purpose |
-|----------|---------|
-| **StatefulSet** | Valka server pods with stable DNS names for gossip |
-| **Service** (ClusterIP) | Exposes gRPC (50051) and HTTP (8989) |
-| **Headless Service** | Pod discovery for gossip (UDP 7280) and internal gRPC |
-| **ConfigMap** | Generated `valka.toml` with seed nodes computed from pod names |
-| **Secrets** | Database URL and PostgreSQL password |
-| **Job** (pre-install hook) | Runs database migrations before pods start |
-| **HPA** (optional) | Horizontal Pod Autoscaler |
-| **ServiceMonitor** (optional) | Prometheus metrics scraping |
-
-### Architecture details
-
-The chart automatically configures gossip seed nodes using stable pod DNS names:
-
-```
-valka-0.valka-headless.<namespace>.svc.cluster.local:7280
-valka-1.valka-headless.<namespace>.svc.cluster.local:7280
-valka-2.valka-headless.<namespace>.svc.cluster.local:7280
-```
-
-Each pod's `advertise_addr` is set to its own stable DNS name via the downward API, so nodes can discover and route to each other.
-
-Database migrations run as a Helm **pre-install/pre-upgrade hook** Job. The StatefulSet pods all start with `VALKA_SKIP_MIGRATIONS=true` since the Job handles it.
-
-### Exposing Valka externally
-
-To expose Valka outside the cluster, use an Ingress or LoadBalancer:
-
-```yaml title="values.yaml"
-service:
-  type: LoadBalancer
-  grpcPort: 50051
-  httpPort: 8989
-```
-
-Or with an Ingress controller (e.g., nginx):
-
-```yaml title="ingress.yaml"
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: valka
-  annotations:
-    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
-spec:
-  rules:
-    - host: valka.example.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: valka
-                port:
-                  number: 8989
-```
-
-For gRPC, you'll need a separate Ingress with gRPC backend protocol or use a gRPC-aware load balancer.
-
-### Monitoring with Prometheus
-
-Enable the ServiceMonitor to scrape Valka metrics:
-
-```yaml title="values.yaml"
-serviceMonitor:
-  enabled: true
-  interval: 30s
-  labels:
-    release: prometheus  # match your Prometheus operator selector
-```
-
-Metrics are available at `/metrics` on the HTTP port.
+The load generator (`examples/rs/chaos.rs`) creates tasks through every node (20 per second by
+default, `RATE`), runs a worker on every node and records every acknowledged create. Meanwhile
+the script picks a random node every 10–30 s and either `kill -9`s it, freezes it (`SIGSTOP`,
+like a long GC pause or a VM freeze) or restarts it with `SIGTERM`. At the end every node comes
+back, and the checker verifies that every acknowledged task exists and finished, and that no
+idempotency key produced two tasks. It needs Docker Compose and cargo, writes its logs to
+`target/chaos`, and exits `0` when every check passes.
 
 ---
 
-## PostgreSQL Recommendations
+## Monitoring and alerts
 
-### Connection Pooling
-
-For production, use **PgBouncer** between Valka and PostgreSQL. Both the Docker Compose cluster and Helm chart include PgBouncer by default.
-
-Key settings:
-- Use `edoburu/pgbouncer` image (not `pgbouncer/pgbouncer` which is stale)
-- `AUTH_TYPE=scram-sha-256` for PostgreSQL 17 compatibility
-- `MAX_PREPARED_STATEMENTS=100` is required for sqlx compatibility
-- PgBouncer listens on port 5432 with the edoburu image
-
-### Database Sizing
-
-| Workload | PostgreSQL | Valka Nodes | Max Connections |
-|----------|-----------|-------------|-----------------|
-| Small (< 100 tasks/min) | 1 vCPU, 1GB RAM | 1 | 20 |
-| Medium (< 1K tasks/min) | 2 vCPU, 4GB RAM | 2-3 | 50 |
-| Large (< 10K tasks/min) | 4 vCPU, 16GB RAM | 3-5 | 100 |
-
-### Maintenance
-
-- Enable `pg_stat_statements` for query monitoring
-- Set up regular `VACUUM` for the `tasks` and `task_runs` tables
-- Archive completed tasks older than your retention period
-- Monitor WAL size if using replication
-
----
-
-## Configuration Reference
-
-### Full Configuration File
-
-Mount a `valka.toml` into the container for file-based configuration:
-
-```toml title="valka.toml"
-# Unique node identifier. Auto-generated UUIDv7 if empty.
-node_id = ""
-
-# gRPC listen address
-grpc_addr = "0.0.0.0:50051"
-
-# HTTP/REST + Dashboard listen address
-http_addr = "0.0.0.0:8989"
-
-# PostgreSQL connection string
-database_url = "postgresql://valka:valka@localhost:5432/valka"
-
-[database]
-max_connections = 20
-acquire_timeout_secs = 5
-
-[gossip]
-listen_addr = "0.0.0.0:7280"
-cluster_id = "valka"
-seed_nodes = []                # empty = single-node mode
-# advertise_addr = ""          # defaults to listen_addr
-
-[matching]
-num_partitions = 4             # use 12+ for clusters
-branching_factor = 3
-max_buffer_per_partition = 1000
-task_reader_batch_size = 50
-task_reader_poll_busy_ms = 10
-task_reader_poll_idle_ms = 200
-
-[scheduler]
-reaper_interval_secs = 10
-lease_timeout_secs = 60
-retry_base_delay_secs = 1
-retry_max_delay_secs = 3600
-dlq_check_interval_secs = 30
-delayed_check_interval_secs = 5
-
-[log_ingester]
-batch_size = 100
-flush_interval_ms = 500
-```
-
-### Environment Variables
-
-All configuration values can be set via environment variables with the `VALKA_` prefix and `__` for nesting:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `VALKA_DATABASE_URL` | - | PostgreSQL connection string |
-| `VALKA_DATABASE__MAX_CONNECTIONS` | `20` | Connection pool size |
-| `VALKA_SERVER__GRPC_ADDR` | `0.0.0.0:50051` | gRPC listen address |
-| `VALKA_SERVER__HTTP_ADDR` | `0.0.0.0:8989` | HTTP listen address |
-| `VALKA_SCHEDULER__ENABLED` | `true` | Enable scheduler loops |
-| `VALKA_SCHEDULER__LEASE_DURATION_SECS` | `300` | Default lease timeout |
-| `VALKA_SCHEDULER__REAPER_INTERVAL_SECS` | `30` | Reaper check interval |
-| `VALKA_CLUSTER__ENABLED` | `false` | Enable clustering |
-| `VALKA_CLUSTER__NUM_PARTITIONS` | `12` | Partition count |
-| `VALKA_SKIP_MIGRATIONS` | `false` | Skip auto-migrations on startup |
-| `RUST_LOG` | `valka=info` | Log level filter |
-
----
-
-## Health Checks
+### Health checks
 
 ```bash
-# HTTP health check
-curl http://localhost:8989/healthz
-
-# Prometheus metrics
-curl http://localhost:8989/metrics
+curl http://localhost:8989/healthz   # "ok" (200), or 503 "wal writer poisoned"
+curl http://localhost:8989/metrics   # Prometheus text format
 ```
 
-For Docker/Kubernetes health checks:
+`/healthz` answers `503` only when the node's WAL writer is poisoned, and such a node exits right
+after. It does not report a self-fenced node (one that can't renew its lease); watch the
+`valka_node_serving` metric for that. The Docker image has a built-in `HEALTHCHECK` on
+`/healthz`.
 
 ```yaml
 livenessProbe:
@@ -584,37 +232,335 @@ livenessProbe:
     port: 8989
   initialDelaySeconds: 15
   periodSeconds: 10
-
 readinessProbe:
   httpGet:
     path: /healthz
     port: 8989
-  initialDelaySeconds: 5
   periodSeconds: 5
 ```
 
-## Graceful Shutdown
+For a cluster-wide view, `GET /api/v1/cluster` on any node returns every node, the number of
+unowned shards and an overall `health.status` (`ok`, `degraded` or `critical`).
+
+### Metrics
+
+Every node exports `/metrics` on its HTTP port. The cluster metrics:
+
+| Metric | Meaning |
+|--------|---------|
+| `valka_node_serving` | `1` while the node's lease is current, `0` when it self-fenced |
+| `valka_lease_age_seconds` | Time since the last successful lease renewal |
+| `valka_shards_owned` | Shards this node serves |
+| `valka_cluster_members` | Nodes this node sees |
+| `valka_node_fenced_total` | Times this node found its lease taken |
+| `valka_tombstones_total` | Nodes declared dead |
+| `valka_splits_total`, `valka_split_failures_total`, `valka_split_duration_seconds` | Log splits |
+| `valka_shard_claims_total`, `valka_shard_releases_total` | Shard moves |
+| `valka_forwarded_commands_total` | Requests forwarded to other nodes, by result |
+| `valka_route_redirects_total` | `NOT_OWNER` redirects followed |
+| `valka_reattach_total` | Worker runs reattached after a reconnect |
+| `valka_wal_segments_total`, `valka_wal_bytes_total` | WAL segments and bytes written |
+
+Task metrics include `valka_tasks_created_total`, `valka_tasks_completed_total`,
+`valka_tasks_failed_total`, `valka_tasks_retried_total`, `valka_tasks_dead_lettered_total`,
+`valka_pending_tasks`, `valka_active_workers` and `valka_task_duration_ms`.
+
+### Alert rules
+
+`deploy/prometheus/alerts.yml` has ready-made Prometheus rules. Each one names a section of the
+[runbooks](https://github.com/IWhitebird/Valka/blob/master/docs/wal/RUNBOOKS.md), which say what
+to do when it fires.
+
+| Alert | Fires when | Runbook |
+|-------|-----------|---------|
+| `ValkaNodeNotServing` (critical) | A node self-fenced for 30 s | [Node not serving](https://github.com/IWhitebird/Valka/blob/master/docs/wal/RUNBOOKS.md#node-not-serving) |
+| `ValkaLeaseStale` | Lease renewals take over 6 s for 1 min | [Bucket slow or down](https://github.com/IWhitebird/Valka/blob/master/docs/wal/RUNBOOKS.md#bucket-slow-or-down) |
+| `ValkaNodeFenced` | A node found its lease taken | [Node fenced](https://github.com/IWhitebird/Valka/blob/master/docs/wal/RUNBOOKS.md#node-fenced) |
+| `ValkaTakeover` | A node was declared dead and taken over | [Node lost](https://github.com/IWhitebird/Valka/blob/master/docs/wal/RUNBOOKS.md#node-lost) |
+| `ValkaSplitFailing` (critical) | A dead node's log split keeps failing | [Stuck split](https://github.com/IWhitebird/Valka/blob/master/docs/wal/RUNBOOKS.md#stuck-split) |
+| `ValkaUnownedShards` (critical) | Fewer shards served than exist, for 2 min | [Unowned shards](https://github.com/IWhitebird/Valka/blob/master/docs/wal/RUNBOOKS.md#unowned-shards) |
+| `ValkaClaimInvariant` (critical) | A claim found the bucket inconsistent with the protocol | [Claim invariant](https://github.com/IWhitebird/Valka/blob/master/docs/wal/RUNBOOKS.md#claim-invariant) |
+| `ValkaForwardingErrors` | Nodes can't reach each other's internal listener | [Nodes cannot reach each other](https://github.com/IWhitebird/Valka/blob/master/docs/wal/RUNBOOKS.md#nodes-cannot-reach-each-other) |
+
+`ValkaUnownedShards` compares against 4096. Change the number if your cluster was created with
+another shard count.
+
+---
+
+## Graceful shutdown
 
 Stopping a **server** (`SIGTERM` or Ctrl-C):
 
-1. Every connected worker receives `ServerShutdown` and its stream is closed, so the server
-   never waits on open streams.
-2. Workers keep running their in-flight tasks and reconnect with backoff, to another node
-   or to the restarted one. Results that finish in the meantime are kept and delivered
-   after the reconnect.
-3. The server flushes its WAL, snapshots dirty shards and exits.
+1. Every connected worker receives `ServerShutdown` and its stream is closed, so the server never
+   waits on open streams.
+2. Workers keep running their in-flight tasks and reconnect with backoff, to another node or to
+   the restarted one. Results that finish in the meantime are kept and delivered after the
+   reconnect.
+3. If live peers exist, the node **drains**: it marks its lease draining, releases every shard
+   with a final snapshot, marks its lease dead and exits. The peers claim the shards with nothing
+   to replay.
+4. If it is alone, it **keeps** its shards: it flushes the WAL, snapshots changed shards and
+   exits. The restart reclaims them with little to replay.
+
+Give the process time to finish. Docker's default stop timeout is 10 s; the chaos script uses
+`docker compose restart -t 30`.
+
+**Rolling restart.** Restart one node at a time, and wait until `GET /api/v1/cluster` shows no
+unowned shards before the next one. Each `SIGTERM` hands that node's shards to the others.
+
+**Drain without a restart.** `POST /api/v1/cluster/nodes/{node}/drain` (admin API) makes a node
+hand everything over and exit.
 
 Stopping a **worker**:
 
-1. The worker sends `GracefulShutdown`: the server stops sending it tasks but keeps the
-   stream open.
-2. In-flight handlers finish and their results are acknowledged (the worker waits up to
-   5 s for the acks).
+1. The worker sends `GracefulShutdown`: the server stops sending it tasks but keeps the stream
+   open.
+2. In-flight handlers finish and their results are acknowledged (the worker waits up to 5 s for
+   the acks).
 3. The worker closes the stream and exits.
 
-### When the bucket fails
+## When the bucket fails
 
-If the WAL cannot be written after its retries, the server answers `503` for writes and then
-**exits with a non-zero status**. Run it under a supervisor that restarts it (Kubernetes,
-systemd, Docker `restart: unless-stopped`): on start it rebuilds its state from the bucket.
-Nothing it acknowledged is lost.
+- Writes are acknowledged only after their WAL segment is in the bucket, so a slow bucket means
+  slower acknowledgements and, eventually, `UNAVAILABLE`. Acknowledged work is never lost.
+- A node that can't renew its lease for 7 s stops serving until it can. If it stays cut off for
+  10 s, another node takes its shards over.
+- If WAL PUTs keep failing after their retries (`put_retries`, default 8), the node fails the
+  pending writes with `UNAVAILABLE` and **exits with a non-zero status**. Its supervisor restarts
+  it, and it rebuilds its state from the bucket.
+- If the bucket is down for everyone, every node stops serving and nobody can declare anybody
+  dead. The cluster recovers by itself when the bucket returns.
+
+## Upgrades
+
+Restart nodes one at a time onto the new build, as in a rolling restart. Each lease advertises
+the node's protocol version, and the cluster's effective protocol is the lowest among live nodes
+(`effective_protocol` in `GET /api/v1/cluster/placement`). A node refuses to join a cluster whose
+live nodes already speak a newer protocol.
+
+---
+
+## Configuration reference
+
+Configuration is layered: built-in defaults, then a TOML file, then `VALKA_*` environment
+variables (highest wins). Nested keys use a double underscore: `[storage] bucket` is
+`VALKA_STORAGE__BUCKET`. Pass the config file path as the first argument:
+`valka-server /etc/valka/valka.toml`.
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VALKA_NODE_ID` | host name | Stable node id (1–64 characters from `A-Z a-z 0-9 _ -`) |
+| `VALKA_ADMIN_TOKEN` | - | Enables the admin API |
+| `VALKA_GRPC_ADDR` | `0.0.0.0:50051` | gRPC listen address |
+| `VALKA_HTTP_ADDR` | `0.0.0.0:8989` | REST, dashboard and metrics listen address |
+| `VALKA_WEB_DIR` | `web/dist` | Built dashboard files (the image sets `/usr/share/valka/web`) |
+| `VALKA_STORAGE__BACKEND` | `local` | `s3`, `local` (a directory) or `memory` (tests only) |
+| `VALKA_STORAGE__PATH` | `./data` | Directory for the `local` backend |
+| `VALKA_STORAGE__BUCKET` | `valka` | Bucket for the `s3` backend |
+| `VALKA_STORAGE__PREFIX` | empty | Key prefix inside the bucket, e.g. `valka/prod` |
+| `VALKA_STORAGE__ENDPOINT` | - | Custom S3 endpoint (MinIO, R2, ...). Omit for AWS |
+| `VALKA_STORAGE__REGION` | - | Bucket region |
+| `VALKA_STORAGE__ACCESS_KEY_ID`, `VALKA_STORAGE__SECRET_ACCESS_KEY` | - | Credentials. Unset: the AWS default chain |
+| `VALKA_STORAGE__ALLOW_HTTP` | `false` | Allow plain-HTTP endpoints (development only) |
+| `VALKA_WAL__FLUSH_INTERVAL_MS` | `50` | Group-commit window: acknowledgement latency vs. PUT count |
+| `VALKA_WAL__MAX_BATCH_BYTES` | `4194304` | Flush early at this many buffered bytes |
+| `VALKA_WAL__MAX_INFLIGHT_SEGMENTS` | `4` | Segment PUTs in flight at once |
+| `VALKA_WAL__PUT_RETRIES` | `8` | PUT retries before writes fail and the node exits |
+| `VALKA_WAL__SNAPSHOT_INTERVAL_SECS` | `60` | Snapshot changed shards at least this often |
+| `VALKA_WAL__SNAPSHOT_AFTER_RECORDS` | `50000` | ...or once a shard has this many new records |
+| `VALKA_WAL__LOG_BUDGET_BYTES` | `67108864` | ...or once this much log is uncovered. Bounds restart and takeover time |
+| `VALKA_WAL__SNAPSHOTS_TO_KEEP` | `2` | Snapshots kept per shard |
+| `VALKA_WAL__COMPLETED_RETENTION_SECS` | `86400` | Finished tasks leave RAM after this (their history stays in the bucket) |
+| `VALKA_CLUSTER__*` | | Cluster settings: see [Clustering](/docs/clustering#environment-variables) |
+| `VALKA_SCHEDULER__TIMER_TICK_MS` | `100` | Timer resolution for lease expiry, retries and delayed tasks |
+| `VALKA_SCHEDULER__LEASE_GRACE_SECS` | `30` | Added to a task's timeout for its first lease |
+| `VALKA_SCHEDULER__HEARTBEAT_LEASE_SECS` | `60` | Each heartbeat keeps the lease at least this far ahead |
+| `VALKA_SCHEDULER__RECOVERY_GRACE_SECS` | `60` | Lease given to recovered `RUNNING` tasks until their worker reconnects |
+| `VALKA_SCHEDULER__RETRY_BASE_DELAY_SECS` | `1` | Retry backoff base |
+| `VALKA_SCHEDULER__RETRY_MAX_DELAY_SECS` | `3600` | Retry backoff cap |
+| `RUST_LOG` | `valka=info,tower_http=info` | Log filter |
+
+### Full configuration file
+
+Every setting with its default and a comment, from `deploy/valka.example.toml`:
+
+```toml title="valka.toml"
+# Valka Server Configuration Reference
+#
+# Config layering: defaults -> this file -> VALKA_* env vars
+# Nested env vars use double underscore: VALKA_STORAGE__BUCKET=valka
+# Pass config path as first CLI argument: valka-server /etc/valka/valka.toml
+
+# Unique, stable node identifier. Defaults to the host name if empty.
+# A restarted node with the same id fences its previous run, splits what that run left in
+# wal/<node_id>/ and reclaims its shards. Every node of a cluster needs a distinct id.
+node_id = ""
+
+# Bearer token for the admin API (drain a node, move a shard, set queue partitions,
+# audit log). Unset = admin API disabled. Env: VALKA_ADMIN_TOKEN.
+# admin_token = ""
+
+# gRPC listen address (workers and API clients)
+grpc_addr = "0.0.0.0:50051"
+
+# HTTP/REST + WebUI listen address
+http_addr = "0.0.0.0:8989"
+
+# Path to built WebUI static files
+web_dir = "/usr/share/valka/web"
+
+# --- Storage (the only durable state) --------------------------------------
+
+[storage]
+# "s3"     any S3-compatible bucket (AWS S3, MinIO, R2, ...). Needs conditional writes.
+# "local"  a directory (dev / single machine). CAS is emulated in-process.
+# "memory" ephemeral, tests and demos only.
+backend = "s3"
+
+# local backend: directory
+path = "./data"
+
+# s3 backend
+bucket = "valka"
+# Optional key prefix inside the bucket, e.g. "valka/prod"
+prefix = ""
+# Custom endpoint for S3-compatible stores (MinIO: "http://minio:9000"). Omit for AWS.
+# endpoint = "http://minio:9000"
+# region = "us-east-1"
+# Credentials. Omit to use the AWS default chain (env vars, profile, IMDS / IRSA).
+# access_key_id = ""
+# secret_access_key = ""
+# Allow plain HTTP endpoints (MinIO in dev only)
+allow_http = false
+
+# --- Write-ahead log -------------------------------------------------------
+
+[wal]
+# Group-commit window. Nothing is acknowledged before its segment is in the bucket.
+# Lower = lower enqueue latency, more PUT requests. 50-100 ms is the sweet spot on S3.
+flush_interval_ms = 50
+# Flush early once the buffer reaches this many bytes.
+max_batch_bytes = 4194304
+# Segment PUTs in flight concurrently.
+max_inflight_segments = 4
+# PUT retries before acks fail with UNAVAILABLE (the node then exits and restarts).
+put_retries = 8
+# Snapshot dirty shards at least this often; segments below every snapshot are deleted.
+snapshot_interval_secs = 60
+# ...or as soon as a shard has this many unsnapshotted records.
+snapshot_after_records = 50000
+# ...or, for every dirty shard, once this many WAL bytes were written since the last
+# full round. Bounds restart replay time. 0 disables.
+log_budget_bytes = 67108864
+# Snapshots kept per shard.
+snapshots_to_keep = 2
+# Terminal tasks (COMPLETED/FAILED/CANCELLED/DEAD_LETTER) leave RAM after this.
+# Their history stays in the bucket.
+completed_retention_secs = 86400
+
+# --- Cluster ---------------------------------------------------------------
+# One node is a cluster of one: the same lease / ownership protocol always runs.
+# See docs/ARCHITECTURE.md §8 and docs/wal/PHASE2.md.
+
+[cluster]
+# Allow other nodes on this bucket. Needs the s3 backend (local/memory CAS only works
+# inside one process) and a token.
+enabled = false
+
+# Shared secret every node-to-node call carries. Required when enabled.
+# token = ""
+
+# Shard count of a NEW bucket (written to cluster.json on first start; fixed afterwards).
+# Power of two, 16..=65536. 0 = whatever the bucket says, or 4096 for a new bucket.
+num_shards = 0
+
+# Node-to-node listener. Never expose it publicly.
+internal_addr = "0.0.0.0:50052"
+# Addresses other nodes / clients use to reach this node (default: the listen addresses).
+# advertise_internal_addr = "10.0.0.1:50052"
+# advertise_grpc_addr = "10.0.0.1:50051"
+# advertise_http_addr = "10.0.0.1:8989"
+
+# Optional mTLS for internal traffic (PEM files). The token is still required.
+# tls_cert = "/etc/valka/tls/node.crt"
+# tls_key = "/etc/valka/tls/node.key"
+# tls_ca = "/etc/valka/tls/ca.crt"
+
+# Lease renewal period, and how long an unchanged lease takes to be declared dead
+# (by the observer's own clock). A node that has not renewed for
+# lease_timeout - lease_safety_margin stops serving on its own.
+lease_interval_ms = 2000
+lease_timeout_ms = 10000
+lease_safety_margin_ms = 3000
+
+# How often nodes/ is listed (membership).
+membership_interval_ms = 3000
+# A new node takes shards after this (all nodes at once on a cold start).
+join_delay_ms = 15000
+# Placement round period, claims in flight, shards handed over per round.
+placement_interval_ms = 3000
+claim_concurrency = 64
+handover_per_tick = 64
+# A shard stays where it is for at least this long after a move.
+min_residency_secs = 300
+# Another node may redo a dead node's log split after this.
+split_timeout_ms = 30000
+# After claiming shards, recovered PENDING tasks wait this long so reconnecting workers
+# can reattach their runs first.
+reconcile_grace_ms = 5000
+# Garbage collector cadence (dead logs, old snapshots, split markers).
+gc_interval_secs = 300
+# Refuse to start while another live process holds this node id.
+startup_lease_check = true
+
+# --- Matching / Task Routing -----------------------------------------------
+
+[matching]
+# In-RAM worker-routing partitions per queue on one node (unrelated to storage shards
+# and to queue partitions, which live in the bucket: queues/{hh}/{queue}).
+num_partitions = 4
+
+# Internal tree branching factor (rarely needs tuning)
+branching_factor = 3
+
+# Max tasks buffered per partition before back-pressure
+max_buffer_per_partition = 1000
+
+# How often the feeder tops up matching buffers from the pending index (ms)
+feeder_interval_ms = 20
+
+# Max tasks moved per queue per feeder tick
+feeder_batch_size = 200
+
+# --- Scheduler -------------------------------------------------------------
+
+[scheduler]
+# Timer resolution for lease expiry, retry promotion and delayed tasks (ms)
+timer_tick_ms = 100
+
+# Extra time on top of a task's timeout before its first lease expires (seconds)
+lease_grace_secs = 30
+
+# Lease granted to RUNNING tasks recovered from the WAL until their worker reconnects
+recovery_grace_secs = 60
+
+# Lease granted by each heartbeat: the worker must heartbeat again within this window
+heartbeat_lease_secs = 60
+
+# Exponential backoff base for retries (seconds)
+retry_base_delay_secs = 1
+
+# Maximum retry delay cap (seconds)
+retry_max_delay_secs = 3600
+
+# --- Log Ingester ----------------------------------------------------------
+
+[log_ingester]
+# Max log lines buffered before a chunk is written to the bucket
+batch_size = 100
+
+# Max time to buffer logs before flushing (ms)
+flush_interval_ms = 500
+```

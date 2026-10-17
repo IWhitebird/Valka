@@ -1,225 +1,377 @@
 ---
 title: Architecture
-description: How Valka works under the hood.
+description: How Valka works under the hood, from one node to many.
 ---
 
-## Overview
+## The one rule
 
-Valka is designed around a simple principle: **PostgreSQL is the source of truth, but the hot path is in-memory**.
+**The bucket is the only truth.** Valka keeps nothing important on a node's disk. It uses no
+database, no Raft, no ZooKeeper and no message broker. Everything that matters is an object
+in one S3-compatible bucket, or in a local directory for a single dev node:
+
+- every change to a task is a record in a **write-ahead log** (WAL) stored as objects;
+- the live state is held **in RAM** by the node that owns it, and rebuilt from the bucket
+  whenever ownership moves;
+- who owns what, and who is alive, is decided by **conditional writes** (compare-and-swap on
+  an object's ETag) in the same bucket.
+
+A node is therefore disposable. Kill it, and another node rebuilds its state from the bucket.
+The price is latency: an acknowledgement waits for an S3 PUT, typically 50–200 ms with the
+default 50 ms group-commit window. In return you get durability, simple operations and a
+cluster that needs nothing but a bucket.
+
+## The big picture
 
 <Mermaid chart={`graph TD
-    RC[REST Clients] --> RA[REST API]
-    GC[gRPC Clients] --> GA[gRPC API]
-    RA --> MS[MatchingService<br/>Partition Tree]
-    GA --> MS
+    P["Producers<br/>REST · gRPC · CLI · SDK clients"] --> A1
+    P --> A2
+    W1["Workers<br/>one gRPC stream each"] --> D1
+    W2["Workers<br/>one gRPC stream each"] --> D2
 
-    MS --> HP[Hot Path<br/>In-Memory Oneshot]
-    MS --> CP[Cold Path<br/>PG SKIP LOCKED]
-
-    HP --> D[Dispatcher<br/>gRPC Bidi Stream]
-    CP --> D
-
-    D --> WA[Worker A<br/>Rust SDK]
-    D --> WB[Worker B<br/>Go SDK]
-    D --> WC[Worker C<br/>Python SDK]
-
-    subgraph Scheduler
-        LR[Lease Reaper]
-        RE[Retry Engine]
-        DLQ[DLQ Mover]
-        DP[Delayed Promoter]
+    subgraph NA["Node A"]
+        A1[API layer] --> E1["Engine<br/>shards A owns, in RAM"]
+        D1[Dispatcher] --- M1[Matching]
+        E1 --> M1
+        E1 --> WR1[WAL writer]
     end
 
-    D -.-> Scheduler
-    EB[Event Broadcast<br/>tokio broadcast] -.-> D
+    subgraph NB["Node B"]
+        A2[API layer] --> E2["Engine<br/>shards B owns, in RAM"]
+        D2[Dispatcher] --- M2[Matching]
+        E2 --> M2
+        E2 --> WR2[WAL writer]
+    end
 
-    style MS fill:#1F5B4F,stroke:#3E9F88,color:#fff
-    style HP fill:#059669,stroke:#10b981,color:#fff
-    style CP fill:#9E5A2E,stroke:#C27A48,color:#fff
-    style D fill:#7c3aed,stroke:#8b5cf6,color:#fff
-    style WA fill:#ea580c,stroke:#f97316,color:#fff
-    style WB fill:#0891b2,stroke:#22d3ee,color:#fff
-    style WC fill:#ca8a04,stroke:#eab308,color:#fff
+    A1 <-->|"internal gRPC :50052<br/>token, optional mTLS"| A2
+    WR1 --> B[("Bucket<br/>leases · owner records · WAL · snapshots")]
+    WR2 --> B
+
+    style E1 fill:#1F5B4F,stroke:#3E9F88,color:#fff
+    style E2 fill:#1F5B4F,stroke:#3E9F88,color:#fff
+    style B fill:#9E5A2E,stroke:#C27A48,color:#fff
+    style D1 fill:#7c3aed,stroke:#8b5cf6,color:#fff
+    style D2 fill:#7c3aed,stroke:#8b5cf6,color:#fff
 `} />
 
-## Crate Architecture
+Things to notice:
 
-Valka is a Cargo workspace with 12 crates, each with a clear responsibility:
+- **Any node accepts any request.** A request for a task another node owns is forwarded to
+  that node over the internal gRPC listener (default `:50052`).
+- **Workers can attach to any node** and run tasks owned by any node.
+- **Nodes never ask each other who is alive or who owns what.** They read it from the bucket.
+  Node-to-node calls only move requests and tasks around. If those calls fail, requests are
+  retried, but ownership does not change.
+- **One node is a cluster of one.** A single `valka-server` runs exactly the same protocol,
+  alone. There is no separate single-node code path.
+
+## What is in the bucket
+
+| Key | Holds |
+|-----|-------|
+| `cluster.json` | Cluster id, shard count and format version. Written once |
+| `nodes/{node}/lease` | Who is alive: incarnation, state, renew counter, log watermark, addresses |
+| `owners/{hh}/{shard}` | Which node incarnation owns a shard, and the shard's generation |
+| `queues/{hh}/{queue}` | A queue's partition count |
+| `wal/{node}/{inc}-{seq}.seg` | Each node's own log, append-only |
+| `snapshots/{hh}/{shard}/...` | Per-shard state checkpoints |
+| `splits/{node}/{inc}` | Marker: this dead log has been redistributed |
+| `logs/{hh}/{run}/...` | Task log lines (not part of the WAL) |
+| `placement.json`, `admin/...` | Operator shard pins, admin audit records |
+
+`{hh}` is two hex digits of a hash of the rest of the key. It spreads busy key families over
+the store's partitions. WAL segments are zstd-compressed, CRC-framed JSON, so anything can
+read the log straight from the bucket.
+
+## Shards, partitions and ids
+
+**Shards.** All state is split into a fixed number of shards. The default is 4096; the count
+is chosen when a bucket is first used, stored in `cluster.json`, and never changes. A shard is
+the unit of ownership: at any moment exactly one node serves it, holds its state in RAM and
+writes its records. A shard holds its tasks, runs, signals, dead letters and idempotency keys.
+Nothing spans two shards, so no operation needs coordination between shards.
+
+**Queue partitions.** A queue is split into partitions (default 16, changed with an admin
+call). Partition `p` of queue `Q` lives on shard `hash(Q, p) mod num_shards`. A queue's tasks
+are therefore spread over up to 16 shards, which may be owned by up to 16 different nodes.
+
+When a task is created, the receiving node picks a partition:
+
+- with an idempotency key: `jump_hash(key, partitions)`, so the same key always lands on the
+  same shard and deduplication is exact;
+- without a key: preferably a partition whose shard this node owns (no network hop),
+  otherwise a random one.
+
+**Ids carry their shard.** Task ids are UUIDv7 (time-ordered) with the shard number embedded
+in the low 16 bits. Any node can route a get, cancel or signal straight to the right shard
+without a lookup. Run ids are minted in the same shard as their task.
+
+## Inside one node
+
+A `valka-server` process runs these pieces in one tokio runtime:
+
+| Piece | Crate | What it does |
+|-------|-------|--------------|
+| REST API (`:8989`) and gRPC API (`:50051`) | `valka-server` | Public endpoints. The dashboard is served from the REST port |
+| API layer | `valka-server` | Decides where a request runs: locally, forwarded to the owner, or scattered to every node and merged |
+| Internal listener (`:50052`) | `valka-server` | Answers other nodes' `Execute`, `Scatter` and `Events` calls |
+| Engine | `valka-engine` | The shards this node owns, the command API, timers, the pending index, snapshots, recovery and the control loop |
+| WAL writer | `valka-wal` | Batches records into segments and PUTs them (group commit) |
+| Lease keeper | `valka-wal` | Renews this node's lease every 2 s |
+| Dispatcher | `valka-dispatcher` | One bidirectional gRPC stream per worker: assignments, results, heartbeats, signals, cancels |
+| Matching | `valka-matching` | Which local workers wait for which queue. Hands a task to one of them |
+| Remote feeder | `valka-server` | When local workers wait for a queue whose partitions other nodes own, long-polls those owners for work |
+| Event relay | `valka-server` | Streams other nodes' task events to this node's subscribers (SSE, gRPC) |
+| Log ingester | `valka-engine` | Batches workers' log lines into `logs/` objects |
+
+The engine runs four background loops:
+
+- the **ticker**, every 100 ms: lease expiry, retry promotion, delayed tasks, retention of
+  finished tasks, coalesced heartbeat records;
+- the **feeder**: offers runnable tasks to waiting workers;
+- the **snapshotter**: writes shard snapshots and truncates the log;
+- the **control loop**: membership, placement, guardian duties, garbage collection.
+
+There is no scheduler leader. Each node runs the timers of the shards it owns.
+
+### Crates
 
 | Crate | Purpose |
 |-------|---------|
-| `valka-proto` | Generated gRPC stubs from proto files |
-| `valka-core` | Shared types, configuration, error types, metrics |
-| `valka-db` | PostgreSQL pool, migrations, query modules |
-| `valka-matching` | In-memory matching service + partition tree + TaskReader |
-| `valka-dispatcher` | Worker gRPC stream management, heartbeat, task dispatch |
-| `valka-scheduler` | Lease reaper, retry engine, DLQ, delayed task promotion |
-| `valka-cluster` | chitchat gossip + consistent hash ring + node forwarder |
-| `valka-server` | Binary: assembles all services |
-| `valka-sdk` | Rust worker SDK |
+| `valka-proto` | Generated gRPC stubs from the proto files |
+| `valka-core` | Shared types, configuration, errors, metrics, shard and id helpers |
+| `valka-wal` | Object-store WAL: store wrapper, segment codec, group-commit writer, snapshots, leases, owner records, splits |
+| `valka-engine` | In-RAM shard state machines, the command API, timers, pending index, snapshots, recovery, ownership |
+| `valka-matching` | In-memory matching of tasks to waiting workers |
+| `valka-dispatcher` | Worker stream management, heartbeats, task dispatch, signal delivery, reattach |
+| `valka-cluster` | Internal RPC commands, peer clients, cluster token and mTLS |
+| `valka-server` | The server binary: REST, gRPC, internal listener, routing, admin API |
+| `valka-sdk` | Rust worker and client SDK |
 | `valka-cli` | Command-line interface |
-| `valka-tests` | Unit + integration test suite |
+| `valka-tests` | Unit and integration tests |
 
-<Mermaid chart={`graph LR
-    subgraph Server Binary
-        S[valka-server]
-    end
+## The write path: acked means durable
 
-    subgraph Core Libraries
-        P[valka-proto]
-        C[valka-core]
-        DB[valka-db]
-    end
-
-    subgraph Services
-        M[valka-matching]
-        DI[valka-dispatcher]
-        SC[valka-scheduler]
-        CL[valka-cluster]
-    end
-
-    subgraph Client Tools
-        SDK[valka-sdk]
-        CLI[valka-cli]
-        T[valka-tests]
-    end
-
-    S --> M
-    S --> DI
-    S --> SC
-    S --> CL
-    M --> DB
-    M --> C
-    DI --> DB
-    DI --> P
-    SC --> DB
-    CL --> C
-    SDK --> P
-    CLI --> P
-    T --> S
-
-    style S fill:#1F5B4F,stroke:#3E9F88,color:#fff
-    style DB fill:#9E5A2E,stroke:#C27A48,color:#fff
-    style M fill:#059669,stroke:#10b981,color:#fff
-    style DI fill:#7c3aed,stroke:#8b5cf6,color:#fff
-`} />
-
-## The Hot Path
-
-When a task is created:
-
-1. Task is inserted into PostgreSQL with status `PENDING`
-2. The `MatchingService` checks if any worker is waiting for this queue
-3. If yes: the task is sent via an in-memory oneshot channel directly to the `Dispatcher`, which pushes it over the gRPC stream to the worker. **Zero database polling.**
-4. If no: the task stays `PENDING` in PostgreSQL for the cold path
+Every change goes through one function, `Engine::mutate`: a create, a dispatch, a result, a
+cancel, a signal or a timer firing.
 
 <Mermaid chart={`sequenceDiagram
-    participant C as Client
-    participant API as REST/gRPC API
-    participant PG as PostgreSQL
-    participant MS as MatchingService
-    participant D as Dispatcher
-    participant W as Worker
+    participant C as Caller
+    participant E as Engine
+    participant W as WAL writer
+    participant B as Bucket
 
-    C->>API: CreateTask
-    API->>PG: INSERT task (PENDING)
-    API->>MS: offer_task()
-    alt Worker waiting
-        MS-->>D: oneshot channel
-        D->>W: TaskAssignment (gRPC stream)
-        D->>PG: UPDATE → RUNNING
-        W->>D: TaskResult
-        D->>PG: UPDATE → COMPLETED
-    else No worker waiting
-        Note over MS: Task stays PENDING in PG
-        W->>PG: SELECT FOR UPDATE SKIP LOCKED
-        PG-->>W: Claim task batch
-    end
+    C->>E: command
+    E->>E: lock shard, validate against RAM
+    E->>E: build record, apply it to RAM
+    E->>W: append record
+    E->>E: unlock shard
+    Note over W: buffer up to 50 ms or 4 MB
+    W->>B: PUT segment
+    B-->>W: 200
+    W->>B: conditional GET of own lease
+    B-->>W: still mine
+    W-->>E: durable, in order
+    E->>E: publish events, offer to matching
+    E-->>C: acknowledge
 `} />
 
-## The Cold Path
+- **Apply, then wait.** RAM is updated under the shard lock before the record is durable, so
+  a shard's records are produced in order and RAM is always at or ahead of the durable log.
+  If the PUT never succeeds, the caller is told it failed and the node exits. Its supervisor
+  restarts it, and the bucket is the truth again.
+- **Group commit.** One segment carries every record appended during the window, from all
+  shards. Throughput is bounded by PUT bandwidth, not PUT latency. Up to 4 segments are in
+  flight at once; acknowledgements are still released strictly in order.
+- **The own-lease check.** After each segment PUT, before releasing its acks, the writer does
+  a conditional GET of its own lease. If another node has declared this one dead, or a newer
+  process took the same node id, the check fails, the acks fail, and the node exits. That one
+  request per flush is the whole write fence. It needs no clock, and its cost does not grow
+  with the cluster.
+- **Only durable work is visible to workers.** A task is offered to matching only after its
+  `TaskCreated` record is durable, so a worker never runs a task that could vanish.
+- **Replay is deterministic.** A record whose precondition no longer holds is a no-op.
+  Timers that fire produce their own records (`LeaseExpired`, `TaskPromoted`), so rebuilding
+  a shard never consults the clock.
 
-Workers that have no tasks periodically call the `TaskReader`, which:
+## Life of a task
 
-1. Queries PostgreSQL using `SELECT ... FOR UPDATE SKIP LOCKED`
-2. Claims a batch of `PENDING` tasks atomically
-3. Updates them to `DISPATCHING` and sends them to the worker
+### On one node
 
-`SKIP LOCKED` means multiple workers can poll concurrently without contention.
+<Mermaid chart={`sequenceDiagram
+    participant P as Producer
+    participant N as Node
+    participant W as Worker
 
-## gRPC Bidirectional Streaming
+    P->>N: CreateTask
+    N->>N: pick partition, mint id
+    N->>N: TaskCreated, durable
+    N-->>P: task (PENDING)
+    N->>W: TaskAssignment (a worker was waiting)
+    N->>N: TaskDispatched (async)
+    W->>N: Heartbeat (extends the run lease)
+    W->>N: Checkpoint (optional, acked once durable)
+    W->>N: TaskResult
+    N->>N: RunCompleted, durable
+    N-->>W: ResultAck APPLIED
+`} />
 
-Each worker maintains a **single gRPC bidirectional stream** with the server. Over this stream:
+- If no worker is waiting, the task stays in the shard's **pending index** in RAM (by
+  priority, then age). The feeder offers it as soon as a worker for that queue is free. There
+  is no polling and no database query on this path.
+- A run holds a **lease**, extended by worker heartbeats. If the worker vanishes, the timer
+  fires `LeaseExpired` and the task is retried or dead-lettered.
+- Results are **acknowledged end to end**: `APPLIED`, `STALE` or `RETRY`. SDKs keep a result
+  until it is `APPLIED` or `STALE`, so a result produced while the server restarts is not lost.
 
-- **Server → Worker**: Task assignments, heartbeat pings, signal delivery
-- **Worker → Server**: Task results (success/failure), heartbeat pongs, log entries, signal acknowledgments
+See [Task Lifecycle](/docs/task-lifecycle) for states, retries, signals and checkpoints.
+
+### Across nodes
+
+With three nodes, the producer may talk to node A, the task's shard may be owned by node B,
+and the only free worker may be attached to node C:
+
+<Mermaid chart={`sequenceDiagram
+    participant P as Producer
+    participant A as Node A
+    participant B as Owner B
+    participant C as Node C
+    participant W as Worker on C
+
+    P->>A: CreateTask
+    A->>A: pick partition, owner is B
+    A->>B: Execute CreateTask
+    B->>B: TaskCreated, durable
+    B-->>A: task
+    A-->>P: task (PENDING)
+    C->>B: Fetch emails (long poll)
+    B-->>C: task, reserved for C in RAM
+    C->>B: Dispatch run to worker on C
+    B->>B: TaskDispatched (worker, node C)
+    C->>W: TaskAssignment
+    W->>C: TaskResult
+    C->>B: result
+    B->>B: RunCompleted, durable
+    B-->>C: APPLIED
+    C-->>W: ResultAck APPLIED
+`} />
+
+- A task C fetched but could not hand to a worker goes back. An unused reservation lapses
+  after 30 s.
+- A run B recorded that never reached its worker goes back to `PENDING` with `RunReturned`,
+  without spending an attempt.
+- The owner records which node each run's worker is on, so cancels and signals reach it.
+- Heartbeats are batched per owner. Checkpoints and results are forwarded to the owner and
+  acknowledged once durable.
+- Event subscribers on any node see every node's events through the event relay.
+
+## Worker streams
+
+Each worker keeps **one bidirectional gRPC stream** with one node. Over it:
+
+- **Server to worker:** task assignments, cancellations, signals, heartbeat acks, result acks,
+  and `ServerShutdown` when the node stops.
+- **Worker to server:** the hello (name, queues, concurrency, and the runs it is still
+  executing), results, heartbeats, log batches, signal acks, and `GracefulShutdown`.
 
 <Mermaid chart={`sequenceDiagram
     participant W as Worker
-    participant S as Server
+    participant S as Node
 
     W->>S: Session (open stream)
-    S->>W: Heartbeat Ping
-    W->>S: Heartbeat Pong
-
+    W->>S: WorkerHello (queues, running runs)
     S->>W: TaskAssignment
-    W->>S: LogEntry
-    W->>S: LogEntry
-    W->>S: TaskResult (success)
-
+    W->>S: Heartbeat (every 10 s)
+    S->>W: HeartbeatAck
+    W->>S: LogBatch
     S->>W: TaskSignal
     W->>S: SignalAck
-
-    S->>W: Heartbeat Ping
-    W->>S: Heartbeat Pong
+    W->>S: TaskResult
+    S->>W: ResultAck
 `} />
 
-This eliminates per-task connection overhead and enables real-time communication.
+Step checkpoints use a separate unary call, `WorkerService.Checkpoint`, so a handler can wait
+until its step is durable. See [gRPC API](/docs/grpc-api).
 
-## Scheduler
+## Snapshots, truncation and restart
 
-The scheduler runs as a set of background loops on the server (with PG advisory lock leader election in multi-node deployments):
+The WAL would grow forever unless it is cut. The snapshotter writes each changed shard's whole
+state to the bucket every 60 s, after 50,000 records, or once 64 MiB of log has accumulated
+(the **log budget**), whichever comes first.
 
-- **Lease Reaper**: Detects tasks stuck in `RUNNING` past their lease deadline and moves them to `RETRY` or `DEAD_LETTER`
-- **Retry Engine**: Picks up `RETRY` tasks and re-enqueues them as `PENDING` after the backoff delay
-- **DLQ Mover**: Moves tasks that have exhausted their max retries to `DEAD_LETTER`
-- **Delayed Promoter**: Promotes scheduled tasks to `PENDING` when their `run_at` time arrives
+- A snapshot covers only **durable** records. The shard is captured, then the writer is
+  synced. If that sync fails, nothing is written.
+- Replay skips records at or below the snapshot's sequence number and records of other
+  generations, so it never depends on records being idempotent.
+- **Truncation:** once every shard a node serves has a snapshot pointing past a segment, the
+  segment is deleted. The node first raises a watermark in its lease, then deletes in
+  ascending order.
+- The newest two snapshots per shard are kept.
 
-## Clustering
+**Restart** of a node with the same `VALKA_NODE_ID`: the new process takes its lease with a
+new **incarnation** number, which fences the previous process if it is somehow still running.
+It then splits its previous incarnation's log, which makes its shards claimable at once,
+with no lease timeout to wait out. Alone, it claims them right back. In a cluster, live peers
+claim them immediately, and placement moves its share back once it has been up for the join
+delay (15 s) and the shards have stayed put for the minimum residency (5 min). Restart cost is
+bounded by the log budget: at most 64 MiB of log to read.
 
-Valka supports multi-node deployments via:
+## Many nodes
 
-- **chitchat gossip**: Nodes discover each other and share state over UDP
-- **Consistent hash ring**: Queues are assigned to partitions, partitions to nodes
-- **Node forwarder**: Tasks routed to the wrong node are forwarded to the correct one with circuit breaker protection
+Several nodes share one bucket without any coordination service:
 
-<Mermaid chart={`graph TD
-    subgraph Cluster
-        N1[Node 1<br/>Partitions 0-3]
-        N2[Node 2<br/>Partitions 4-7]
-        N3[Node 3<br/>Partitions 8-11]
-    end
+- **Leases** say who is alive. Each node renews `nodes/{node}/lease` every 2 s. A lease that
+  stops changing for 10 s is declared dead by another node, its **guardian**.
+- **Owner records** say who owns each shard. They change only by compare-and-swap, so two
+  nodes can never both win a shard.
+- **Placement** uses rendezvous hashing over the live nodes. Every node computes the same
+  answer; there is no leader.
+- A dead node's log is **split** once into per-shard snapshots, then its shards are claimed by
+  their new owners.
 
-    N1 <-->|chitchat gossip<br/>UDP| N2
-    N2 <-->|chitchat gossip<br/>UDP| N3
-    N3 <-->|chitchat gossip<br/>UDP| N1
+The full protocol, configuration and operations are on the [Clustering](/docs/clustering) page.
 
-    C[Client] -->|CreateTask<br/>queue: emails| N1
-    N1 -->|Forward<br/>wrong partition| N2
+## Failure handling
 
-    W1[Workers] --> N1
-    W2[Workers] --> N2
-    W3[Workers] --> N3
+| What happens | What the cluster does | What you see |
+|--------------|----------------------|--------------|
+| `kill -9` on a node | After 10 s its guardian tombstones it, splits its log (about 1 s), and the new owners claim its shards | Its shards are unavailable for about 11–15 s (`UNAVAILABLE`, clients retry). Its workers reconnect and reattach. Nothing acknowledged is lost |
+| Node frozen 30 s, then wakes up | Taken over while frozen. On waking, its own-lease check fails: it exits and restarts as a new incarnation | Requests it held fail; clients retry |
+| Node cut off from the bucket | It acknowledges nothing. After 7 s it stops serving; after 10 s it is tombstoned and its shards move | About 15 s of unavailability for its shards |
+| Network split between nodes, bucket reachable | No takeover: leases keep renewing. Forwarding across the split fails | Cross-side requests get `UNAVAILABLE` until it heals |
+| Bucket down for everyone | No acks anywhere; every node stops serving; nobody can tombstone anybody | Full outage, recovers by itself |
+| Node restarts with the same id | The new incarnation fences the old one and splits its own old log at once; peers claim its shards (alone: it claims them itself); its share moves back later | Seconds of unavailability for those shards |
+| `SIGTERM` | With live peers: release every shard with a final snapshot, then exit. Alone: snapshot and keep the shards | Near-zero unavailability |
+| A worker's node dies mid-task | The worker keeps running, reconnects, reattaches; its result is resent | The task completes once |
+| A worker dies mid-task | The run's lease expires; the task is retried | One retry (checkpointed steps are skipped) |
 
-    style N1 fill:#1F5B4F,stroke:#3E9F88,color:#fff
-    style N2 fill:#7c3aed,stroke:#8b5cf6,color:#fff
-    style N3 fill:#9E5A2E,stroke:#C27A48,color:#fff
-`} />
+## Guarantees
 
-## Event Broadcasting
+Guaranteed under every failure above:
 
-All state changes emit events via `tokio::sync::broadcast`. Consumers include:
+- **Acknowledged means durable.** A create, result, cancel, checkpoint or signal that got a
+  success response is in the bucket and survives any node failure.
+- **One history per shard.** Two nodes never write diverging histories of the same shard.
+- **Bounded recovery.** At most 64 MiB of log per node to replay or split.
+- **Failover.** A dead node's shards are served again within about 15 s, as long as some node
+  can reach the bucket.
+- **Exact idempotency.** Two creates with the same idempotency key produce one task.
 
-- **gRPC event streams**: Clients can subscribe to real-time events
-- **SSE endpoint**: Browser-compatible event stream
-- **Web dashboard**: Uses SSE for live updates
+Not guaranteed, by design:
+
+- **Exactly-once execution.** Execution is at-least-once: a task can run twice around
+  failures. Make handlers idempotent, or use steps.
+- **Global ordering.** FIFO holds per queue partition, priority first. Set a queue's partitions
+  to 1 for strict FIFO.
+- **Durable reads.** Reads are served from RAM and can show a write whose acknowledgement is
+  still in flight.
+- **Low-latency acks.** An acknowledgement waits for an object-store PUT.
+
+## Event broadcasting
+
+Every state change emits a task event on a `tokio::sync::broadcast` channel. Each node also
+relays the events of every other live node, so a subscriber on any node sees the whole
+cluster. Consumers:
+
+- **gRPC event streams**: `ApiService.SubscribeEvents`
+- **SSE endpoint**: `GET /api/v1/events`
+- **Web dashboard**: uses SSE for live updates

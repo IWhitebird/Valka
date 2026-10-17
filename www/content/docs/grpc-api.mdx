@@ -5,6 +5,21 @@ description: gRPC service definitions and streaming protocols.
 
 Valka's gRPC API runs on port `50051` by default. Proto files are at `proto/valka/v1/`.
 
+Every node serves `ApiService` and `WorkerService`. In a cluster, a call about a task is
+forwarded to the node that owns the task's shard, and a worker connected to any node can run
+tasks owned by any node.
+
+## Status Codes
+
+| Code | When |
+|------|------|
+| `NOT_FOUND` | Unknown task |
+| `INVALID_ARGUMENT` | Missing or invalid field |
+| `ALREADY_EXISTS` | The idempotency key is already used |
+| `FAILED_PRECONDITION` | The task is in the wrong state for the call (e.g. cancelling a finished task) |
+| `UNAVAILABLE` | The shard is moving, its owner is unreachable, or the bucket is failing. Retry |
+| `INTERNAL` | Server error |
+
 ## ApiService
 
 The main client-facing API for task management.
@@ -85,7 +100,7 @@ A single `Session` stream carries all communication between a worker and the ser
 
 | Message | When Sent | Description |
 |---------|-----------|-------------|
-| `WorkerHello` | On connect | Worker name, queues, concurrency |
+| `WorkerHello` | On connect | Worker name, queues, concurrency, and the runs it is still executing (`running`), so they are reattached after a reconnect |
 | `TaskResult` | Task done | Success/failure with output/error; resent until a `ResultAck` says APPLIED or STALE |
 | `Heartbeat` | Every 10s | IDs of tasks running or awaiting a result ack, for lease extension |
 | `LogBatch` | During task | Structured log entries |
@@ -97,7 +112,7 @@ A single `Session` stream carries all communication between a worker and the ser
 | Message | When Sent | Description |
 |---------|-----------|-------------|
 | `TaskAssignment` | Task matched | New task to execute, with checkpoints from earlier attempts |
-| `TaskCancellation` | Cancel request | Cancel a running task |
+| `TaskCancellation` | Cancel request | Cancel a running task. Also sent for a run in the hello that has already ended |
 | `HeartbeatAck` | After heartbeat | Confirms heartbeat received |
 | `ServerShutdown` | Server stopping | The stream is about to close; the worker reconnects with backoff |
 | `TaskSignal` | Signal sent | Real-time signal for a task |
@@ -135,18 +150,43 @@ is durable. Every later `TaskAssignment` for the task carries its checkpoints
 an earlier attempt completed. Limits: step names up to 256 bytes, outputs up to 256 KiB of
 JSON, at most 256 distinct steps per task.
 
+### Reconnect and reattach
+
+`WorkerHello.running` lists the runs a reconnecting worker is still executing:
+
+```protobuf
+message RunningTask {
+    string task_id = 1;
+    string task_run_id = 2;
+    int32 attempt_number = 3;
+}
+```
+
+For each one, the task's owner reattaches the run to the new connection, adopts it if its
+dispatch record was lost in a crash, or answers with a `TaskCancellation` if the run is stale.
+The worker also resends every result not yet acknowledged.
+
 ## InternalService
 
-Used for inter-node communication in clustered deployments.
+Node-to-node calls in a cluster, on the internal listener (`cluster.internal_addr`, default
+`:50052`). Every call carries the cluster token (`authorization: Bearer <token>`), optionally
+over mTLS. This service is not for clients; never expose its port publicly.
 
 ```protobuf
 service InternalService {
-    rpc ForwardTask(ForwardTaskRequest) returns (ForwardTaskResponse);
-    rpc RelayLogs(RelayLogsRequest) returns (stream LogEntry);
-    rpc ForwardEvent(ForwardEventRequest) returns (ForwardEventResponse);
+    // Run an id-routed command on the node that owns its shard.
+    rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+    // Answer a cluster-wide query from this node's shards only (list, count, stats).
+    rpc Scatter(ScatterRequest) returns (ScatterResponse);
+    // This node's task events, for nodes whose subscribers want the whole cluster's stream.
+    rpc Events(EventsRequest) returns (stream TaskEvent);
+    // Health and identity.
     rpc Ping(PingRequest) returns (PingResponse);
 }
 ```
+
+A node that does not own the shard of an `Execute` command answers `NOT_OWNER` with a hint of
+the owner it knows; the caller retries there.
 
 ## Common Types
 
@@ -165,6 +205,9 @@ enum TaskStatus {
     TASK_STATUS_CANCELLED = 8;
 }
 ```
+
+`TASK_STATUS_DISPATCHING` is kept for compatibility but never used: a dispatched task is
+`RUNNING`.
 
 ### LogLevel
 

@@ -5,21 +5,22 @@ description: Understanding task states, transitions, retries, and signals.
 
 ## Task States
 
-Every task in Valka moves through a well-defined state machine:
+Every task in Valka moves through a well-defined state machine. Each arrow is a record in the
+write-ahead log (`TaskCreated`, `TaskDispatched`, `RunCompleted`, `RunFailed`, `LeaseExpired`,
+`TaskPromoted`, `TaskCancelled`, ...), so a task's state survives any node failure.
 
 <Mermaid chart={`stateDiagram-v2
-    [*] --> PENDING: Task Created
-    PENDING --> DISPATCHING: Worker matched
-    DISPATCHING --> RUNNING: Worker confirmed
+    [*] --> PENDING: Task created
+    PENDING --> RUNNING: Dispatched to a worker
+    RUNNING --> PENDING: Run never reached its worker
     RUNNING --> COMPLETED: Success
-    RUNNING --> FAILED: Unrecoverable error
-    RUNNING --> RETRY: Retryable error
-
+    RUNNING --> FAILED: Non-retryable error
+    RUNNING --> RETRY: Retryable error or lease expired
+    RUNNING --> DEAD_LETTER: Out of attempts
     RETRY --> PENDING: Backoff elapsed
-    RETRY --> DEAD_LETTER: Max retries exhausted
 
     PENDING --> CANCELLED: Cancel API
-    DISPATCHING --> CANCELLED: Cancel API
+    RETRY --> CANCELLED: Cancel API
     RUNNING --> CANCELLED: Cancel API
 
     COMPLETED --> [*]
@@ -32,82 +33,96 @@ Every task in Valka moves through a well-defined state machine:
 
 | State | Description |
 |-------|-------------|
-| `PENDING` | Task is waiting to be picked up by a worker |
-| `DISPATCHING` | Task has been claimed and is being sent to a worker |
-| `RUNNING` | Worker is actively processing the task |
+| `PENDING` | Waiting for a worker. A scheduled task is `PENDING` but not dispatched before its time |
+| `RUNNING` | A worker is processing the task. The run holds a lease |
 | `COMPLETED` | Task finished successfully |
-| `FAILED` | Task failed with an unrecoverable error |
-| `RETRY` | Task failed but has retries remaining |
-| `DEAD_LETTER` | Task exhausted all retries |
+| `FAILED` | Task failed with a non-retryable error |
+| `RETRY` | Task failed (or its lease expired) and has attempts left. It returns to `PENDING` after a backoff |
+| `DEAD_LETTER` | Task used all its attempts |
 | `CANCELLED` | Task was cancelled via the API |
+
+A task can be cancelled from any non-terminal state: `PENDING`, `RETRY` or `RUNNING`.
+
+A run that the owner recorded but that never reached its worker (the worker vanished, or its node
+could not deliver the assignment) goes back to `PENDING` without spending an attempt.
+
+The protobuf `TaskStatus` enum still has a `DISPATCHING` value, but no task is ever stored in that
+state: a dispatched task is `RUNNING`.
 
 ## Retries
 
-When a task handler returns an error, Valka automatically retries with exponential backoff:
+When a task handler returns an error, Valka retries it with exponential backoff:
 
-- **Default max retries**: 3
-- **Backoff formula**: `base_delay * 2^attempt` (with jitter)
-- **Base delay**: 1 second
+- **Attempts**: `max_retries` (default 3) caps the attempts. When the attempt number reaches
+  `max_retries`, the next failure moves the task to `DEAD_LETTER`.
+- **Backoff**: the delay after attempt `n` fails is `retry_base_delay_secs × 2^n`, capped at
+  `retry_max_delay_secs`. With the defaults (1 s and 3600 s) that is 2 s, 4 s, 8 s, ...
+- **Non-retryable errors**: a handler can report its error as not retryable. The task then
+  becomes `FAILED` at once, unless it was already on its last attempt (then `DEAD_LETTER`). In
+  the Go, TypeScript and Python SDKs, fail with a `HandlerError` whose `retryable` is false; the
+  Rust SDK treats every handler error as retryable.
 
 <Mermaid chart={`sequenceDiagram
     participant W as Worker
-    participant S as Server
-    participant PG as PostgreSQL
+    participant O as Owner node
+    participant B as Bucket
 
-    W->>S: TaskResult (error)
-    S->>PG: UPDATE status = RETRY, attempt + 1
+    W->>O: TaskResult (retryable error)
+    O->>B: RunFailed (RETRY, next attempt at now + backoff)
+    O-->>W: ResultAck APPLIED
 
-    Note over S: Backoff: 1s × 2^attempt
+    Note over O: Timer fires when the backoff elapses
+    O->>B: TaskPromoted (PENDING)
 
-    rect rgb(40, 40, 40)
-        Note over S,PG: Scheduler (retry engine)
-        S->>PG: Check RETRY tasks where backoff elapsed
-        PG-->>S: task_id
-        S->>PG: UPDATE status = PENDING
-    end
-
-    S->>W: TaskAssignment (retry)
-    W->>S: TaskResult (success)
-    S->>PG: UPDATE status = COMPLETED
+    O->>W: TaskAssignment (attempt 2)
+    W->>O: TaskResult (success)
+    O->>B: RunCompleted (COMPLETED)
+    O-->>W: ResultAck APPLIED
 `} />
 
-Tasks in `RETRY` state are picked up by the scheduler's retry engine and re-enqueued as `PENDING` after the backoff delay has elapsed.
+Retry timers run on the node that owns the task's shard, checked every 100 ms. They are not
+stored separately: after a restart or a takeover they are rebuilt from the tasks' state.
 
 ### Dead Letter Queue
 
-When a task exhausts all retries, it moves to `DEAD_LETTER` status and is recorded in the `dead_letter_queue` table. Dead letter tasks can be:
+When a task exhausts its attempts, it moves to `DEAD_LETTER` and gets a dead-letter entry in its
+shard. Dead letter tasks can be:
 
-- Inspected via the REST API or dashboard
+- Inspected via the REST API (`GET /api/v1/dead-letters`) or the dashboard
 - Replayed manually by creating a new task with the same input
 
 ## Lease Management
 
-When a task moves to `RUNNING`, it gets a lease: its timeout plus a 30 s grace. Workers
-heartbeat every 10 s; each heartbeat extends the lease to 60 s from now.
+When a task moves to `RUNNING`, its run gets a lease: the task's timeout plus a 30 s grace.
+Workers heartbeat every 10 s, and each heartbeat keeps the lease at least 60 s ahead.
 
 If a worker crashes or disconnects:
-1. The engine's timer fires when the lease expires (checked every 100 ms)
-2. The task moves to `RETRY` (if retries remain) or `DEAD_LETTER`
+1. The owner's timer fires when the lease expires (checked every 100 ms)
+2. The task moves to `RETRY` (if attempts remain) or `DEAD_LETTER`
 3. Another worker can pick up the retried task
 
 <Mermaid chart={`sequenceDiagram
     participant W as Worker
-    participant S as Server
+    participant S as Owner node
 
-    S->>W: TaskAssignment (lease: timeout + 30s)
+    S->>W: TaskAssignment (lease: timeout + 30 s)
 
-    loop Every 10s
+    loop Every 10 s
         W->>S: Heartbeat
-        S->>S: Extend lease to now + 60s
+        S->>S: Lease at least now + 60 s
     end
 
     Note over W: Worker crashes!
 
     Note over S: Lease timer fires
-    S->>S: LeaseExpired → RETRY or DEAD_LETTER
+    S->>S: LeaseExpired, RETRY or DEAD_LETTER
 
     Note over S: Task available for another worker
 `} />
+
+If the worker's **node** dies instead, the worker keeps running the task, reconnects and
+reattaches it, so the task is not retried. After a takeover, recovered `RUNNING` tasks get a 60 s
+grace lease so their workers have time to reconnect.
 
 ## Result Delivery
 
@@ -119,6 +134,9 @@ STALE and keep heartbeating the task meanwhile, so:
 - a result is never lost because the server was busy, restarting, or briefly unreachable;
 - a task whose handler finished during a server restart completes once, without re-running;
 - sending the same result twice is harmless.
+
+In a cluster, the worker's node forwards the result to the task's owner, wherever it is, and
+relays the acknowledgement back.
 
 ## Step Checkpoints
 
@@ -148,18 +166,20 @@ Signals allow you to send real-time messages to running tasks. This is useful fo
 
 <Mermaid chart={`sequenceDiagram
     participant C as Client
-    participant API as REST API
-    participant PG as PostgreSQL
-    participant D as Dispatcher
+    participant A as Any node
+    participant O as Owner node
+    participant D as Worker node
     participant W as Worker
 
-    C->>API: POST /tasks/:id/signal
-    API->>PG: INSERT signal (PENDING)
-    API->>D: Deliver signal
+    C->>A: POST /tasks/:id/signal
+    A->>O: forward to the shard owner
+    O->>O: SignalCreated (PENDING), durable
+    O->>D: deliver to the run's node
     D->>W: TaskSignal (gRPC stream)
-    D->>PG: UPDATE signal → DELIVERED
+    O->>O: SignalDelivered (DELIVERED)
     W->>D: SignalAck
-    D->>PG: UPDATE signal → ACKNOWLEDGED
+    D->>O: ack
+    O->>O: SignalAcked (ACKNOWLEDGED)
 `} />
 
 ### Signal States
@@ -167,49 +187,56 @@ Signals allow you to send real-time messages to running tasks. This is useful fo
 | State | Description |
 |-------|-------------|
 | `PENDING` | Signal created, waiting for delivery |
-| `DELIVERED` | Signal sent to the worker over gRPC stream |
+| `DELIVERED` | Signal sent to the worker over its gRPC stream |
 | `ACKNOWLEDGED` | Worker confirmed receipt |
 
-If a worker disconnects before acknowledging, unacknowledged signals reset to `PENDING` for redelivery when the task is retried.
+A signal can be sent to any non-terminal task. A signal sent before the task runs is delivered
+when its run starts. If a worker disconnects before acknowledging, unacknowledged signals reset to
+`PENDING` for redelivery.
 
 ### Sending a Signal
 
 ```bash
 curl -X POST http://localhost:8989/api/v1/tasks/{task_id}/signal \
   -H "Content-Type: application/json" \
-  -d '{"signal_type": "progress_request", "payload": {}}'
+  -d '{"signal_name": "progress_request", "payload": {}}'
 ```
 
 ## Scheduled Tasks
 
-Tasks can be created with a `run_at` timestamp for delayed execution:
+Tasks can be created with a `scheduled_at` timestamp (RFC 3339) for delayed execution:
 
 ```bash
 curl -X POST http://localhost:8989/api/v1/tasks \
   -H "Content-Type: application/json" \
   -d '{
     "task_name": "send-reminder",
-    "queue": "emails",
+    "queue_name": "emails",
     "input": {"to": "user@example.com"},
-    "run_at": "2025-01-15T10:00:00Z"
+    "scheduled_at": "2026-01-15T10:00:00Z"
   }'
 ```
 
-The task stays in `PENDING` state but is not eligible for dispatch until the scheduled time. The scheduler's **delayed promoter** handles the timing.
+The task stays in `PENDING` state but is not eligible for dispatch until the scheduled time. The
+owner's timer then promotes it (`TaskPromoted`) and it is offered to workers.
 
 ## Idempotency
 
-Tasks support idempotency keys to prevent duplicate execution:
+Tasks support idempotency keys to prevent duplicates:
 
 ```bash
 curl -X POST http://localhost:8989/api/v1/tasks \
   -H "Content-Type: application/json" \
   -d '{
     "task_name": "charge-payment",
-    "queue": "payments",
+    "queue_name": "payments",
     "input": {"order_id": "abc-123", "amount": 99.99},
     "idempotency_key": "payment-abc-123"
   }'
 ```
 
-If a task with the same idempotency key already exists, the existing task is returned instead of creating a duplicate.
+If a task with the same idempotency key already exists, the create is rejected with `409 CONFLICT`
+(gRPC `ALREADY_EXISTS`) and no second task is made. A key always maps to the same queue partition,
+so this holds on every node of a cluster, and also after the queue's partition count changes. A
+key is remembered as long as its task is held in RAM: while it is live, and for
+`completed_retention_secs` (24 h by default) after it finishes.

@@ -4,7 +4,7 @@
 
 Valka is a polyglot distributed task queue built entirely in Rust. Only external dependency: an S3-compatible bucket (or a local directory in dev). No database, no NATS, no Redis, no RabbitMQ.
 
-**Architecture (branch `wal`):** a write-ahead log on object storage is the only truth. Every mutation is validated against in-RAM shard state, applied, appended to a group-committed WAL segment, and acknowledged only once the segment is in the bucket. gRPC bidirectional streaming for worker communication, in-memory matching service with partition trees for task routing, tokio::sync::broadcast for event fan-out. Full spec: `docs/wal/DESIGN.md`, plan: `docs/wal/PLAN.md`.
+**Architecture (branch `wal`):** a write-ahead log on object storage is the only truth. Every mutation is validated against in-RAM shard state, applied, appended to a group-committed WAL segment, and acknowledged only once the segment is in the bucket. Any number of nodes share one bucket: each shard has one owner (owner records moved by CAS, node leases, an own-lease check after every segment PUT), any node takes any request and forwards it to the owner, and workers on any node run tasks owned by any node. gRPC bidirectional streaming for worker communication, in-memory matching service, tokio::sync::broadcast for event fan-out. Start here: `docs/ARCHITECTURE.md` (readable overview). Specs: `docs/wal/DESIGN.md` (one node), `docs/wal/PHASE2.md` (many nodes); plan: `docs/wal/PLAN.md`; operations: `docs/wal/RUNBOOKS.md`.
 
 ## Quick Start
 
@@ -13,6 +13,9 @@ Valka is a polyglot distributed task queue built entirely in Rust. Only external
 cargo run -p valka-server
 
 # Or against MinIO: docker compose up -d minio minio-init, then set VALKA_STORAGE__* (see README)
+
+# Or a 3-node cluster (REST :8981-8983, gRPC :50061-50063): docker compose -f docker-compose.cluster.yml up -d --build
+# Chaos test against it: scripts/chaos.sh (DURATION=seconds, NO_BUILD=1)
 
 # In another terminal, run the example worker
 cargo run -p valka-examples --example worker
@@ -42,11 +45,11 @@ cargo fmt --check                # Format check
 | `valka-engine` | 4096 in-RAM shard state machines, command API (`Engine`), timer wheel (leases/retries/delayed), pending index + feeder, snapshotter + WAL truncation, recovery |
 | `valka-matching` | In-memory matching service + partition tree + `MatchingSink` (engine → matching adapter) |
 | `valka-dispatcher` | Worker gRPC stream management, heartbeat, task dispatch, signal delivery |
-| `valka-cluster` | chitchat gossip + consistent hash ring + node forwarder (multi-node ownership: phase 2) |
-| `valka-server` | Binary: assembles all services (gRPC + REST + engine + log ingester) |
+| `valka-cluster` | Node-to-node layer: internal RPC commands/queries (`rpc.rs`), peer clients with circuit breaker (`peer.rs`), cluster token + mTLS (`security.rs`) |
+| `valka-server` | Binary: assembles all services (gRPC + REST + internal listener + engine + log ingester); `api.rs` routes every request (local / forward / scatter), `feeder.rs` remote fetching, `relay.rs` cluster events, `admin.rs` admin API |
 | `valka-sdk` | Rust worker SDK: ValkaClient (task CRUD) + ValkaWorker (builder pattern, stream) |
 | `valka-cli` | CLI: `valka task create/get/list/cancel`, `valka logs tail` |
-| `valka-tests` | Unit + integration test suite (266 tests, plus MinIO-gated) |
+| `valka-tests` | Unit + integration test suite (253 tests, incl. 3-node clusters over real localhost gRPC, plus MinIO-gated) |
 | `examples/rs` | Rust examples (producer, worker, full_lifecycle, signal_demo, steps) |
 
 ## SDKs
@@ -76,7 +79,10 @@ Every write goes through `Engine::mutate`: lock the shard, validate against RAM,
 Envelopes carry a per-shard `shard_seq` and the shard's ownership generation `gen`; snapshots store the last applied `shard_seq`. Replay skips records at or below it and records of other generations, so snapshots never rely on idempotency. After a snapshot round the node raises its lease's `trunc` watermark, then deletes its own segments below every dirty shard's `dirty_since_lsn` (and below the durable LSN), ascending.
 
 ### Ownership (docs/wal/PHASE2.md)
-One code path for one node or many. Start = lease CAS (`inc + 1`, fences the previous run of the node id) → split the node's own unsplit incarnations → placement claims shards. Claim: owner record CAS to `gen + 1` (allowed if missing, released, or its incarnation is dead *and* split) → load newest snapshot → acquisition snapshot pointing into my log → Serving. Release: Releasing → sync → final snapshot → CAS released. A guardian tombstones a lease unchanged for `lease_timeout` (its own clock) and splits the dead log (`valka-engine/src/ownership.rs`, `cluster.rs`). Every segment PUT is followed by a conditional GET of the node's own lease before acks are released. Multi-node tests: `valka-engine/src/cluster_tests.rs`.
+One code path for one node or many. Start = lease CAS (`inc + 1`, fences the previous run of the node id) → split the node's own unsplit incarnations → placement claims shards. Claim: owner record CAS to `gen + 1` (allowed if missing, released, or its incarnation is dead *and* split) → load newest snapshot → acquisition snapshot pointing into my log → Serving. Release: Releasing → sync → final snapshot → CAS released. A guardian tombstones a lease unchanged for `lease_timeout` (its own clock) and splits the dead log (`valka-engine/src/ownership.rs`, `cluster.rs`). Every segment PUT is followed by a conditional GET of the node's own lease before acks are released. Membership is a LIST of `nodes/` every 3 s (ETag ageing by the observer's own clock); no gossip. Placement is rendezvous hashing over eligible nodes plus operator pins (`placement.json`). A claim that may have passed its CAS but failed is "stranded" and retried by its claimer. Multi-node tests: `valka-engine/src/cluster_tests.rs`, `safety_tests.rs` (TLA+ findings), `sim_tests.rs` (randomized, history checker; `VALKA_SIM_SEEDS=N`). TLA+ model: `spec/tla/`.
+
+### Requests and workers across nodes (PHASE2 §9–§11)
+Queues have partitions (`queues/{hh}/{queue}`, default 16); keyed creates use `jump_hash(key, P)`, unkeyed prefer a local partition. Every REST/gRPC call goes through `valka_server::api::Api`: id-routed commands run on the shard owner (`InternalService.Execute`, JSON `valka_cluster::Command`, NOT_OWNER hints, owner-record fallback); lists/stats are scattered (`X-Valka-Partial`). Workers: idle workers' nodes long-poll owners (`Command::Fetch`, RAM reservation, 30 s TTL), dispatch is recorded by the owner (`Command::Dispatch`, idempotent on the run id), an undelivered run goes back with `RunReturned` (no attempt spent). The dispatcher's `TaskRouter` sends results/heartbeats/checkpoints/signal acks to owners; cancels and signals go to the run's node. Reconnecting workers send `WorkerHello.running`: Reattached / Adopted / Stale. Internal calls need `VALKA_CLUSTER__TOKEN` (constant-time), mTLS optional.
 
 ### Time in tests
 `TokioClock` derives wall time from tokio's instant, so `#[tokio::test(start_paused = true)]` + `tokio::time::advance` moves leases, retries and timestamps deterministically. `FaultyStore` (valka-wal) injects latency, errors, lost PUT acks and freezes.
@@ -124,9 +130,13 @@ Layered via figment: defaults → `valka.toml` → env vars (VALKA_ prefix).
 Key env vars:
 - `VALKA_STORAGE__BACKEND` — `local` (default, `./data`), `s3`, or `memory`
 - `VALKA_STORAGE__BUCKET` / `VALKA_STORAGE__ENDPOINT` / `VALKA_STORAGE__ALLOW_HTTP` — S3 settings (MinIO: `http://localhost:9000`, allow_http)
-- `VALKA_NODE_ID` — stable node id (default: the host name); a restarted node reclaims its own shards at once
+- `VALKA_NODE_ID` — stable node id (default: the host name); a restarted node splits its previous incarnation's log at start, so its shards are claimable at once (alone it reclaims them; in a cluster peers take them and placement moves them back after `join_delay` + `min_residency`)
 - `VALKA_CLUSTER__NUM_SHARDS` — shard count of a new bucket (default 4096; tests use 256)
 - `VALKA_CLUSTER__ENABLED` / `VALKA_CLUSTER__TOKEN` — allow several nodes on one bucket (S3 only)
+- `VALKA_CLUSTER__INTERNAL_ADDR` (default `0.0.0.0:50052`) / `VALKA_CLUSTER__ADVERTISE_{INTERNAL,GRPC,HTTP}_ADDR` — node-to-node listener and the addresses peers/clients use
+- `VALKA_CLUSTER__TLS_{CERT,KEY,CA}` — optional mTLS for internal traffic
+- `VALKA_CLUSTER__LEASE_TIMEOUT_MS` (10000), `JOIN_DELAY_MS` (15000), `MIN_RESIDENCY_SECS` (300), ... — see `docs/ARCHITECTURE.md` §12
+- `VALKA_ADMIN_TOKEN` — enables the admin API (drain, move/pin shard, partitions, audit) behind `Authorization: Bearer`
 - `VALKA_WAL__FLUSH_INTERVAL_MS` — group-commit window (default 50)
 - `VALKA_GRPC_ADDR` — gRPC listen address (default `0.0.0.0:50051`)
 - `VALKA_HTTP_ADDR` — REST/HTTP listen address (default `0.0.0.0:8989`)
@@ -142,6 +152,9 @@ wal/{node}/{inc:010}-{seq:016}.seg             WAL segments (v2 header + CRC-fra
 snapshots/{hh}/{shard}/{gen}-{seq}-{ptr}.snap  per-shard snapshots; ptr = node.inc.seq | final | split
 splits/{node}/{inc}                            "this dead incarnation's log is split"
 logs/{hh}/{run_id}/{uuidv7}.log                task log chunks
+queues/{hh}/{queue}                            partition count; CAS'd by admin changes
+placement.json                                 operator shard pins
+admin/{ts}-{id}.json                           admin audit records
 ```
 `object_store` lists by path segment: LIST prefixes must end at a `/`.
 Dev default is `./data` via the `local` backend. MinIO for S3 semantics: `docker compose up -d minio minio-init`.
@@ -150,9 +163,11 @@ Dev default is `./data` via the `local` backend. MinIO for S3 semantics: `docker
 
 ```bash
 cargo test --workspace                                   # everything, no external services
-cargo test -p valka-wal                                  # 37: store, codec, writer under faults, snapshots, leases, owners, split/seal
-cargo test -p valka-engine                               # 50: lifecycle, timers (paused time), recovery, checkpoints, results, log budget, crash/replay proptest, multi-node takeover
-cargo test -p valka-tests                                # 266: unit + REST + lifecycle + dispatcher + gRPC e2e with the SDK, server exit
+cargo test -p valka-wal                                  # 39: store, codec, writer under faults, snapshots, leases, owners, split/seal
+cargo test -p valka-engine                               # 62: lifecycle, timers (paused time), recovery, checkpoints, results, log budget, crash/replay proptest, multi-node takeover/drain/fencing, TLA+ regressions, randomized simulation
+cargo test -p valka-tests                                # 253: unit + REST + lifecycle + dispatcher + gRPC e2e with the SDK, server exit, 3-node routing/workers/admin/mTLS
+VALKA_SIM_SEEDS=200 cargo test -p valka-engine randomized_cluster   # more simulation seeds
+scripts/chaos.sh                                         # chaos on the 3-node compose cluster (docker)
 VALKA_TEST_S3_ENDPOINT=http://localhost:9000 AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
   cargo test -p valka-tests --features minio minio_    # real S3: CAS, self-test, two-node takeover (bucket valka-test)
 ```

@@ -1,9 +1,26 @@
 ---
 title: REST API
-description: Complete REST API reference for task management, signals, and monitoring.
+description: Complete REST API reference for task management, signals, monitoring, the cluster and the admin API.
 ---
 
 The Valka REST API runs on port `8989` by default. All endpoints return JSON.
+
+In a cluster, **every node serves the whole API**. A request about one task is forwarded to the
+node that owns the task's shard; a list is gathered from every live node and merged. You can
+send any request to any node.
+
+### Partial answers
+
+Endpoints that gather from every node (`GET /api/v1/tasks`, `DELETE /api/v1/tasks`,
+`GET /api/v1/workers`, `GET /api/v1/dead-letters`) set the `X-Valka-Partial` response header:
+
+```
+X-Valka-Partial: false
+X-Valka-Partial: true; missing=valka-2
+```
+
+`true` means some live node did not answer in time, and the list is missing its part. Retry, or
+check the [cluster](#cluster).
 
 ## Tasks
 
@@ -33,11 +50,13 @@ POST /api/v1/tasks
 | `task_name` | string | Yes | - | Human-readable task identifier |
 | `input` | JSON | No | `null` | Task payload (any valid JSON) |
 | `priority` | integer | No | `0` | Higher = higher priority |
-| `max_retries` | integer | No | `3` | Max retry attempts |
+| `max_retries` | integer | No | `3` | Attempt limit: a failure on this attempt dead-letters the task |
 | `timeout_seconds` | integer | No | `300` | Lease timeout per attempt |
 | `idempotency_key` | string | No | `null` | Prevents duplicate tasks |
-| `metadata` | JSON | No | `null` | Arbitrary metadata |
+| `metadata` | JSON | No | `{}` | Arbitrary metadata |
 | `scheduled_at` | RFC 3339 | No | `null` | Delayed execution time |
+
+The response is sent once the task is durable in the bucket.
 
 **Response** `201 Created`:
 
@@ -56,6 +75,8 @@ POST /api/v1/tasks
 }
 ```
 
+A create whose `idempotency_key` is already taken returns `409 CONFLICT`.
+
 ### Get a Task
 
 ```bash
@@ -73,9 +94,12 @@ GET /api/v1/tasks?queue_name=emails&status=RUNNING&limit=50&offset=0
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `queue_name` | string | - | Filter by queue |
-| `status` | string | - | Filter by status |
-| `limit` | integer | `50` | Max results |
+| `status` | string | - | Filter by status: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`, `RETRY`, `DEAD_LETTER`, `CANCELLED` |
+| `limit` | integer | `50` | Max results (1–1000) |
 | `offset` | integer | `0` | Pagination offset |
+
+Newest first. Lists are served from RAM: finished tasks are listed for
+`completed_retention_secs` (24 h by default) after they end.
 
 ### Cancel a Task
 
@@ -83,7 +107,8 @@ GET /api/v1/tasks?queue_name=emails&status=RUNNING&limit=50&offset=0
 POST /api/v1/tasks/{task_id}/cancel
 ```
 
-Cancels a task in `PENDING`, `DISPATCHING`, or `RUNNING` state.
+Cancels a task in any non-terminal state: `PENDING`, `RETRY` or `RUNNING`. A running task's
+worker receives a cancellation. Returns `422 INVALID_STATE` for an unknown or finished task.
 
 ### Delete a Task
 
@@ -91,13 +116,15 @@ Cancels a task in `PENDING`, `DISPATCHING`, or `RUNNING` state.
 DELETE /api/v1/tasks/{task_id}
 ```
 
+Returns `{ "deleted": true }`, or `404` for an unknown task.
+
 ### Clear All Tasks
 
 ```bash
 DELETE /api/v1/tasks
 ```
 
-Returns `{ "deleted_count": 42 }`.
+Returns `{ "deleted_count": 42 }`. Runs on every node.
 
 ## Signals
 
@@ -123,6 +150,9 @@ POST /api/v1/tasks/{task_id}/signal
 }
 ```
 
+A signal can be sent to any non-terminal task. `delivered` is `false` when the task has no
+running worker to hand it to yet; the signal stays `PENDING` and is delivered when a run starts.
+
 ### List Signals
 
 ```bash
@@ -137,7 +167,8 @@ GET /api/v1/tasks/{task_id}/signals?status=PENDING
 GET /api/v1/tasks/{task_id}/runs
 ```
 
-Returns all execution attempts with worker info, timing, and output.
+Returns all execution attempts with worker info (`worker_id`, `assigned_node_id`), lease,
+timing, and output.
 
 ### Get Run Logs
 
@@ -178,10 +209,13 @@ task.
 GET /api/v1/workers
 ```
 
+Every connected worker on every node.
+
 ```json
 [
   {
     "id": "01912345-...",
+    "node_id": "valka-1",
     "name": "email-worker",
     "queues": ["emails"],
     "concurrency": 8,
@@ -209,12 +243,240 @@ GET /api/v1/dead-letters?queue_name=emails&limit=50&offset=0
 GET /api/v1/events
 ```
 
-Server-Sent Events stream. Each event:
+Server-Sent Events stream of task status changes. Every node relays the other nodes' events, so
+one subscription sees the whole cluster. Each event:
 
 ```
-event: task_event
-data: {"event_id":"...","task_id":"...","queue_name":"emails","new_status":"COMPLETED","timestamp_ms":1705312800000}
+data: {"event_id":"...","task_id":"...","queue_name":"emails","new_status":4,"timestamp_ms":1705312800000}
 ```
+
+`new_status` is the numeric `TaskStatus` value from the [gRPC API](/docs/grpc-api#taskstatus)
+(`4` is `COMPLETED`).
+
+## Cluster
+
+Read-only views of nodes, shards and storage. They need no token.
+
+### Overview
+
+```bash
+GET /api/v1/cluster
+```
+
+Every node with its stats, plus nodes known only from their lease (dead, suspect or not
+answering), and an overall health verdict.
+
+```json
+{
+  "cluster_id": "0199...",
+  "this_node": "valka-1",
+  "clustered": true,
+  "num_shards": 4096,
+  "health": {
+    "status": "ok",
+    "unowned_shards": 0,
+    "poisoned_nodes": [],
+    "suspect_nodes": [],
+    "partial": false
+  },
+  "nodes": [
+    {
+      "node_id": "valka-1",
+      "inc": 3,
+      "status": "alive",
+      "lease_age_ms": 812,
+      "shards_owned": 1365,
+      "tasks": { "pending": 3, "running": 8, "retry": 0, "completed": 120, "failed": 0, "dead_letter": 1, "cancelled": 0, "total": 132 },
+      "workers_connected": 2,
+      "wal": { "inc": 3, "durable_lsn": "3:1840", "next_lsn": "3:1841", "unflushed_records": 0, "oldest_unacked_ms": null, "poisoned": null },
+      "eligible": true
+    }
+  ]
+}
+```
+
+Node entries also carry addresses, version, start time, storage backend, queues and snapshot
+stats (trimmed above). `health.status` is `ok`, `degraded` (unowned shards, suspect nodes, or a
+partial answer) or `critical` (a poisoned or self-fenced node). Node `status` is one of `alive`, `draining`,
+`fenced`, `poisoned` for nodes that answered, and `suspect`, `dead`, `draining`, `alive` or
+`unknown` for nodes known only from their lease. `unowned_shards` is `null` when the answer is
+partial.
+
+### Members
+
+```bash
+GET /api/v1/cluster/members
+```
+
+This node's view of membership, straight from the leases in the bucket: every node id ever seen,
+with `inc`, `status`, `state` (`alive`, `draining`, `dead`), `live`, `suspect`, `eligible`,
+`lease_age_ms`, addresses, `version`, `protocol`, `started_at`, `unsplit` (earlier
+incarnations whose log is not split yet) and `dead_by` (for a dead lease: the guardian that
+tombstoned it, or the node itself after a clean exit).
+
+### Shards
+
+```bash
+GET /api/v1/cluster/shards?node=valka-2&dirty=true&min_tasks=1
+```
+
+One row per shard, gathered from every node: `shard`, `owner` (`null` when nobody serves it right
+now), `gen` (ownership generation), `phase` (`unowned`, `loading`, `serving`, `releasing`), task
+and signal counts, `shard_seq`, the latest snapshot and `records_since_snapshot`.
+
+| Param | Description |
+|-------|-------------|
+| `node` | Only shards owned by this node |
+| `dirty` | `true`: only shards with records not covered by a snapshot |
+| `min_tasks` | Only shards holding at least this many tasks |
+| `unowned` | `true`: only shards nobody serves right now |
+
+### One Shard
+
+```bash
+GET /api/v1/cluster/shards/{shard}
+```
+
+A shard row plus its task counts per queue, from the node serving it. `404` for a shard number
+out of range.
+
+### Storage
+
+```bash
+GET /api/v1/cluster/storage
+```
+
+Object counts and sizes in the bucket: this node's WAL segments, all snapshots and task log
+chunks, with the age of the oldest objects, plus an upper-bound estimate of daily PUT requests
+and their S3 Standard cost. Cached for 30 s.
+
+### Snapshot Now
+
+```bash
+POST /api/v1/cluster/snapshot
+```
+
+Snapshots the dirty shards of the node that received the request, now. Returns its snapshot
+stats and durable LSN.
+
+### Placement
+
+```bash
+GET /api/v1/cluster/placement
+```
+
+```json
+{
+  "pins": { "42": "valka-1" },
+  "effective_protocol": 2,
+  "eligible_nodes": ["valka-1", "valka-2", "valka-3"]
+}
+```
+
+`pins` are operator pins (shard to node). `effective_protocol` is the lowest protocol version
+among live nodes.
+
+### Queues
+
+```bash
+GET /api/v1/queues
+```
+
+Every queue's partition config: `queue`, `partitions` (new tasks go to these),
+`served_partitions` (every partition the queue ever had: after a shrink, the removed ones take
+no new tasks but are served until empty), `previous` (the count before the last change, if
+any), `version`, `created_at`, and `partition_shards` (each served partition's shard, desired
+owner and `draining` flag).
+
+## Admin
+
+The admin endpoints change where things live. They are disabled until `VALKA_ADMIN_TOKEN` is
+set, and need `Authorization: Bearer <admin token>`. Every action is written to the bucket as an
+audit record. See [Clustering](/docs/clustering#admin-api) for when to use them.
+
+| Status | Code | Meaning |
+|--------|------|---------|
+| 403 | `FORBIDDEN` | The admin API is disabled (no `VALKA_ADMIN_TOKEN`) |
+| 401 | `UNAUTHORIZED` | Bad or missing admin token |
+
+### Drain a Node
+
+```bash
+POST /api/v1/cluster/nodes/{node}/drain
+```
+
+The node hands every shard over with final snapshots, marks its lease dead and exits.
+**Response** `202 Accepted`: `{ "accepted": true }`. `404` if no live node has that id, `503` if
+the node did not accept.
+
+### Move (Pin) a Shard
+
+```bash
+POST /api/v1/cluster/shards/{shard}/move
+```
+
+```json
+{ "to": "valka-1" }
+```
+
+Pins the shard to an eligible node; its owner hands it over on its next placement round. The pin
+holds while that node is eligible.
+
+**Response** `202 Accepted`:
+
+```json
+{ "shard": 42, "pinned_to": "valka-1", "placement_version": 3 }
+```
+
+`400` if the target is not an eligible node (live, alive, past its join delay), `404` for a shard
+out of range.
+
+### Unpin a Shard
+
+```bash
+DELETE /api/v1/cluster/shards/{shard}/pin
+```
+
+Back to automatic placement. Returns `{ "shard": 42, "placement_version": 4 }`.
+
+### Set a Queue's Partitions
+
+```bash
+PUT /api/v1/queues/{queue}/partitions
+```
+
+```json
+{ "partitions": 32 }
+```
+
+Between 1 and 4096. Growing is online: new partitions take new tasks while old ones drain.
+Keyed creates also check a key's old partition while the change is recent, so idempotency stays
+exact.
+
+**Response** `200 OK`:
+
+```json
+{
+  "queue": "emails",
+  "partitions": 32,
+  "previous": 16,
+  "version": 2,
+  "nodes_not_told": []
+}
+```
+
+`nodes_not_told` lists nodes that could not be told to drop their cached copy; they pick up the
+change within 30 s anyway.
+
+### Audit Log
+
+```bash
+GET /api/v1/cluster/audit?limit=50
+```
+
+The newest admin actions, newest first (`limit` 1–500). Each record has `id`, `action`
+(`drain_node`, `move_shard`, `unpin_shard`, `set_partitions`), `params`, `result`, `node` (the node
+that ran it) and `at`.
 
 ## Monitoring
 
@@ -224,7 +486,8 @@ data: {"event_id":"...","task_id":"...","queue_name":"emails","new_status":"COMP
 GET /healthz
 ```
 
-Returns `"ok"` with status `200`.
+Returns `"ok"` with status `200`, or `503` with `"wal writer poisoned"` when the node can no
+longer write to the bucket (it exits right after).
 
 ### Prometheus Metrics
 
@@ -232,7 +495,7 @@ Returns `"ok"` with status `200`.
 GET /metrics
 ```
 
-Returns metrics in Prometheus text format.
+Returns metrics in Prometheus text format. See [Deployment](/docs/deployment#metrics).
 
 ## Error Responses
 
@@ -240,13 +503,16 @@ All errors follow this format:
 
 ```json
 {
-  "error": "NOT_FOUND",
-  "message": "Task not found: 01912345-..."
+  "error": "Task not found",
+  "code": "NOT_FOUND"
 }
 ```
 
 | Status | Code | Description |
 |--------|------|-------------|
+| 400 | `BAD_REQUEST` | Invalid argument (missing field, unknown status, bad timestamp) |
 | 404 | `NOT_FOUND` | Resource not found |
+| 409 | `CONFLICT` | Idempotency key already used |
 | 422 | `INVALID_STATE` | Task in invalid state for the operation |
+| 503 | `UNAVAILABLE` | The shard is moving, its owner is unreachable, or the bucket is failing. Retry |
 | 500 | `INTERNAL_ERROR` | Server error |

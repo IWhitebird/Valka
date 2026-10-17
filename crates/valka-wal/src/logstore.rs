@@ -1,4 +1,4 @@
-//! Task log chunks: `logs/{run_id}/{uuidv7}.log`, zstd JSON lines. Append-only per run;
+//! Task log chunks: `logs/{hh}/{run_id}/{uuidv7}.log`, zstd JSON lines. Append-only per run;
 //! chunk ids are time-ordered so a prefix list returns them in order.
 
 use bytes::Bytes;

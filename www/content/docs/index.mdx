@@ -5,49 +5,69 @@ description: What is Valka and why does it exist?
 
 ## What is Valka?
 
-Valka is a **distributed task queue** built entirely in Rust with a single external dependency: **PostgreSQL**.
+Valka is a **distributed task queue** built entirely in Rust with a single external dependency:
+an **S3-compatible bucket**. For a single node, even that can be a local directory.
 
-Most task queues bolt together a message broker, a database, and a cache. Every moving part is another thing to deploy, monitor, and debug at 3 AM. Valka takes a different approach: PostgreSQL is the single source of truth, and an in-memory matching engine with gRPC bidirectional streaming replaces the message broker entirely.
+Most task queues bolt together a message broker, a database, and a cache. Every moving part is
+another thing to deploy, monitor, and debug at 3 AM. Valka takes a different approach: the bucket
+is the single source of truth. Every state change is a record in a write-ahead log stored in the
+bucket, and nothing is acknowledged before its record is there. An in-memory matching engine and
+gRPC bidirectional streaming replace the message broker entirely.
 
-The result: simple to operate, easy to reason about, and fast where it matters.
+The result: nodes you can kill at any time, nothing to operate but a bucket, and a fast path that
+never touches a database.
 
 ## Key Features
 
-- **One dependency**: if you have Postgres, you can run Valka
-- **Zero-latency hot path**: tasks are matched to waiting workers in-memory, no polling
+- **One dependency**: if you have a bucket (AWS S3, MinIO or another S3-compatible store), you can
+  run Valka. A single node can also use a local directory
+- **Acked means durable**: a task, result or cancel is acknowledged only once it is in the bucket
+- **Disposable nodes**: live state is in RAM and rebuilt from the bucket, so any node can be
+  killed or replaced
+- **One node or many**: point more nodes at the same bucket. Any node takes any request, and a
+  dead node's work moves to the others in about 15 s
+- **Workers ride through node failures**: they reconnect and reattach their running tasks
+- **Zero-latency hot path**: tasks are matched to waiting workers in memory, no polling
 - **Polyglot SDKs**: Rust, TypeScript, Go, and Python with the same builder pattern
 - **gRPC bidirectional streaming**: single connection per worker, real-time task delivery
 - **Automatic retries**: exponential backoff with dead letter queue
+- **Step checkpoints**: a retried task skips the steps an earlier attempt finished
 - **Task signals**: send real-time signals to running workers
 - **Observable**: real-time log streaming, event feeds, Prometheus metrics, web dashboard
-- **Multi-node clustering**: chitchat gossip + consistent hash ring
-- **Idempotency keys**: prevent duplicate task execution
+- **Idempotency keys**: prevent duplicate tasks
 - **Scheduled tasks**: delayed and deferred task execution
 
 ## How It Works
 
 <Mermaid chart={`graph TD
-    C[REST / gRPC Client] --> MS[MatchingService<br/>Partition Tree]
+    C[REST / gRPC Client] --> API["API layer<br/>any node"]
+    API -->|routes to the shard owner| E["Engine<br/>shards in RAM"]
+    E -->|group commit| B[("Bucket<br/>write-ahead log + snapshots")]
+    E -->|once durable| MS["Matching<br/>waiting workers"]
+    E -.->|no worker waiting| PI["Pending index<br/>in RAM"]
+    PI -.->|worker frees up| MS
 
-    MS --> HP[Hot Path<br/>In-Memory Oneshot]
-    MS --> CP[Cold Path<br/>PG SKIP LOCKED]
-
-    HP --> D[Dispatcher<br/>gRPC Bidi Stream]
-    CP --> D
+    MS --> D[Dispatcher<br/>gRPC Bidi Stream]
 
     D --> W1[Worker A]
     D --> W2[Worker B]
     D --> W3[Worker C]
 
-    style MS fill:#1F5B4F,stroke:#3E9F88,color:#fff
-    style HP fill:#059669,stroke:#10b981,color:#fff
-    style CP fill:#9E5A2E,stroke:#C27A48,color:#fff
+    style E fill:#1F5B4F,stroke:#3E9F88,color:#fff
+    style MS fill:#059669,stroke:#10b981,color:#fff
+    style B fill:#9E5A2E,stroke:#C27A48,color:#fff
     style D fill:#7c3aed,stroke:#8b5cf6,color:#fff
 `} />
 
-**Hot path**: When a task is created and a worker is already waiting, the task is matched in-memory via a oneshot channel and pushed over the gRPC stream instantly.
+**Write path**: a new task is applied to the owning node's RAM state and appended to the
+write-ahead log. Records from many requests are batched into one segment (group commit) and
+written to the bucket. Only then is the task acknowledged.
 
-**Cold path**: When no worker is waiting, the task is persisted to PostgreSQL. Workers poll using `SKIP LOCKED` to claim tasks without contention.
+**Hot path**: if a worker is already waiting, the durable task is handed to it in memory and
+pushed over its gRPC stream at once.
+
+**Waiting tasks**: if no worker is waiting, the task stays in the owner's pending index in RAM.
+It is offered as soon as a worker for its queue frees up. No polling, no database query.
 
 ## SDKs
 
@@ -65,3 +85,4 @@ Any language can also interact via the REST API on port `8989`.
 - [Quick Start](/docs/quick-start): get Valka running in minutes
 - [Architecture](/docs/architecture): deep dive into how Valka works
 - [Task Lifecycle](/docs/task-lifecycle): understand task states and transitions
+- [Clustering](/docs/clustering): run many nodes on one bucket

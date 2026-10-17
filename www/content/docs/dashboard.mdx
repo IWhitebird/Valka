@@ -1,6 +1,6 @@
 ---
 title: Web Dashboard
-description: Real-time monitoring dashboard for tasks, workers, and events.
+description: Real-time monitoring dashboard for tasks, workers, events and the cluster.
 ---
 
 Valka includes a built-in web dashboard that is served directly by the Valka server. No additional setup is required. The dashboard is available as soon as the server starts.
@@ -13,47 +13,69 @@ Open your browser and navigate to the Valka server's HTTP address:
 http://<your-server>:8989
 ```
 
-The dashboard is a single-page application served alongside the REST API. There is no separate process or deployment step.
+The dashboard is a single-page application served alongside the REST API. There is no separate process or deployment step. In a cluster, every node serves it, and every node shows the whole cluster: open it on any node.
 
 ## Pages
 
 ### Dashboard
 
 The main overview page showing:
-- Active task counts by status
-- Recent task throughput
-- Connected worker count
-- Queue activity
+- Task counts by status (total, pending, running, completed, failed)
+- A cluster strip: health, nodes alive, shards owned, unflushed WAL records, dirty shards
+- Queue overview
+- Live event feed
 
 ### Tasks
 
 Browse and filter all tasks:
-- Filter by queue, status, and date range
-- Search by task name or ID
-- View task details inline
+- Filter by queue and status
+- Create a task from a form
+- Open any task's details
 
 ### Task Detail
 
 Deep dive into a specific task:
-- **Overview**: status, input/output, metadata, timing
-- **Runs**: all execution attempts with worker info and duration
+- **Overview**: status, input/output, metadata, timing, and the shard that holds the task
+- **Runs**: all execution attempts with worker, node and duration
+- **Steps**: checkpoints recorded by `step` helpers, with the attempt that recorded each one
 - **Logs**: real-time structured log viewer per run
-- **Signals**: signal history with delivery status
+- **Signals**: signal history with delivery status, and a form to send one
 
 ### Workers
 
-Monitor connected workers:
-- Worker name, queues, and concurrency
+Monitor connected workers on every node:
+- Worker name, node, queues, and concurrency
 - Active task count
 - Connection uptime
 - Last heartbeat timestamp
 
+### Cluster
+
+Nodes, shard ownership and write-ahead log health, in three tabs (Overview, Shards, Storage)
+and a page per node:
+
+- **Overview**: a health banner (ok, degraded or critical, with the reasons: unowned shards,
+  suspect or poisoned nodes, nodes that did not answer), one card per node (status, incarnation,
+  shards owned, pending and running tasks, workers, unflushed WAL records), and a membership
+  table built from the leases in the bucket: each node's incarnation, lease state, lease age,
+  eligibility for placement, protocol version, unsplit logs and operator pins. Nodes that died
+  stay visible here, known only from their lease.
+- **Node page**: one node's WAL (incarnation, durable and next log position, unflushed records,
+  oldest unacknowledged write, writer state), its snapshots (last round, dirty shards, oldest
+  uncovered log position) with a **Snapshot now** button on the node serving the page, and the
+  workers connected to it.
+- **Shards**: a heatmap of every shard, colored by owner, pending load, records since the last
+  snapshot or snapshot age. Click a shard for its owner, generation, phase, task counts per
+  queue, sequence numbers and latest snapshot. Filter by node.
+- **Storage**: WAL segments, snapshots and task log chunks in the bucket, an upper-bound
+  estimate of daily PUT cost, and the bucket layout.
+
+Watch a takeover here: kill a node and see it turn suspect, then dead, while its shards move to
+the other nodes. See [Clustering](/docs/clustering#watching-a-takeover).
+
 ### Events
 
-Real-time event stream showing:
-- Task state transitions
-- Worker connections and disconnections
-- Signal deliveries
+Real-time stream of task events: every task status change, from every node.
 
 Uses Server-Sent Events (SSE) for live updates without polling.
 

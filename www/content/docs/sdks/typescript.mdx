@@ -127,3 +127,20 @@ const worker = ValkaWorker.builder()
   })
   .build();
 ```
+
+## Reconnects
+
+The worker survives server restarts and node failures without losing work:
+
+- When its stream breaks (or the server sends `ServerShutdown`), the worker **reconnects with
+  exponential backoff**, from 100 ms up to 30 s, to the address given to `.serverAddr(...)`. Running
+  handlers keep going meanwhile.
+- On the new connection it **resends every result not yet acknowledged** (`APPLIED` or `STALE`),
+  and keeps heartbeating those tasks until then.
+- Its hello **lists the runs it is still executing**. The task's owner reattaches each one to the
+  new connection instead of running the task again, or records a dispatch that was lost in a
+  crash. A run that ended meanwhile (cancelled, expired) gets a cancellation.
+
+In a cluster, point `.serverAddr(...)` at a load balancer or a DNS name that covers several nodes, so the
+worker can land on a live node when its own dies. See
+[Clustering](/docs/clustering#reattach-after-a-reconnect).

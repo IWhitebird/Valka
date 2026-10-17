@@ -1,236 +1,509 @@
 ---
 title: Clustering
-description: Multi-node deployment with gossip discovery and consistent hashing.
+description: Run many Valka nodes on one bucket. Leases, shard ownership, routing, takeover and the admin API.
 ---
 
-Valka supports horizontal scaling through a multi-node clustering architecture.
-
-## How It Works
+A Valka cluster is a set of `valka-server` processes that point at the **same bucket**. There
+is no gossip, no leader election and no coordination service. Nodes learn who is alive and who
+owns what from objects in the bucket, changed only by conditional writes. One node is simply a
+cluster of one: it runs the same protocol, alone.
 
 <Mermaid chart={`graph TD
-    C[REST / gRPC Client] -->|CreateTask<br/>queue: emails| LB[Load Balancer]
+    C["Producers<br/>REST · gRPC · CLI"] --> N1
+    C --> N2
+    C --> N3
 
-    LB --> N1
-    LB --> N2
-    LB --> N3
-
-    subgraph Cluster["Valka Cluster"]
-        N1["Node 1<br/>Partitions 0-3<br/>⚡ Scheduler Leader"]
-        N2["Node 2<br/>Partitions 4-7"]
-        N3["Node 3<br/>Partitions 8-11"]
-
-        N1 <-.->|gossip<br/>UDP :7280| N2
-        N2 <-.->|gossip<br/>UDP :7280| N3
-        N3 <-.->|gossip<br/>UDP :7280| N1
-
-        N1 -->|gRPC forward<br/>wrong partition| N2
+    subgraph Cluster["Valka cluster"]
+        N1["valka-1<br/>owns about 1/3 of the shards"]
+        N2["valka-2<br/>owns about 1/3 of the shards"]
+        N3["valka-3<br/>owns about 1/3 of the shards"]
+        N1 <-->|"internal gRPC :50052"| N2
+        N2 <-->|"internal gRPC :50052"| N3
+        N3 <-->|"internal gRPC :50052"| N1
     end
 
-    N1 --> W1["Worker A<br/>queue: emails"]
-    N1 --> W2["Worker B<br/>queue: emails"]
-    N2 --> W3["Worker C<br/>queue: payments"]
-    N3 --> W4["Worker D<br/>queue: reports"]
+    W1["Workers"] --> N1
+    W2["Workers"] --> N2
+    W3["Workers"] --> N3
 
-    PG[(PostgreSQL<br/>Shared Storage)] <--> N1
-    PG <--> N2
-    PG <--> N3
+    N1 --> B[("Bucket<br/>leases · owner records<br/>WAL · snapshots")]
+    N2 --> B
+    N3 --> B
 
     style N1 fill:#1F5B4F,stroke:#3E9F88,color:#fff
     style N2 fill:#7c3aed,stroke:#8b5cf6,color:#fff
     style N3 fill:#9E5A2E,stroke:#C27A48,color:#fff
-    style PG fill:#336791,stroke:#2d5f8a,color:#fff
-    style LB fill:#059669,stroke:#10b981,color:#fff
-    style C fill:#475569,stroke:#64748b,color:#fff
+    style B fill:#336791,stroke:#2d5f8a,color:#fff
 `} />
 
-### Components
+- **Any node takes any request.** It runs it locally, forwards it to the shard's owner, or asks
+  every node and merges the answers.
+- **Workers attach to any node** and run tasks owned by any node.
+- **A dead node's shards move to the others in about 15 s.** Nothing acknowledged is lost.
+- **Node-to-node calls never decide ownership.** If they fail, requests are retried; the bucket
+  still says who owns what.
 
-1. **chitchat gossip**: Nodes discover each other and exchange state over UDP (port 7280). Based on the [chitchat](https://crates.io/crates/chitchat) crate.
+## How nodes share a bucket
 
-2. **Consistent hash ring**: Queues are hashed to partitions (default 12), and partitions are assigned to nodes. When a node joins or leaves, only partitions that change ownership need to rebalance.
+All state is split into shards (default 4096, fixed when the bucket is first used). Each shard
+has exactly one owner at a time. The owner holds the shard in RAM and is the only node that
+writes its records. The rest of this section explains how that stays true when nodes crash,
+freeze or lose the network.
 
-3. **Node forwarder**: When a task arrives at the wrong node (the queue's partition belongs to another node), it is forwarded via gRPC with circuit breaker protection.
+### Leases: who is alive
+
+Each node owns one object, `nodes/{node}/lease`. It holds the node's **incarnation** (bumped at
+every start), its state (`alive`, `draining` or `dead`), a renew counter, a log watermark and
+the node's addresses.
+
+- **Start.** The node bumps its incarnation with a compare-and-swap (CAS). Two processes with
+  the same node id can't both succeed; the older one is fenced.
+- **Renew.** Every 2 s the node CASes its renew counter.
+- **Self-fence.** A node that has not renewed for 7 s (lease timeout 10 s minus a 3 s safety
+  margin) stops serving and answers `UNAVAILABLE` until it renews again. It goes quiet before
+  anybody may take over its shards.
+- **Watch others.** Every 3 s each node lists `nodes/`. A lease whose ETag has not changed for
+  10 s, measured on the observer's own clock, is suspect. No two clocks are ever compared.
+- **Tombstone.** The suspect's **guardian** (the first live node in rendezvous order for the
+  suspect's id) CASes the suspect's lease to `dead`, conditioned on the exact ETag it watched.
+  If the suspect renewed meanwhile, the CAS fails and nothing happens.
+
+A network split between nodes never causes a takeover: both sides keep renewing their leases in
+the bucket. Leases are never deleted, because incarnation numbers must never be reused.
+
+### Owner records: who owns a shard
+
+Each shard has an owner record, `owners/{hh}/{shard}`: the owning node, its incarnation, the
+shard's **generation** and a state (`owned` or `released`). It is written only when the shard
+moves, so a stable cluster never writes it.
+
+A shard can be claimed only if its record is missing, `released`, or names an incarnation that
+is **dead and whose log is split**. Every move is a CAS, so two nodes that briefly disagree
+can't both win.
+
+### Placement: who should own a shard
+
+Every node computes the same answer on its own with **rendezvous hashing** over the eligible
+nodes: alive, not draining, past a 15 s join delay, and on a compatible protocol version. The
+desired owner of shard `s` is the node with the highest `hash(s, node)`. Adding or removing a
+node moves only about 1/N of the shards. There is no leader.
+
+Every 3 s each node runs a **placement round**:
+
+- it claims shards whose desired owner is itself and that are claimable;
+- it releases shards it owns whose desired owner is another node: at most 64 per round, and
+  never within 5 minutes of the shard's last move, so a flapping node can't make shards bounce.
+
+Operators can **pin** a shard to a node with the admin API. A pin wins while that node is
+eligible, and moves the shard at once.
+
+On a cold start (no node past its join delay) every node takes part at once.
+
+### Claim and release
+
+A **claim** of shard `S` by node `B`:
+
+1. Read `owners/S` and check it is claimable.
+2. CAS it to `B`, at generation + 1.
+3. Load the newest snapshot of `S`.
+4. Write an **acquisition snapshot** at the new generation, pointing into `B`'s own log.
+5. Serve `S`.
+
+Step 4 makes failover exact: the newest snapshot of a shard always points into its current
+owner's log, so the next claimer has exactly one log to replay. A claim that crashes between
+steps 2 and 4 is harmless; the next claimer takes the next generation from the same snapshot.
+
+A **release** by the owner `A` (a planned move, a drain, a rolling restart):
+
+1. Stop accepting commands for `S`. Callers are told to retry at the new owner.
+2. Wait until every record of `S` is durable.
+3. Write a final snapshot.
+4. CAS `owners/S` to `released`.
+5. Drop `S` from RAM.
+
+### Why a frozen node can't lose acknowledged work
+
+After each WAL segment PUT, and before releasing its acknowledgements, a node re-reads its own
+lease with a conditional GET. A tombstone is a write to that lease. So either the check ran
+before the tombstone (and the segment was already in the bucket, where the split will find it),
+or the check ran after it (and fails, so the records are never acknowledged). A node that wakes
+up from a long pause finds itself fenced and exits. Nothing it acknowledged is lost; nothing it
+did not acknowledge is served.
+
+### Splitting a dead node's log
+
+A dead node's log holds records of many shards. Rather than have every claimer read the whole
+log, the guardian reads it **once** and turns it into per-shard snapshots:
+
+1. Read the dead incarnation's watermark from its frozen lease.
+2. List its segments from the watermark. The end is the first missing position.
+3. Write an empty **sealed** segment at that end, so a late PUT from the dead node fails.
+4. Read the segments from the watermark up to the seal.
+5. For each shard the dead incarnation owned: newest snapshot plus this log's records, written
+   as a split snapshot.
+6. Write the split marker `splits/{node}/{inc}`. The shards are now claimable.
+7. Delete the dead log.
+
+A restarted node splits its own previous incarnation the same way, so restart and takeover are
+one code path. If a split stalls, another node may redo it after 30 s (`split_timeout_ms`).
+
+<Mermaid chart={`sequenceDiagram
+    participant X as Node X
+    participant G as Guardian
+    participant B as Bucket
+    participant N as New owners
+
+    X->>B: renew lease every 2 s
+    Note over X: kill -9
+    G->>B: list nodes/ every 3 s
+    Note over G: lease ETag of X unchanged for 10 s
+    G->>B: CAS lease of X to dead
+    G->>B: seal the log of X, read it
+    G->>B: PUT split snapshots
+    G->>B: PUT split marker
+    N->>B: CAS owner records to the next generation
+    N->>B: load snapshot, PUT acquisition snapshot
+    Note over N: serve the shards
+`} />
+
+### Garbage collection
+
+The desired owner of shard 0 runs a garbage collector every 5 minutes. It removes dead logs once
+their split marker exists, old snapshots (the newest two per shard are kept), and split markers
+nothing references any more. Leases are never collected.
+
+## Queue partitions
+
+A queue is split into **partitions** (default 16). Partition `p` of queue `Q` lives on shard
+`hash(Q, p) mod num_shards`, so a queue's tasks are spread over up to 16 shards and up to 16
+nodes.
+
+- A create with an idempotency key always lands on the key's partition, so deduplication is
+  exact, also across a change of the partition count.
+- A create without a key prefers a partition whose shard the receiving node owns (no hop).
+- Order is FIFO per partition, priority first. A queue with one partition is strictly FIFO.
+- A queue's peak throughput is roughly `partitions × per-shard throughput`. Set the partition
+  count to at least the number of nodes you want serving the queue.
+
+Change a queue's partitions with `PUT /api/v1/queues/{queue}/partitions` (1 to 4096). Both
+directions are online. Growing: new partitions start taking new tasks at once. Shrinking:
+the removed partitions take no new tasks but are still served, by local and remote workers,
+until their tasks are done. For the task retention window after a change (24 h by default),
+keyed creates also check a key's old partition, so idempotency stays exact across it. `GET /api/v1/queues` lists every queue's partitions
+and the shard, desired owner and `draining` flag of each.
+
+## Request routing
+
+Every REST and gRPC call goes through the API layer of the node that received it:
+
+| Request | Runs on |
+|---------|---------|
+| Create task | The receiving node picks the partition and mints the id; the shard's owner creates it |
+| Get, cancel, delete, signal, runs, checkpoints of a task | The owner of the shard in the task id |
+| List tasks, dead letters, workers; clear tasks; cluster stats; shard map | Every live node, merged |
+
+The owner is found from a cache, refreshed from `NOT_OWNER` replies (which carry a hint), and as
+a last resort from the owner record in the bucket. While a shard is moving, callers get
+`UNAVAILABLE` (HTTP `503`) and retry; the SDKs do this for you.
+
+A merged answer that missed a node carries the header
+`X-Valka-Partial: true; missing=<node ids>`. A complete answer carries `X-Valka-Partial: false`.
+
+## Workers across nodes
+
+Each node keeps, per queue, the local workers waiting for a task. The owner of a task hands it
+out in two ways:
+
+1. **Local:** when a task becomes runnable and a worker on the owner node is waiting, it is
+   offered at once, as soon as its record is durable.
+2. **Remote:** a node whose workers wait for a queue long-polls the owners of that queue's
+   partitions (`Fetch`). The owner reserves a runnable task for that node, in RAM only, and
+   hands it over. The fetching node's worker then dispatches it through the owner, which
+   records the dispatch with the worker and the worker's node.
+
+Details that keep this safe:
+
+- A fetched task no local worker takes goes straight back. An unused reservation lapses after
+  30 s.
+- A dispatch whose worker vanished before the assignment reached it is returned with a
+  `RunReturned` record: back to `PENDING`, without spending an attempt.
+- Heartbeats are batched per owner. Results and checkpoints are forwarded to the owner and
+  acknowledged end to end.
+- Cancels and signals go to the node recorded on the run, then to the worker.
+
+Tasks nobody is waiting for stay in the owner's pending index. Nothing is pushed blindly.
+
+## Reattach after a reconnect
+
+A worker that loses its node keeps running its tasks and reconnects with backoff. Its hello
+lists the runs it is still executing, and it resends every result not yet acknowledged. For each
+running run, the owner answers:
+
+- **Reattached:** the run is current. The owner records the worker's new node (`RunReattached`)
+  so results, cancels and signals flow again.
+- **Adopted:** the owner died right after dispatching and its dispatch record was lost; the task
+  is `PENDING` at exactly that attempt. The owner records the dispatch under the worker's run id
+  instead of running the task a second time.
+- **Stale:** the run is over (cancelled, expired, finished elsewhere). The worker gets a
+  `TaskCancellation` and stops it.
+
+After claiming shards, a node holds back recovered `PENDING` tasks for 5 s
+(`reconcile_grace_ms`), so reconnecting workers can adopt their runs before anything is
+dispatched again.
+
+The SDKs reconnect to the address they were given. Point workers at a load balancer or a DNS
+name that covers several nodes, so a worker whose node died lands on a live one.
 
 ## Configuration
 
-```toml
-[cluster]
-enabled = true
-node_id = "node-1"
-gossip_addr = "0.0.0.0:7280"
-advertise_addr = "10.0.0.1:7280"
-seeds = ["10.0.0.2:7280", "10.0.0.3:7280"]
-num_partitions = 12
-```
+A cluster needs:
 
-### Environment Variables
+- an **S3-compatible bucket**. The `local` and `memory` backends only work inside one process;
+  clustered mode refuses them;
+- `VALKA_CLUSTER__ENABLED=true` on every node;
+- the **same** `VALKA_CLUSTER__TOKEN` on every node. Clustered mode refuses to start without one;
+- a **distinct, stable** `VALKA_NODE_ID` per node (1–64 characters from `A-Z a-z 0-9 _ -`). The
+  default is the host name;
+- the internal port (`:50052`) reachable between nodes, and the advertised addresses set to
+  something the other nodes can reach.
+
+At start, a clustered node runs a **storage self-test**: create-if-absent must refuse to
+overwrite, `If-Match` must reject a wrong ETag and accept the right one, and a new object must
+be readable and listed at once. A bucket that fails is refused.
+
+### Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VALKA_CLUSTER__ENABLED` | `false` | Enable clustering |
-| `VALKA_CLUSTER__NODE_ID` | hostname | Unique node identifier |
-| `VALKA_CLUSTER__GOSSIP_ADDR` | `0.0.0.0:7280` | Gossip listen address |
-| `VALKA_CLUSTER__ADVERTISE_ADDR` | - | Address other nodes use to reach this node |
-| `VALKA_CLUSTER__SEEDS` | `[]` | Comma-separated seed node addresses |
-| `VALKA_CLUSTER__NUM_PARTITIONS` | `12` | Number of partitions in the hash ring |
+| `VALKA_NODE_ID` | host name | Stable node id (distinct per node). A restart with the same id splits what the previous run left, so its shards are served again at once |
+| `VALKA_CLUSTER__ENABLED` | `false` | Allow other nodes on this bucket (S3 backend only) |
+| `VALKA_CLUSTER__TOKEN` | - | Shared secret every node-to-node call carries. Required when enabled |
+| `VALKA_CLUSTER__NUM_SHARDS` | `0` | Shard count of a **new** bucket: a power of two, 16 to 65536. `0` means the bucket's count, or 4096 |
+| `VALKA_CLUSTER__INTERNAL_ADDR` | `0.0.0.0:50052` | Node-to-node listener. Never expose it publicly |
+| `VALKA_CLUSTER__ADVERTISE_INTERNAL_ADDR` | internal addr | Address other nodes use to reach this node's internal listener |
+| `VALKA_CLUSTER__ADVERTISE_GRPC_ADDR` | `VALKA_GRPC_ADDR` | Public gRPC address shown for this node |
+| `VALKA_CLUSTER__ADVERTISE_HTTP_ADDR` | `VALKA_HTTP_ADDR` | Public REST address shown for this node |
+| `VALKA_CLUSTER__TLS_CERT`, `VALKA_CLUSTER__TLS_KEY`, `VALKA_CLUSTER__TLS_CA` | - | Optional mTLS for internal traffic (PEM files). Set all three to enable it |
+| `VALKA_CLUSTER__LEASE_INTERVAL_MS` | `2000` | Lease renewal period |
+| `VALKA_CLUSTER__LEASE_TIMEOUT_MS` | `10000` | An unchanged lease is declared dead after this |
+| `VALKA_CLUSTER__LEASE_SAFETY_MARGIN_MS` | `3000` | Stop serving at `timeout − margin` without a renewal |
+| `VALKA_CLUSTER__MEMBERSHIP_INTERVAL_MS` | `3000` | How often `nodes/` is listed |
+| `VALKA_CLUSTER__JOIN_DELAY_MS` | `15000` | A new node takes shards after this |
+| `VALKA_CLUSTER__PLACEMENT_INTERVAL_MS` | `3000` | Placement round period |
+| `VALKA_CLUSTER__CLAIM_CONCURRENCY` | `64` | Shard claims in flight at once |
+| `VALKA_CLUSTER__HANDOVER_PER_TICK` | `64` | Shards released per placement round |
+| `VALKA_CLUSTER__MIN_RESIDENCY_SECS` | `300` | A shard stays put this long after a move |
+| `VALKA_CLUSTER__SPLIT_TIMEOUT_MS` | `30000` | Another node may redo a stalled split after this |
+| `VALKA_CLUSTER__RECONCILE_GRACE_MS` | `5000` | Hold recovered `PENDING` tasks for reattaching workers |
+| `VALKA_CLUSTER__GC_INTERVAL_SECS` | `300` | Garbage collector cadence |
+| `VALKA_CLUSTER__STARTUP_LEASE_CHECK` | `true` | Refuse to start while another live process holds this node id |
+| `VALKA_ADMIN_TOKEN` | - | Enables the admin API |
 
-### Partition Count
+### `[cluster]` in valka.toml
 
-The partition count must be **identical across all nodes** and should be a multiple of your expected replica count. For example, use 12 partitions for a 3-node cluster (4 partitions per node).
+The same settings in the config file (from `deploy/valka.example.toml`):
 
-## Scheduler Leader Election
+```toml title="valka.toml"
+[cluster]
+# Allow other nodes on this bucket. Needs the s3 backend (local/memory CAS only works
+# inside one process) and a token.
+enabled = false
 
-In a cluster, only one node runs the scheduler (lease reaper, retry engine, DLQ mover, delayed promoter). Leader election uses **PostgreSQL advisory locks**:
+# Shared secret every node-to-node call carries. Required when enabled.
+# token = ""
 
-<Mermaid chart={`sequenceDiagram
-    participant N1 as Node 1
-    participant N2 as Node 2
-    participant PG as PostgreSQL
+# Shard count of a NEW bucket (written to cluster.json on first start; fixed afterwards).
+# Power of two, 16..=65536. 0 = whatever the bucket says, or 4096 for a new bucket.
+num_shards = 0
 
-    N1->>PG: pg_try_advisory_lock(1337)
-    PG-->>N1: true (leader)
-    N1->>N1: Start scheduler loops
+# Node-to-node listener. Never expose it publicly.
+internal_addr = "0.0.0.0:50052"
+# Addresses other nodes / clients use to reach this node (default: the listen addresses).
+# advertise_internal_addr = "10.0.0.1:50052"
+# advertise_grpc_addr = "10.0.0.1:50051"
+# advertise_http_addr = "10.0.0.1:8989"
 
-    N2->>PG: pg_try_advisory_lock(1337)
-    PG-->>N2: false (standby)
+# Optional mTLS for internal traffic (PEM files). The token is still required.
+# tls_cert = "/etc/valka/tls/node.crt"
+# tls_key = "/etc/valka/tls/node.key"
+# tls_ca = "/etc/valka/tls/ca.crt"
 
-    Note over N1: Node 1 crashes
-    N1--xPG: Connection lost
-    PG->>PG: Release advisory lock
+# Lease renewal period, and how long an unchanged lease takes to be declared dead
+# (by the observer's own clock). A node that has not renewed for
+# lease_timeout - lease_safety_margin stops serving on its own.
+lease_interval_ms = 2000
+lease_timeout_ms = 10000
+lease_safety_margin_ms = 3000
 
-    N2->>PG: pg_try_advisory_lock(1337)
-    PG-->>N2: true (new leader)
-    N2->>N2: Start scheduler loops
-`} />
-
-## Docker Compose Cluster
-
-For a full production-ready 3-node cluster with PgBouncer, see the [Deployment guide](/docs/deployment#cluster-docker-compose). Below is the minimal cluster configuration.
-
-Create a shared config file and compose file in the same directory:
-
-```toml title="cluster.toml"
-[database]
-max_connections = 5
-
-[gossip]
-listen_addr = "0.0.0.0:7280"
-cluster_id = "valka"
-seed_nodes = ["valka-1:7280", "valka-2:7280", "valka-3:7280"]
-
-[matching]
-num_partitions = 12
+# How often nodes/ is listed (membership).
+membership_interval_ms = 3000
+# A new node takes shards after this (all nodes at once on a cold start).
+join_delay_ms = 15000
+# Placement round period, claims in flight, shards handed over per round.
+placement_interval_ms = 3000
+claim_concurrency = 64
+handover_per_tick = 64
+# A shard stays where it is for at least this long after a move.
+min_residency_secs = 300
+# Another node may redo a dead node's log split after this.
+split_timeout_ms = 30000
+# After claiming shards, recovered PENDING tasks wait this long so reconnecting workers
+# can reattach their runs first.
+reconcile_grace_ms = 5000
+# Garbage collector cadence (dead logs, old snapshots, split markers).
+gc_interval_secs = 300
+# Refuse to start while another live process holds this node id.
+startup_lease_check = true
 ```
 
-```yaml title="docker-compose.yml"
-x-valka-follower: &valka-follower
-  image: ghcr.io/iwhitebird/valka:latest
-  depends_on:
-    valka-1:
-      condition: service_healthy
-    pgbouncer:
-      condition: service_started
-  volumes:
-    - ./cluster.toml:/etc/valka/valka.toml:ro
-  command: ["/etc/valka/valka.toml"]
+The node id and admin token are top-level keys (`node_id`, `admin_token`), not part of
+`[cluster]`. Lease and placement timings are best left at their defaults: they set the failover
+time (about 10–15 s) and keep false takeovers rare.
 
-services:
-  postgres:
-    image: postgres:17
-    environment:
-      POSTGRES_USER: valka
-      POSTGRES_PASSWORD: valka
-      POSTGRES_DB: valka
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U valka"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    shm_size: 128mb
+## A three-node cluster with Docker Compose
 
-  pgbouncer:
-    image: edoburu/pgbouncer:latest
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql://valka:valka@postgres:5432/valka
-      AUTH_TYPE: scram-sha-256
-      MAX_CLIENT_CONN: "100"
-      DEFAULT_POOL_SIZE: "20"
-      POOL_MODE: transaction
-      MAX_PREPARED_STATEMENTS: "100"
-
-  valka-1:
-    image: ghcr.io/iwhitebird/valka:latest
-    depends_on:
-      pgbouncer:
-        condition: service_started
-    volumes:
-      - ./cluster.toml:/etc/valka/valka.toml:ro
-    command: ["/etc/valka/valka.toml"]
-    environment:
-      VALKA_NODE_ID: valka-1
-      VALKA_DATABASE_URL: postgresql://valka:valka@pgbouncer:5432/valka
-      VALKA_MIGRATION_DATABASE_URL: postgresql://valka:valka@postgres:5432/valka
-      VALKA_GOSSIP__ADVERTISE_ADDR: "valka-1:7280"
-      RUST_LOG: valka=info
-    ports:
-      - "50061:50051"
-      - "8991:8989"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8989/healthz || exit 1"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-
-  valka-2:
-    <<: *valka-follower
-    environment:
-      VALKA_NODE_ID: valka-2
-      VALKA_DATABASE_URL: postgresql://valka:valka@pgbouncer:5432/valka
-      VALKA_SKIP_MIGRATIONS: "true"
-      VALKA_GOSSIP__ADVERTISE_ADDR: "valka-2:7280"
-      RUST_LOG: valka=info
-    ports:
-      - "50062:50051"
-      - "8992:8989"
-
-  valka-3:
-    <<: *valka-follower
-    environment:
-      VALKA_NODE_ID: valka-3
-      VALKA_DATABASE_URL: postgresql://valka:valka@pgbouncer:5432/valka
-      VALKA_SKIP_MIGRATIONS: "true"
-      VALKA_GOSSIP__ADVERTISE_ADDR: "valka-3:7280"
-      RUST_LOG: valka=info
-    ports:
-      - "50063:50051"
-      - "8993:8989"
-
-volumes:
-  pgdata:
-```
+The repository ships `docker-compose.cluster.yml`: three nodes on one S3-compatible store
+(`pgsty/silo`, a MinIO fork).
 
 ```bash
-docker compose up -d
+git clone https://github.com/IWhitebird/Valka.git && cd Valka
+docker compose -f docker-compose.cluster.yml up -d --build
 ```
 
-Workers and clients can connect to **any node**. Tasks are automatically forwarded to the correct partition owner.
+| Node | REST API and dashboard | gRPC |
+|------|------------------------|------|
+| valka-1 | `http://localhost:8981` | `localhost:50061` |
+| valka-2 | `http://localhost:8982` | `localhost:50062` |
+| valka-3 | `http://localhost:8983` | `localhost:50063` |
 
-## Kubernetes Cluster
+Any node takes any request, and workers may attach to any node. The compose file sets a cluster
+token and an admin token (`change-me-cluster-token`, `change-me-admin-token`): change both
+before you use it anywhere but your laptop. The nodes reach each other on the compose network
+at `valka-N:50052`; that port is not published.
 
-For Kubernetes deployments, the Helm chart automatically configures gossip seed nodes using stable StatefulSet pod DNS names. See the full [Kubernetes deployment guide](/docs/deployment#kubernetes-helm).
+## Watching a takeover
 
-## Circuit Breaker
+Open the Cluster page at `http://localhost:8981/cluster`, or watch membership from the API:
 
-The node forwarder includes a circuit breaker to handle node failures:
+```bash
+watch -n1 "curl -s localhost:8981/api/v1/cluster/members | jq -c '.[] | {node_id, status, lease_age_ms}'"
+```
 
-- **Closed** (normal): Requests forwarded normally
-- **Open** (tripped): After 3 consecutive failures, stops forwarding for 30s
-- **Half-open**: After cooldown, allows one probe request to test recovery
+Then break a node:
 
-If forwarding fails, the task is still persisted in PostgreSQL and will be picked up by the cold path on the correct node once it recovers.
+```bash
+# kill -9 a node
+docker compose -f docker-compose.cluster.yml kill -s SIGKILL valka-2
+
+# freeze a node (like a long GC pause): it is fenced when it wakes up
+docker compose -f docker-compose.cluster.yml pause valka-3
+docker compose -f docker-compose.cluster.yml unpause valka-3
+```
+
+After a `kill -9`, the node's lease stops changing. About 10 s later it turns suspect, its
+guardian tombstones it and splits its log, and the other nodes claim its shards.
+`GET /api/v1/cluster` reports `health.unowned_shards` back at `0`. Workers that were attached to
+the dead node reconnect and reattach their running tasks.
+
+Bring it back with `docker compose -f docker-compose.cluster.yml start valka-2`. It starts a new
+incarnation and rejoins after the join delay. Shards that just moved stay where they are for
+`min_residency_secs` (5 minutes), then placement hands the node its share again.
+
+A frozen node is taken over the same way. When it wakes, its own-lease check fails: it exits
+and Docker restarts it as a new incarnation.
+
+The metrics tell the same story: `valka_tombstones_total`, `valka_splits_total`,
+`valka_shard_claims_total`, `valka_reattach_total`. To break nodes at random under load and
+check that nothing acknowledged was lost, run [the chaos test](/docs/deployment#chaos-test).
+
+## Admin API
+
+The admin API changes where things live. It is **disabled** until you set `VALKA_ADMIN_TOKEN`
+(or `admin_token` in `valka.toml`). Every admin request needs
+`Authorization: Bearer <admin token>`; without a configured token the endpoints answer `403`,
+and with a wrong token `401`. Every action is written to the bucket as an audit record.
+
+| Method and path | Body | What it does |
+|-----------------|------|--------------|
+| `POST /api/v1/cluster/nodes/{node}/drain` | - | The node hands every shard over (final snapshots, nothing to replay), marks its lease dead and exits. `202` |
+| `POST /api/v1/cluster/shards/{shard}/move` | `{"to": "node-id"}` | Pins the shard to an eligible node. Its owner hands it over on its next placement round. `202` |
+| `DELETE /api/v1/cluster/shards/{shard}/pin` | - | Removes the pin: back to rendezvous placement |
+| `PUT /api/v1/queues/{queue}/partitions` | `{"partitions": n}` | Sets a queue's partition count (1 to 4096) |
+| `GET /api/v1/cluster/audit?limit=50` | - | The newest admin actions (limit up to 500) |
+
+Read-only views need no token: `GET /api/v1/cluster/placement` (pins, eligible nodes, effective
+protocol) and `GET /api/v1/queues` (partition counts). See the [REST API](/docs/rest-api#cluster)
+for response shapes.
+
+```bash
+H="Authorization: Bearer $VALKA_ADMIN_TOKEN"
+
+# Drain a node (decommission, maintenance)
+curl -X POST -H "$H" localhost:8981/api/v1/cluster/nodes/valka-3/drain
+
+# Pin shard 42 to valka-1, then return it to automatic placement
+curl -X POST -H "$H" -H 'Content-Type: application/json' \
+  -d '{"to": "valka-1"}' localhost:8981/api/v1/cluster/shards/42/move
+curl -X DELETE -H "$H" localhost:8981/api/v1/cluster/shards/42/pin
+
+# Spread a hot queue over 32 partitions
+curl -X PUT -H "$H" -H 'Content-Type: application/json' \
+  -d '{"partitions": 32}' localhost:8981/api/v1/queues/emails/partitions
+
+# Who did what
+curl -H "$H" 'localhost:8981/api/v1/cluster/audit?limit=20'
+```
+
+A drained node exits cleanly. A supervisor that restarts on any exit (Docker's
+`restart: unless-stopped` does) brings it back as a new incarnation, and it rejoins. Stop the
+service for good when you decommission a node.
+
+A pin to a node that is not eligible (dead, draining, or younger than the join delay) is
+ignored until that node becomes eligible.
+
+## Security
+
+- **Cluster token.** Every internal call carries `cluster.token`, compared in constant time. A
+  wrong token shows as `Unauthenticated` in the logs.
+- **Optional mTLS.** Set `tls_cert`, `tls_key` and `tls_ca` on every node. Each node presents its
+  certificate and requires one signed by the cluster CA. The token is still required. The
+  certificates must be valid for the advertised internal host names.
+- **Internal port.** `:50052` must be reachable between nodes and **never** from the public
+  internet.
+- **Admin token.** Keep `VALKA_ADMIN_TOKEN` separate from the cluster token, and unset it where
+  you don't need the admin API.
+- **Public API.** The REST and gRPC APIs on `:8989` and `:50051` have no authentication of their
+  own (apart from the admin endpoints). Keep them on a private network or behind a proxy that
+  authenticates.
+
+Peer clients have a small circuit breaker: after 3 consecutive transport failures to a peer,
+calls to it fail fast for 3 s, then one call is let through to probe it. This only shortens
+`UNAVAILABLE` answers during an outage; it never changes ownership.
+
+## Failure handling
+
+| What happens | What the cluster does | What you see |
+|--------------|----------------------|--------------|
+| `kill -9` on a node | After 10 s its guardian tombstones it, splits its log (about 1 s), and the desired owners claim its shards | Its shards are unavailable for about 11–15 s. Its workers reconnect and reattach. Nothing acknowledged is lost |
+| Node frozen, then wakes up | Taken over while frozen. On waking, its PUTs hit the seal, its own-lease check fails: it exits and restarts as a new incarnation | Requests it held fail; clients retry |
+| Node cut off from the bucket | It acknowledges nothing. After 7 s it stops serving; after 10 s it is tombstoned and its shards move | About 15 s of unavailability for its shards |
+| Network split between nodes, bucket reachable | No takeover: leases keep renewing. Forwarding across the split fails | Cross-side requests get `UNAVAILABLE` until it heals |
+| Bucket down for everyone | No acks anywhere; every node stops serving; nobody can tombstone anybody | Full outage, recovers by itself |
+| Two nodes claim one shard | CAS on the owner record: one wins | Nothing |
+| Crash in the middle of a split | Another node redoes it after `split_timeout_ms` | Takeover delayed by up to 30 s |
+| Same node id started twice | The lease CAS at start lets one win; the other exits | Nothing (fix the duplicate id) |
+| Node joins | After the join delay, about 1/N of the shards move by release and claim, rate-limited | Brief retried `UNAVAILABLE` per moved shard |
+| `SIGTERM` (rolling restart) | With live peers: release every shard with a final snapshot, then exit. Alone: keep the shards and reclaim them on restart | Near-zero unavailability |
+| A worker's node dies mid-task | The worker keeps running, reconnects, reattaches; its result is resent and acknowledged | The task completes once |
+| The owner dies right after dispatching | The worker's reattach adopts the run | No duplicate run |
+
+## Limits
+
+- Useful nodes are about `num_shards / 8`. Pick the shard count of a new bucket with that in
+  mind; it can never change.
+- A queue partition is served by one shard (one owner, one lock). Add partitions for a hot queue.
+- Every node relays every other node's events. That fan-in is fine up to a few dozen nodes.
+- Per node, coordination costs about one lease PUT every 2 s, one own-lease GET per WAL flush and
+  one `nodes/` list every 3 s. None of it grows with the number of nodes.
+
+For alerts and what to do when they fire, see [Deployment](/docs/deployment#monitoring-and-alerts).

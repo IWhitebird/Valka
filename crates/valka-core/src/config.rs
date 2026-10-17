@@ -297,3 +297,23 @@ impl ServerConfig {
         figment.extract().map_err(Box::new)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The documented example config must keep loading, with every setting it spells out.
+    #[test]
+    fn example_config_loads() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/valka.example.toml"
+        );
+        let cfg = ServerConfig::load(Some(path)).expect("deploy/valka.example.toml loads");
+        assert_eq!(cfg.storage.backend, "s3");
+        assert_eq!(cfg.cluster.internal_addr, "0.0.0.0:50052");
+        assert_eq!(cfg.cluster.lease_timeout_ms, 10_000);
+        assert_eq!(cfg.cluster.min_residency_secs, 300);
+        assert_eq!(cfg.wal.log_budget_bytes, 64 * 1024 * 1024);
+    }
+}
