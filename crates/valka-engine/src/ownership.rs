@@ -117,10 +117,20 @@ impl Engine {
         let mut claimed = 0;
         for (s, r) in results {
             match r {
-                Ok(()) => claimed += 1,
-                Err(ClaimRefused::Busy(why)) => debug!(shard = %s, why, "not claimable yet"),
-                Err(ClaimRefused::Lost) => debug!(shard = %s, "claim lost to another node"),
+                Ok(()) => {
+                    claimed += 1;
+                    valka_core::metrics::record_shard_claim("claimed");
+                }
+                Err(ClaimRefused::Busy(why)) => {
+                    valka_core::metrics::record_shard_claim("busy");
+                    debug!(shard = %s, why, "not claimable yet")
+                }
+                Err(ClaimRefused::Lost) => {
+                    valka_core::metrics::record_shard_claim("lost");
+                    debug!(shard = %s, "claim lost to another node")
+                }
                 Err(ClaimRefused::Invariant(why)) => {
+                    valka_core::metrics::record_shard_claim("invariant");
                     error!(shard = %s, why, "refusing to claim: bucket violates the protocol")
                 }
             }
@@ -312,9 +322,15 @@ impl Engine {
         let mut released = 0;
         for shard in shards.into_iter().take(limit) {
             match self.release_one(shard).await {
-                Ok(true) => released += 1,
+                Ok(true) => {
+                    released += 1;
+                    valka_core::metrics::record_shard_release("released");
+                }
                 Ok(false) => {}
-                Err(e) => warn!(shard = %shard, error = %e, "release failed"),
+                Err(e) => {
+                    valka_core::metrics::record_shard_release("failed");
+                    warn!(shard = %shard, error = %e, "release failed")
+                }
             }
         }
         if released > 0 {
@@ -415,10 +431,17 @@ impl Engine {
         inc: u32,
         trunc: u64,
     ) -> Result<(), ServerError> {
-        let Some(log) = self.split_read(node, inc, trunc).await? else {
-            return Ok(());
-        };
-        self.split_commit(node, inc, log).await
+        let r = async {
+            let Some(log) = self.split_read(node, inc, trunc).await? else {
+                return Ok(());
+            };
+            self.split_commit(node, inc, log).await
+        }
+        .await;
+        if r.is_err() {
+            valka_core::metrics::record_split_failed();
+        }
+        r
     }
 
     /// Phase 1: read the log from the watermark to its sealed end. `None` when the
@@ -502,6 +525,7 @@ impl Engine {
             },
         )
         .await?;
+        valka_core::metrics::record_split(total, started.elapsed().as_secs_f64());
         info!(
             node,
             inc,

@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub node_id: String,
+    /// Bearer token for the admin API (drain, move shard, set partitions). Unset: the
+    /// admin API is disabled.
+    pub admin_token: Option<String>,
     pub grpc_addr: String,
     pub http_addr: String,
     pub web_dir: String,
@@ -152,6 +155,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             node_id: String::new(),
+            admin_token: None,
             grpc_addr: "0.0.0.0:50051".to_string(),
             http_addr: "0.0.0.0:8989".to_string(),
             web_dir: "web/dist".to_string(),

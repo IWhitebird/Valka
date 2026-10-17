@@ -340,11 +340,16 @@ impl Api {
             };
             match self.inner.peers.execute(&addr, &cmd).await {
                 Ok(r) => {
+                    valka_core::metrics::record_forwarded(cmd.name(), "ok");
                     self.inner.owners.lock().insert(shard, node);
                     return Ok(r);
                 }
-                Err(RpcError::Server(e)) => return Err(e),
+                Err(RpcError::Server(e)) => {
+                    valka_core::metrics::record_forwarded(cmd.name(), "error");
+                    return Err(e);
+                }
                 Err(RpcError::NotOwner { hint, .. }) => {
+                    valka_core::metrics::record_route_redirect();
                     self.inner.owners.lock().remove(&shard);
                     last = format!("{node} does not serve shard {shard}");
                     target = match hint.filter(|h| *h != node) {
@@ -353,6 +358,7 @@ impl Api {
                     };
                 }
                 Err(RpcError::Transport(m)) => {
+                    valka_core::metrics::record_forwarded(cmd.name(), "unreachable");
                     self.inner.owners.lock().remove(&shard);
                     debug!(shard = %shard, node, error = %m, "forward failed");
                     last = m;
@@ -517,7 +523,9 @@ impl Api {
             cmd @ (Command::Heartbeat { .. }
             | Command::Fetch { .. }
             | Command::CancelOnWorker { .. }
-            | Command::DeliverSignal { .. }) => self.execute_node_command(cmd).await,
+            | Command::DeliverSignal { .. }
+            | Command::Drain
+            | Command::InvalidateQueue { .. }) => self.execute_node_command(cmd).await,
         }
     }
 
@@ -567,6 +575,19 @@ impl Api {
                     )
                     .await,
             )),
+            Command::Drain => {
+                let e = e.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = e.drain().await {
+                        tracing::error!(error = %err, "drain failed");
+                    }
+                });
+                Ok(Reply::Done)
+            }
+            Command::InvalidateQueue { queue } => {
+                e.invalidate_queue(&queue);
+                Ok(Reply::Done)
+            }
             other => Err(ServerError::Internal(format!(
                 "{} is not a node command",
                 other.name()
@@ -1041,6 +1062,20 @@ impl TaskRouter for Api {
 }
 
 impl Api {
+    /// Send a node command to every live node, this one included. Returns the nodes that
+    /// did not take it.
+    pub async fn broadcast(&self, cmd: Command) -> Vec<String> {
+        let mut nodes = vec![self.node_id().to_string()];
+        nodes.extend(self.inner.engine.live_peers().into_iter().map(|(n, _)| n));
+        let mut missed = Vec::new();
+        for n in nodes {
+            if self.send_to_node(&n, cmd.clone()).await.is_none() {
+                missed.push(n);
+            }
+        }
+        missed
+    }
+
     /// Live nodes other than this one that own partitions of `queue`.
     pub async fn remote_owners(&self, queue: &str) -> Vec<String> {
         let e = &self.inner.engine;

@@ -475,6 +475,7 @@ async fn committer(
         match result {
             Ok(()) => {
                 bytes_committed.fetch_add(f.bytes, Ordering::SeqCst);
+                valka_core::metrics::record_wal_segment(f.bytes);
                 for a in f.acks {
                     let _ = a.send(Ok(f.lsn));
                 }

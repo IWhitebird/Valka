@@ -116,6 +116,12 @@ pub enum Command {
     DeliverSignal {
         signal: SignalView,
     },
+    /// Hand every shard over and stop (admin drain).
+    Drain,
+    /// A queue's partition count changed: drop the cached copy.
+    InvalidateQueue {
+        queue: String,
+    },
 }
 
 /// Where a command goes.
@@ -152,7 +158,9 @@ impl Command {
             Command::Heartbeat { .. }
             | Command::Fetch { .. }
             | Command::CancelOnWorker { .. }
-            | Command::DeliverSignal { .. } => Target::Node,
+            | Command::DeliverSignal { .. }
+            | Command::Drain
+            | Command::InvalidateQueue { .. } => Target::Node,
         }
     }
 
@@ -188,6 +196,8 @@ impl Command {
             Command::Fetch { .. } => "fetch",
             Command::CancelOnWorker { .. } => "cancel_on_worker",
             Command::DeliverSignal { .. } => "deliver_signal",
+            Command::Drain => "drain",
+            Command::InvalidateQueue { .. } => "invalidate_queue",
         }
     }
 }

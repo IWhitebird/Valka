@@ -583,3 +583,248 @@ async fn grpc_api_routes_like_rest() {
     let (status, _) = call(&c.nodes[0], get(&format!("/api/v1/tasks/{}", t.id))).await;
     assert_eq!(status, StatusCode::OK);
 }
+
+const ADMIN: &str = "admin-secret";
+
+async fn admin_call(
+    node: &TestNode,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let mut b = Request::builder().method(method).uri(uri);
+    if let Some(t) = token {
+        b = b.header("authorization", format!("Bearer {t}"));
+    }
+    let req = match body {
+        Some(v) => b
+            .header("content-type", "application/json")
+            .body(Body::from(v.to_string()))
+            .unwrap(),
+        None => b.body(Body::empty()).unwrap(),
+    };
+    let resp = node
+        .router_with_admin(Some(ADMIN))
+        .oneshot(req)
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_api_needs_its_token() {
+    let c = cluster(2).await;
+    // Disabled when no token is configured.
+    let resp = c.nodes[0]
+        .router()
+        .oneshot(post(
+            "/api/v1/cluster/shards/0/move",
+            serde_json::json!({"to": "n1"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let (s, _) = admin_call(
+        &c.nodes[0],
+        "POST",
+        "/api/v1/cluster/shards/0/move",
+        None,
+        Some(serde_json::json!({"to": "n1"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = admin_call(
+        &c.nodes[0],
+        "POST",
+        "/api/v1/cluster/shards/0/move",
+        Some("nope"),
+        Some(serde_json::json!({"to": "n1"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = admin_call(
+        &c.nodes[0],
+        "GET",
+        "/api/v1/cluster/audit",
+        Some(ADMIN),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn moving_a_shard_pins_it_and_unpinning_releases_the_pin() {
+    let c = cluster(3).await;
+    let shard = valka_core::ShardId(5);
+    let from = c.nodes.iter().position(|n| n.engine.owns(shard)).unwrap();
+    let to = (from + 1) % 3;
+    let target = format!("n{to}");
+    let (s, body) = admin_call(
+        &c.nodes[(from + 2) % 3],
+        "POST",
+        "/api/v1/cluster/shards/5/move",
+        Some(ADMIN),
+        Some(serde_json::json!({ "to": target })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{body}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !c.nodes[to].engine.owns(shard) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the shard never moved"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!c.nodes[from].engine.owns(shard));
+    let (_, placement) = call(&c.nodes[0], get("/api/v1/cluster/placement")).await;
+    assert_eq!(placement["pins"]["5"], target);
+    assert_eq!(placement["effective_protocol"], 2);
+    let (s, _) = admin_call(
+        &c.nodes[0],
+        "POST",
+        "/api/v1/cluster/shards/5/move",
+        Some(ADMIN),
+        Some(serde_json::json!({"to": "ghost"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "only eligible nodes");
+
+    let (s, _) = admin_call(
+        &c.nodes[0],
+        "DELETE",
+        "/api/v1/cluster/shards/5/pin",
+        Some(ADMIN),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, placement) = call(&c.nodes[0], get("/api/v1/cluster/placement")).await;
+    assert!(placement["pins"].as_object().unwrap().is_empty());
+    let (_, audit) = admin_call(
+        &c.nodes[1],
+        "GET",
+        "/api/v1/cluster/audit",
+        Some(ADMIN),
+        None,
+    )
+    .await;
+    let actions: Vec<&str> = audit
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(actions, vec!["unpin_shard", "move_shard"], "newest first");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn changing_partitions_reaches_every_node() {
+    let c = cluster(2).await;
+    let (s, _) = call(
+        &c.nodes[0],
+        post(
+            "/api/v1/tasks",
+            serde_json::json!({"queue_name": "grow", "task_name": "t"}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, body) = admin_call(
+        &c.nodes[1],
+        "PUT",
+        "/api/v1/queues/grow/partitions",
+        Some(ADMIN),
+        Some(serde_json::json!({"partitions": 4})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["partitions"], 4);
+    assert_eq!(body["previous"], 16);
+    assert_eq!(body["nodes_not_told"], serde_json::json!([]));
+    for n in &c.nodes {
+        assert_eq!(n.engine.queue_config("grow").await.unwrap().partitions, 4);
+    }
+    let (_, queues) = call(&c.nodes[0], get("/api/v1/queues")).await;
+    let grow = queues
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["queue"] == "grow")
+        .unwrap();
+    assert_eq!(grow["partition_shards"].as_array().unwrap().len(), 4);
+    let (s, _) = admin_call(
+        &c.nodes[1],
+        "PUT",
+        "/api/v1/queues/grow/partitions",
+        Some(ADMIN),
+        Some(serde_json::json!({"partitions": 0})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn draining_a_node_through_another_hands_its_shards_over() {
+    let c = cluster(3).await;
+    let mut ids = Vec::new();
+    for i in 0..15 {
+        let (s, b) = call(
+            &c.nodes[i % 3],
+            post(
+                "/api/v1/tasks",
+                serde_json::json!({"queue_name": "d", "task_name": "t"}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        ids.push(b["id"].as_str().unwrap().to_string());
+    }
+    let (s, body) = admin_call(
+        &c.nodes[0],
+        "POST",
+        "/api/v1/cluster/nodes/n2/drain",
+        Some(ADMIN),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{body}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let survivors: usize = c.nodes[..2]
+            .iter()
+            .map(|n| n.engine.owned_shards().len())
+            .sum();
+        if c.nodes[2].engine.is_drained() && survivors == SHARDS as usize {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "drain did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(c.nodes[2].engine.owned_shards().is_empty());
+    for id in &ids {
+        let (s, _) = call(&c.nodes[0], get(&format!("/api/v1/tasks/{id}"))).await;
+        assert_eq!(s, StatusCode::OK, "task {id} after the drain");
+    }
+    let (s, _) = admin_call(
+        &c.nodes[0],
+        "POST",
+        "/api/v1/cluster/nodes/ghost/drain",
+        Some(ADMIN),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}

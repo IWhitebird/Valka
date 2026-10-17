@@ -101,6 +101,12 @@ impl DispatcherService {
             let outcome = router
                 .reattach(&r.task_id, &r.task_run_id, r.attempt_number, &worker_id.0)
                 .await;
+            valka_core::metrics::record_reattach(match &outcome {
+                Ok(valka_engine::ReattachOutcome::Reattached) => "reattached",
+                Ok(valka_engine::ReattachOutcome::Adopted) => "adopted",
+                Ok(valka_engine::ReattachOutcome::Stale) => "stale",
+                Err(_) => "failed",
+            });
             match outcome {
                 Ok(valka_engine::ReattachOutcome::Stale) => {
                     info!(worker_id = %worker_id, task_id = %r.task_id, "stale run on reconnect: cancelling it");

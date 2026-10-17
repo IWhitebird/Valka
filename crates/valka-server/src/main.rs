@@ -94,12 +94,13 @@ async fn main() -> Result<()> {
     let http_addr = config.http_addr.parse()?;
     let shutdown_tx_rest = node.shutdown_tx.clone();
     let http_handle = tokio::spawn({
-        let (api, event_tx, logs, shutdown, web_dir) = (
+        let (api, event_tx, logs, shutdown, web_dir, admin_token) = (
             node.api.clone(),
             node.cluster_events.clone(),
             node.logs.clone(),
             node.shutdown_rx.clone(),
             config.web_dir.clone(),
+            config.admin_token.clone(),
         );
         let node_info = valka_server::cluster::NodeInfo::new(
             &config.grpc_addr,
@@ -114,6 +115,7 @@ async fn main() -> Result<()> {
                 logs,
                 metrics_handle,
                 node_info,
+                admin_token,
                 web_dir,
                 shutdown,
             )
@@ -135,6 +137,7 @@ async fn main() -> Result<()> {
         shutdown::wait_for_shutdown(),
         node.engine.poison_watch(),
         node.shutdown_rx.clone(),
+        node.engine.drained_watch(),
     )
     .await;
     match &reason {
@@ -144,6 +147,7 @@ async fn main() -> Result<()> {
             "WAL writer poisoned; exiting so the node restarts from the bucket"
         ),
         ExitReason::Failed => error!("a server task failed; exiting"),
+        ExitReason::Drained => info!("drained: every shard handed over, exiting"),
     }
     let _ = node.shutdown_tx.send(true);
 
@@ -158,7 +162,7 @@ async fn main() -> Result<()> {
 
     // A clean stop hands shards to live peers, or snapshots them for the next start.
     // A poisoned node must not write anything more: it exits and its successor recovers.
-    if reason.is_clean()
+    if reason == ExitReason::Signal
         && let Err(e) = node.engine.stop().await
     {
         tracing::error!(error = %e, "engine shutdown failed");

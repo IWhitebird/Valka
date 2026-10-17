@@ -145,11 +145,13 @@ pub enum ExitReason {
     Poisoned(String),
     /// A server task failed and requested shutdown.
     Failed,
+    /// The node was drained (admin API): it handed its shards over and exits.
+    Drained,
 }
 
 impl ExitReason {
     pub fn is_clean(&self) -> bool {
-        matches!(self, ExitReason::Signal)
+        matches!(self, ExitReason::Signal | ExitReason::Drained)
     }
 }
 
@@ -158,6 +160,7 @@ pub async fn wait_for_exit(
     signal: impl std::future::Future<Output = ()>,
     mut poison: watch::Receiver<Option<String>>,
     mut shutdown: watch::Receiver<bool>,
+    mut drained: watch::Receiver<bool>,
 ) -> ExitReason {
     let poisoned = async move {
         poison
@@ -166,9 +169,11 @@ pub async fn wait_for_exit(
             .map(|p| p.clone().unwrap_or_default())
     };
     let failed = async move { shutdown.wait_for(|s| *s).await.map(|_| ()) };
+    let drained = async move { drained.wait_for(|d| *d).await.map(|_| ()) };
     tokio::select! {
         _ = signal => ExitReason::Signal,
         Ok(reason) = poisoned => ExitReason::Poisoned(reason),
         Ok(()) = failed => ExitReason::Failed,
+        Ok(()) = drained => ExitReason::Drained,
     }
 }

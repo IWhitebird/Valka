@@ -164,6 +164,8 @@ pub(crate) struct Inner {
     pub(crate) shutdown: watch::Sender<bool>,
     /// Set once when this node must exit: the WAL writer failed or the lease was lost.
     pub(crate) poison: watch::Sender<Option<String>>,
+    /// Set once a drain finished: the process should exit (cleanly).
+    pub(crate) drained: watch::Sender<bool>,
     pub(crate) started_at: DateTime<Utc>,
     pub(crate) last_snapshot_round: Mutex<Option<DateTime<Utc>>>,
     /// Writer bytes committed when the last full snapshot round started.
@@ -226,6 +228,22 @@ impl Engine {
             meta::self_test(&store, &node_id).await?;
         }
 
+        // A node must not join a cluster that already runs a newer protocol: it could
+        // misread what the newer nodes write.
+        for (node, _) in valka_wal::lease::list(&store).await? {
+            if let Some(l) = valka_wal::lease::get(&store, &node).await?
+                && l.record.state != valka_wal::LeaseState::Dead
+                && l.record.protocol > valka_wal::lease::PROTOCOL
+                && node != node_id
+            {
+                return Err(ServerError::InvalidArgument(format!(
+                    "node {node} runs protocol {} but this build speaks {}; upgrade this node",
+                    l.record.protocol,
+                    valka_wal::lease::PROTOCOL
+                )));
+            }
+        }
+
         let (lease, _prev) = LeaseKeeper::start(
             store.clone(),
             &node_id,
@@ -266,6 +284,7 @@ impl Engine {
             pending_wake: Notify::new(),
             shutdown,
             poison: watch::Sender::new(None),
+            drained: watch::Sender::new(false),
             started_at: clock_now,
             last_snapshot_round: Mutex::new(None),
             log_mark: AtomicU64::new(0),
@@ -464,7 +483,17 @@ impl Engine {
             .set_state(valka_wal::LeaseState::Dead)
             .await?;
         info!(released, "drained");
+        self.inner.drained.send_replace(true);
         Ok(())
+    }
+
+    /// Turns true once a drain finished and the process should exit.
+    pub fn drained_watch(&self) -> watch::Receiver<bool> {
+        self.inner.drained.subscribe()
+    }
+
+    pub fn is_drained(&self) -> bool {
+        *self.inner.drained.borrow()
     }
 
     /// Force a snapshot round now (tests, admin).

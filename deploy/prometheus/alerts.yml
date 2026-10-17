@@ -1,0 +1,69 @@
+# Prometheus alert rules for a Valka cluster. Every node exports /metrics on its HTTP
+# port. Runbooks: docs/wal/RUNBOOKS.md (the `runbook` annotation names the section).
+groups:
+  - name: valka
+    rules:
+      - alert: ValkaNodeNotServing
+        # The node could not renew its lease for lease_timeout - safety_margin: it stopped
+        # dispatching and answers Unavailable until a renewal succeeds.
+        expr: valka_node_serving == 0
+        for: 30s
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.instance }} is self-fenced (lease not renewed)"
+          runbook: "RUNBOOKS.md#node-not-serving"
+
+      - alert: ValkaLeaseStale
+        expr: valka_lease_age_seconds > 6
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }} renews its lease slowly ({{ $value }}s)"
+          runbook: "RUNBOOKS.md#bucket-slow-or-down"
+
+      - alert: ValkaNodeFenced
+        # Someone else holds this node's lease (tombstone or a newer incarnation): the
+        # process exits; its supervisor should restart it.
+        expr: increase(valka_node_fenced_total[5m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }} was fenced"
+          runbook: "RUNBOOKS.md#node-fenced"
+
+      - alert: ValkaTakeover
+        expr: increase(valka_tombstones_total[5m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "a node was declared dead and its shards taken over"
+          runbook: "RUNBOOKS.md#node-lost"
+
+      - alert: ValkaSplitFailing
+        expr: increase(valka_split_failures_total[10m]) > 2
+        labels: { severity: critical }
+        annotations:
+          summary: "splitting a dead node's log keeps failing: its shards stay unavailable"
+          runbook: "RUNBOOKS.md#stuck-split"
+
+      - alert: ValkaUnownedShards
+        # Sum over nodes of owned shards below the cluster's shard count (set NUM_SHARDS).
+        expr: sum(valka_shards_owned) < 4096
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $value }} of 4096 shards are served"
+          runbook: "RUNBOOKS.md#unowned-shards"
+
+      - alert: ValkaClaimInvariant
+        expr: increase(valka_shard_claims_total{result="invariant"}[10m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "a claim found the bucket inconsistent with the protocol"
+          runbook: "RUNBOOKS.md#claim-invariant"
+
+      - alert: ValkaForwardingErrors
+        expr: rate(valka_forwarded_commands_total{result="unreachable"}[5m]) > 1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "nodes cannot reach each other's internal listener"
+          runbook: "RUNBOOKS.md#nodes-cannot-reach-each-other"

@@ -264,3 +264,35 @@ async fn log_holds_each_shards_records_in_order_under_concurrency() {
     }
     assert!(leases > 0, "the race was exercised");
 }
+
+/// A node refuses to join a cluster that already runs a newer protocol.
+#[tokio::test(start_paused = true)]
+async fn a_node_refuses_to_join_a_newer_protocol() {
+    let store = Store::memory();
+    let (newer, _) = lease::LeaseKeeper::start(
+        store.clone(),
+        "newer",
+        Default::default(),
+        valka_wal::LeaseConfig::from_core(&cfg("newer").cluster),
+    )
+    .await
+    .unwrap();
+    // Pretend it speaks a future protocol.
+    newer
+        .update(|r| r.protocol = valka_wal::lease::PROTOCOL + 1)
+        .await
+        .unwrap();
+    let err = Engine::open_with(
+        store.clone(),
+        cfg("older"),
+        TokioClock::new(),
+        Arc::new(crate::sink::NoopSink),
+    )
+    .await
+    .err()
+    .expect("must refuse");
+    assert!(err.to_string().contains("protocol"), "{err}");
+    // Once the newer node is gone, the older one may start.
+    newer.set_state(lease::LeaseState::Dead).await.unwrap();
+    open(&store, "older").await;
+}

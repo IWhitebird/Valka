@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Sse, sse::Event},
-    routing::{get, post},
+    routing::{delete, get, post, put},
 };
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
@@ -93,6 +93,7 @@ pub struct AppState {
     pub(crate) metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     pub(crate) node_info: NodeInfo,
     pub(crate) storage_cache: Arc<StorageCache>,
+    pub(crate) admin_token: Option<String>,
 }
 
 /// Header set when a cluster-wide answer is missing some node's part.
@@ -116,6 +117,7 @@ pub fn build_api_router(
     logs: Arc<LogIngester>,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     node_info: NodeInfo,
+    admin_token: Option<String>,
 ) -> Router {
     let state = AppState {
         engine: api.engine().clone(),
@@ -125,7 +127,30 @@ pub fn build_api_router(
         metrics_handle,
         node_info,
         storage_cache: cluster::new_storage_cache(),
+        admin_token,
     };
+    let admin_routes = Router::new()
+        .route(
+            "/api/v1/cluster/nodes/{node}/drain",
+            post(crate::admin::drain_node),
+        )
+        .route(
+            "/api/v1/cluster/shards/{shard}/move",
+            post(crate::admin::move_shard),
+        )
+        .route(
+            "/api/v1/cluster/shards/{shard}/pin",
+            delete(crate::admin::unpin_shard),
+        )
+        .route(
+            "/api/v1/queues/{queue}/partitions",
+            put(crate::admin::set_partitions),
+        )
+        .route("/api/v1/cluster/audit", get(crate::admin::audit_log))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::admin::require_admin,
+        ));
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -159,6 +184,9 @@ pub fn build_api_router(
         .route("/api/v1/cluster/storage", get(cluster::storage))
         .route("/api/v1/cluster/snapshot", post(cluster::snapshot_now))
         .route("/api/v1/cluster/members", get(cluster::members))
+        .route("/api/v1/cluster/placement", get(crate::admin::placement))
+        .route("/api/v1/queues", get(crate::admin::list_queues))
+        .merge(admin_routes)
         .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
         .with_state(state)
@@ -173,10 +201,11 @@ pub async fn serve_rest(
     logs: Arc<LogIngester>,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     node_info: NodeInfo,
+    admin_token: Option<String>,
     web_dir: String,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
-    let api_routes = build_api_router(api, event_tx, logs, metrics_handle, node_info);
+    let api_routes = build_api_router(api, event_tx, logs, metrics_handle, node_info, admin_token);
 
     let index_path = format!("{web_dir}/index.html");
     let spa_fallback = ServeDir::new(&web_dir).not_found_service(ServeFile::new(index_path));

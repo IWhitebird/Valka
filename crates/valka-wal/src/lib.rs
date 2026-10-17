@@ -14,6 +14,7 @@ pub mod logstore;
 pub mod lsn;
 pub mod meta;
 pub mod owners;
+pub mod placement;
 pub mod queues;
 pub mod reader;
 pub mod record;

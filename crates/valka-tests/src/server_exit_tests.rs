@@ -10,7 +10,7 @@ use crate::integration::helpers::{TestNode, task_req};
 async fn signal_is_a_clean_exit() {
     let (_ptx, prx) = watch::channel(None);
     let (_stx, srx) = watch::channel(false);
-    let reason = wait_for_exit(async {}, prx, srx).await;
+    let reason = wait_for_exit(async {}, prx, srx, watch::channel(false).1).await;
     assert_eq!(reason, ExitReason::Signal);
     assert!(reason.is_clean());
 }
@@ -20,7 +20,7 @@ async fn poisoned_writer_is_an_unclean_exit() {
     let (ptx, prx) = watch::channel(None);
     let (_stx, srx) = watch::channel(false);
     ptx.send_replace(Some("bucket down".into()));
-    let reason = wait_for_exit(std::future::pending(), prx, srx).await;
+    let reason = wait_for_exit(std::future::pending(), prx, srx, watch::channel(false).1).await;
     assert_eq!(reason, ExitReason::Poisoned("bucket down".into()));
     assert!(!reason.is_clean());
 }
@@ -33,7 +33,7 @@ async fn failed_server_task_is_an_unclean_exit() {
         tokio::time::sleep(Duration::from_millis(10)).await;
         stx.send_replace(true);
     });
-    let reason = wait_for_exit(std::future::pending(), prx, srx).await;
+    let reason = wait_for_exit(std::future::pending(), prx, srx, watch::channel(false).1).await;
     assert_eq!(reason, ExitReason::Failed);
 }
 
@@ -45,7 +45,7 @@ async fn dropped_channels_do_not_trigger_an_exit() {
     drop(stx);
     let reason = tokio::time::timeout(
         Duration::from_millis(50),
-        wait_for_exit(std::future::pending(), prx, srx),
+        wait_for_exit(std::future::pending(), prx, srx, watch::channel(false).1),
     )
     .await;
     assert!(reason.is_err(), "a closed channel is not a stop condition");
@@ -60,6 +60,7 @@ async fn node_whose_bucket_fails_decides_to_exit() {
         std::future::pending(),
         node.engine.poison_watch(),
         srx,
+        node.engine.drained_watch(),
     ));
     // The queue's config is cached by a first create; then the WAL PUTs start failing.
     node.engine.create_task(task_req("q", "t")).await.unwrap();

@@ -106,6 +106,11 @@ impl TestNode {
     }
 
     pub fn router(&self) -> Router {
+        self.router_with_admin(None)
+    }
+
+    /// The REST router with the admin API enabled under `token`.
+    pub fn router_with_admin(&self, token: Option<&str>) -> Router {
         let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
             .build_recorder()
             .handle();
@@ -115,6 +120,7 @@ impl TestNode {
             self.logs.clone(),
             metrics_handle,
             valka_server::cluster::NodeInfo::new("127.0.0.1:50051", "127.0.0.1:8989", 5),
+            token.map(str::to_string),
         )
     }
 

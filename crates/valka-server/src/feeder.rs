@@ -74,7 +74,10 @@ async fn fetch_loop(api: &Api, queue: &str, node: &str) {
             )
             .await;
         let tasks = match reply {
-            Some(Reply::Fetched(t)) => t,
+            Some(Reply::Fetched(t)) => {
+                valka_core::metrics::record_remote_fetch(t.len());
+                t
+            }
             // Unreachable or not an owner any more: the feeder re-plans on its next tick.
             _ => return,
         };

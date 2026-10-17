@@ -386,6 +386,7 @@ impl LeaseKeeper {
             error!(node = %self.node, inc = self.inc, reason = %why, "lease lost: this process is fenced");
             self.fenced.send_replace(Some(why));
             self.serving.send_replace(false);
+            valka_core::metrics::record_fenced();
         }
     }
 
@@ -507,6 +508,8 @@ impl LeaseKeeper {
                 }
             }
             let serving = self.is_serving();
+            valka_core::metrics::set_lease_age(self.lease_age().as_secs_f64());
+            valka_core::metrics::set_serving(serving);
             self.serving.send_if_modified(|s| {
                 if *s != serving {
                     if !serving {

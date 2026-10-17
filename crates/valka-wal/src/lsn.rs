@@ -155,6 +155,11 @@ pub mod keys {
         format!("logs/{}/{run_id}/{chunk_id}.log", hash_prefix(run_id))
     }
 
+    /// Audit record of one admin action.
+    pub fn admin_audit(ts_ms: i64, id: &str) -> String {
+        format!("admin/{ts_ms:016}-{id}.json")
+    }
+
     pub fn blob(id: &str) -> String {
         format!("blobs/{}/{id}", hash_prefix(id))
     }

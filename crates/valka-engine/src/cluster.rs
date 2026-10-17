@@ -67,6 +67,8 @@ pub(crate) struct Membership {
     /// Shards that were not claimable: next attempt, and the current backoff.
     backoff: Mutex<HashMap<ShardId, (Instant, Duration)>>,
     last_gc: Mutex<Option<Instant>>,
+    /// Operator pins from `placement.json` (shard -> node) and the ETag they were read at.
+    pins: Mutex<(BTreeMap<u16, String>, Option<String>)>,
 }
 
 impl Membership {
@@ -80,6 +82,7 @@ impl Membership {
             last_refresh: Mutex::new(None),
             backoff: Mutex::new(HashMap::new()),
             last_gc: Mutex::new(None),
+            pins: Mutex::new((BTreeMap::new(), None)),
         }
     }
 
@@ -144,7 +147,19 @@ impl Engine {
                 Err(e) => debug!(node, error = %e, "membership: reading lease failed"),
             }
         }
+        self.refresh_placement().await;
         *ms.last_refresh.lock() = Some(now);
+    }
+
+    /// Re-read operator pins (`placement.json`) if they changed.
+    pub async fn refresh_placement(&self) {
+        let ms = &self.inner.membership;
+        let etag = ms.pins.lock().1.clone();
+        match valka_wal::placement::refresh(&self.inner.store, etag.as_deref()).await {
+            Ok(Some((p, etag))) => *ms.pins.lock() = (p.pins, etag),
+            Ok(None) => {}
+            Err(e) => debug!(error = %e, "reading placement failed"),
+        }
     }
 
     fn observe_lease(&self, v: VersionedLease, now: Instant) {
@@ -206,8 +221,36 @@ impl Engine {
     }
 
     /// Where `shard` should live given `eligible` nodes.
+    /// Where `shard` should live: its pinned node while that node is eligible, otherwise
+    /// the rendezvous pick among `eligible`.
     pub fn desired_owner<'a>(&self, shard: ShardId, eligible: &'a [String]) -> Option<&'a str> {
+        if let Some(node) = self.pinned(shard)
+            && let Some(n) = eligible.iter().find(|n| **n == node)
+        {
+            return Some(n.as_str());
+        }
         rendezvous_pick(&shard.0.to_be_bytes(), eligible.iter().map(String::as_str))
+    }
+
+    /// The node an operator pinned `shard` to, if any.
+    pub fn pinned(&self, shard: ShardId) -> Option<String> {
+        self.inner.membership.pins.lock().0.get(&shard.0).cloned()
+    }
+
+    /// All operator pins (shard -> node).
+    pub fn pins(&self) -> BTreeMap<u16, String> {
+        self.inner.membership.pins.lock().0.clone()
+    }
+
+    /// The lowest protocol version among live nodes (this one included): features that
+    /// change what other nodes must understand wait until every live node speaks it.
+    pub fn effective_protocol(&self) -> u32 {
+        self.live_peers()
+            .iter()
+            .map(|(_, l)| l.protocol)
+            .chain(std::iter::once(valka_wal::lease::PROTOCOL))
+            .min()
+            .unwrap_or(valka_wal::lease::PROTOCOL)
     }
 
     /// Live nodes other than this one.
@@ -299,11 +342,16 @@ impl Engine {
                         claims.push(shard)
                     }
                     ShardPhase::Serving if draining => releases.push(shard),
+                    // An operator pin moves a shard at once; automatic moves respect the
+                    // minimum residency so a flapping node cannot make shards bounce.
                     ShardPhase::Serving
                         if desired.is_some_and(|d| d != me)
-                            && moved
-                                .get(&shard)
-                                .is_none_or(|at| now.duration_since(*at) >= residency) =>
+                            && (self
+                                .pinned(shard)
+                                .is_some_and(|p| Some(p.as_str()) == desired)
+                                || moved
+                                    .get(&shard)
+                                    .is_none_or(|at| now.duration_since(*at) >= residency)) =>
                     {
                         releases.push(shard)
                     }
@@ -328,6 +376,7 @@ impl Engine {
                 }
             }
         }
+        valka_core::metrics::set_shards_owned(self.owned_shards().len() as f64);
         if !releases.is_empty() {
             let limit = if draining {
                 usize::MAX
@@ -374,6 +423,7 @@ impl Engine {
                         match lease::tombstone(&self.inner.store, &v, &me).await {
                             Ok(true) => {
                                 warn!(node, inc = v.record.inc, "lease expired: tombstoned");
+                                valka_core::metrics::record_tombstone();
                                 let mut dead = v.clone();
                                 dead.record.state = LeaseState::Dead;
                                 dead.record.dead_by = Some(me.clone());
