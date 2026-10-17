@@ -156,8 +156,8 @@ goes through one function, `Engine::mutate`:
    │                                                          │ PUT wal/{me}/{inc}-{seq}.seg ──► 200
    │                                                          │ GET my own lease (conditional) ──► still mine
    │  ◄────────────────────────────────── durable ────────────│ release acks, in order
-   │  after_durable: publish events, offer to matching
-   │  acknowledge the client
+   │  after_durable: publish events, offer to matching   (in its own task: it runs even if
+   │  acknowledge the client                              the caller has gone away)
 ```
 
 - **Apply, then wait.** The RAM state is updated under the shard lock before the record is
@@ -470,7 +470,9 @@ Tasks nobody is waiting for stay in the owner's pending index; nothing is pushed
 
 ### 9.3 Reattach after a reconnect
 
-A worker that loses its node keeps running its tasks, reconnects (to any node), and says
+A worker that loses its node keeps running its tasks, reconnects (to another node if its
+server address is a load balancer or DNS name in front of several nodes, otherwise to the
+same node once it is back), and says
 in its hello which runs it is still executing. For each one the owner answers:
 
 - **Reattached:** the run is current; the owner records the worker's new node
@@ -497,7 +499,7 @@ dispatched again.
 | Two nodes claim one shard | CAS on the owner record: one wins | Nothing |
 | Node restarts with the same id | New incarnation fences the old one and splits its own old log at once; peers claim its shards (alone: it claims them itself); its share moves back later | Seconds of unavailability for those shards, no lease timeout to wait out |
 | `SIGTERM` (rolling restart) | If live peers exist: release every shard with a final snapshot, then exit; peers claim without any replay. Alone: keep the shards, reclaim on restart | Near-zero unavailability |
-| A worker's node dies mid-task | The worker keeps running, reconnects to another node, reattaches; its result is resent and acknowledged | The task completes once |
+| A worker's node dies mid-task | The worker keeps running, reconnects (another node behind its address, or the same one once restarted), reattaches; its result is resent and acknowledged | The task completes once |
 | The owner dies right after dispatching | The worker's reattach adopts the run | No duplicate run |
 | A worker dies mid-task | The run's lease expires; the task is retried (checkpointed steps are skipped) | One retry |
 
@@ -559,7 +561,7 @@ number of nodes.
 | Engine and WAL | `crates/valka-engine/src/tests.rs`, `crates/valka-wal` | crash/replay property test, timers, the writer under faults |
 | Integration | `crates/valka-tests` | REST, gRPC and the Rust SDK end to end; 3-node clusters over real localhost gRPC (routing, cross-node workers, reattach, admin, mTLS) |
 | Real S3 | `--features minio` | conditional-write semantics, storage self-test, two-node takeover |
-| Chaos | `scripts/chaos.sh` + `examples/rs/chaos.rs` | a 3-node docker compose cluster with random `kill -9`, freezes and restarts under load; checks that every acknowledged task exists and finishes and no idempotency key made two tasks. It found 2 bugs: a drain stopped renewing its lease before handing its shards over, and a task whose local dispatch failed stayed "offered" forever instead of runnable (PHASE2.md §19b) |
+| Chaos | `scripts/chaos.sh` + `examples/rs/chaos.rs` | a 3-node docker compose cluster with random `kill -9`, freezes and restarts under load; checks that every acknowledged task exists and finishes and no idempotency key made two tasks. It found 3 bugs: a drain stopped renewing its lease before handing its shards over; a task whose local dispatch failed stayed "offered" forever; a create whose forwarding node died mid-request became durable but was never made runnable (PHASE2.md §19b) |
 
 ## 14. Compared with Cloudflare Durable Objects
 

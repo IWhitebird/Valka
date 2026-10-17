@@ -1340,6 +1340,32 @@ async fn results_that_cannot_be_made_durable_are_retried() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_create_whose_caller_goes_away_is_still_published_once_durable() {
+    // Found by the chaos rig: a create forwarded by a node that was killed mid-request was
+    // cancelled while waiting for durability. The record became durable, but the task was
+    // never indexed or offered, so it never ran.
+    let store = Store::memory();
+    let e = open(&store).await;
+    let sink = Arc::new(RecordingSink::default());
+    e.set_sink(sink.clone());
+    e.create_task(create("q")).await.unwrap();
+    settle().await;
+    assert_eq!(sink.offers.lock().len(), 1);
+    // The caller gives up while the record waits for its group commit.
+    let gave_up = tokio::time::timeout(Duration::from_millis(1), e.create_task(create("q"))).await;
+    assert!(
+        gave_up.is_err(),
+        "the create was still waiting for durability"
+    );
+    settle().await;
+    assert_eq!(
+        sink.offers.lock().len(),
+        2,
+        "the durable task was offered although its caller was gone"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_local_offer_that_is_never_dispatched_lapses_back_to_pending() {
     // Found by the chaos rig: the owner's own feeder handed a task to its matching layer,
     // the dispatch failed (the node was briefly not serving), and the task stayed

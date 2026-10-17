@@ -227,47 +227,75 @@ async fn main() {
         acked.len(),
         errors.load(Ordering::Relaxed)
     );
-    let mut clients: Vec<Option<ValkaClient>> = clients.lock().unwrap().clone();
+    let clients: Vec<Option<ValkaClient>> = clients.lock().unwrap().clone();
 
-    // Check: every acknowledged task exists and finishes.
+    // Check: every acknowledged task exists and finishes. Each pass reads every task not
+    // yet seen terminal, through all nodes, CHECKERS reads at a time.
+    const CHECKERS: usize = 32;
     let deadline = Instant::now() + Duration::from_secs(drain);
     let mut pending: HashSet<String> = acked.keys().cloned().collect();
     let mut missing: HashSet<String> = HashSet::new();
     let mut statuses: HashMap<i32, usize> = HashMap::new();
     let mut by_key: HashMap<String, HashSet<String>> = HashMap::new();
     while !pending.is_empty() && Instant::now() < deadline {
-        let batch: Vec<String> = pending.iter().take(200).cloned().collect();
-        for id in batch {
-            let i = rng.below(nodes.len() as u64) as usize;
-            if clients[i].is_none() {
-                clients[i] = connect(&nodes[i]).await;
-            }
-            let Some(client) = clients[i].as_mut() else {
-                continue;
-            };
-            match tokio::time::timeout(Duration::from_secs(10), client.get_task(&id)).await {
-                Err(_) => clients[i] = None,
-                Ok(Ok(t)) => {
-                    missing.remove(&id);
-                    if !t.idempotency_key.is_empty() {
-                        by_key
-                            .entry(t.idempotency_key.clone())
-                            .or_default()
-                            .insert(t.id.clone());
+        let ids: Vec<String> = pending.iter().cloned().collect();
+        let chunk = ids.len().div_ceil(CHECKERS);
+        let mut readers = tokio::task::JoinSet::new();
+        for (n, part) in ids.chunks(chunk.max(1)).enumerate() {
+            let i = n % nodes.len();
+            let (addr, mut client, part) = (nodes[i].clone(), clients[i].clone(), part.to_vec());
+            readers.spawn(async move {
+                let mut out = Vec::with_capacity(part.len());
+                for id in part {
+                    if client.is_none() {
+                        client = tokio::time::timeout(Duration::from_secs(5), connect(&addr))
+                            .await
+                            .ok()
+                            .flatten();
                     }
-                    if matches!(t.status, COMPLETED | FAILED | DEAD_LETTER | CANCELLED) {
-                        *statuses.entry(t.status).or_default() += 1;
-                        pending.remove(&id);
+                    let Some(c) = client.as_mut() else { break };
+                    match tokio::time::timeout(Duration::from_secs(5), c.get_task(&id)).await {
+                        Ok(Ok(t)) => out.push((id, Some(Ok((t.status, t.idempotency_key))))),
+                        Ok(Err(e)) if e.to_string().to_lowercase().contains("not found") => {
+                            out.push((id, Some(Err(()))))
+                        }
+                        // Unavailable or slow: try again next pass, on a fresh connection.
+                        _ => {
+                            out.push((id, None));
+                            client = None;
+                        }
                     }
                 }
-                Ok(Err(e)) if e.to_string().to_lowercase().contains("not found") => {
-                    missing.insert(id);
+                out
+            });
+        }
+        while let Some(read) = readers.join_next().await {
+            for (id, seen) in read.unwrap_or_default() {
+                match seen {
+                    Some(Ok((status, key))) => {
+                        missing.remove(&id);
+                        if !key.is_empty() {
+                            by_key.entry(key).or_default().insert(id.clone());
+                        }
+                        if matches!(status, COMPLETED | FAILED | DEAD_LETTER | CANCELLED) {
+                            *statuses.entry(status).or_default() += 1;
+                            pending.remove(&id);
+                        }
+                    }
+                    Some(Err(())) => {
+                        missing.insert(id);
+                    }
+                    None => {}
                 }
-                Ok(Err(_)) => clients[i] = None,
             }
         }
         if !pending.is_empty() {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            println!(
+                "  check: {} not finished yet ({} not found)",
+                pending.len(),
+                missing.len()
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
     for s in &stops {

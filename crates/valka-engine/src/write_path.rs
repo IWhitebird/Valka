@@ -85,6 +85,47 @@ impl Engine {
         }
     }
 
+    /// Wait until `durable`, then publish `transitions` (events, runnable index, offers,
+    /// timers). The wait and the publishing run in their own task: a caller that goes away
+    /// mid-wait (a request cancelled because its client disconnected) must not leave a
+    /// durable record unpublished. Found by the chaos rig: creates forwarded by a node that
+    /// was killed mid-request became durable but were never indexed, so they never ran.
+    pub(crate) async fn commit(
+        &self,
+        durable: Durable,
+        transitions: Vec<Transition>,
+    ) -> Result<(), ServerError> {
+        self.commit_all(vec![durable], transitions).await
+    }
+
+    /// [`Engine::commit`] for several records.
+    pub(crate) async fn commit_all(
+        &self,
+        durables: Vec<Durable>,
+        transitions: Vec<Transition>,
+    ) -> Result<(), ServerError> {
+        let me = self.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut res = Ok(());
+            for d in durables {
+                if let Err(e) = d.wait().await {
+                    res = Err(e);
+                    break;
+                }
+            }
+            match &res {
+                Ok(()) => me.after_durable(&transitions),
+                Err(e) => warn!(error = %e, "record not durable; transitions not published"),
+            }
+            let _ = tx.send(res);
+        });
+        match rx.await {
+            Ok(res) => res.map_err(Into::into),
+            Err(_) => Err(ServerError::Unavailable("commit interrupted; retry".into())),
+        }
+    }
+
     pub(crate) fn spawn_after_durable(&self, durable: Durable, transitions: Vec<Transition>) {
         let me = self.clone();
         tokio::spawn(async move {

@@ -820,6 +820,13 @@ The model's findings (§19) are all implemented, each with a regression test
   remote, lapses after `OFFER_TTL` (30 s) as a safety net. Regression tests:
   `a_local_offer_that_is_never_dispatched_lapses_back_to_pending`,
   `test_a_failed_dispatch_hands_the_task_back_at_once`.
+- **Found by the chaos rig: publishing after durability must not depend on the caller.**
+  A create forwarded by a node that was then killed had its request cancelled while it
+  waited for its group commit. The record became durable, but the code after the wait
+  (publish events, index and offer the task, arm timers) ran in the cancelled future, so
+  the task was durable yet never runnable until its shard moved. Every command now waits
+  and publishes in its own task (`Engine::commit`) and the caller only awaits the outcome.
+  Regression test: `a_create_whose_caller_goes_away_is_still_published_once_durable`.
 
 ## 20. Open questions
 

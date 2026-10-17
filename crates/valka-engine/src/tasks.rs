@@ -150,9 +150,8 @@ impl Engine {
             },
             |st| st.tasks.get(&id).map(|t| t.view()),
         )?;
-        durable.wait().await?;
+        self.commit(durable, transitions).await?;
         valka_core::metrics::record_task_created(&req.queue_name);
-        self.after_durable(&transitions);
         view.ok_or_else(|| ServerError::Internal("task vanished after create".into()))
     }
 
@@ -262,8 +261,7 @@ impl Engine {
             },
             |st| st.tasks.get(task_id).map(|t| t.view()),
         )?;
-        durable.wait().await?;
-        self.after_durable(&transitions);
+        self.commit(durable, transitions).await?;
         let view =
             view.ok_or_else(|| ServerError::Internal("task vanished after cancel".into()))?;
         Ok((view, running))
@@ -307,8 +305,7 @@ impl Engine {
         );
         match res {
             Ok((durable, transitions, _, _)) => {
-                durable.wait().await?;
-                self.after_durable(&transitions);
+                self.commit(durable, transitions).await?;
                 Ok(true)
             }
             Err(ServerError::TaskNotFound(_)) => Ok(false),
@@ -338,10 +335,7 @@ impl Engine {
                 all_transitions.extend(tr);
             }
         }
-        for d in waits {
-            d.wait().await?;
-        }
-        self.after_durable(&all_transitions);
+        self.commit_all(waits, all_transitions).await?;
         Ok(total)
     }
 
@@ -576,8 +570,7 @@ impl Engine {
             },
             |_| (),
         )?;
-        durable.wait().await?;
-        self.after_durable(&transitions);
+        self.commit(durable, transitions).await?;
         Ok(())
     }
 
@@ -607,8 +600,7 @@ impl Engine {
             },
             |st| st.tasks.get(task_id).map(|t| t.view()),
         )?;
-        durable.wait().await?;
-        self.after_durable(&transitions);
+        self.commit(durable, transitions).await?;
         view.ok_or_else(|| ServerError::Internal("task vanished after completion".into()))
     }
 
@@ -645,8 +637,7 @@ impl Engine {
             |_| (),
         )?;
         self.arm_timers_for(&transitions);
-        durable.wait().await?;
-        self.after_durable(&transitions);
+        self.commit(durable, transitions).await?;
         Ok(FailResult { outcome })
     }
 
