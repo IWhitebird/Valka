@@ -429,3 +429,141 @@ async fn test_reconnecting_worker_keeps_current_runs_and_cancels_stale_ones() {
         .clone();
     assert!(active.contains(&live.id) && active.contains(&lost.id) && !active.contains(&done.id));
 }
+
+/// Fails the first `fail` reattaches (the owner unreachable while its shard moves), then
+/// answers like the local engine.
+struct FlakyReattach {
+    inner: valka_dispatcher::LocalRouter,
+    fail: std::sync::atomic::AtomicU32,
+}
+
+#[async_trait::async_trait]
+impl valka_dispatcher::TaskRouter for FlakyReattach {
+    async fn dispatch(
+        &self,
+        task_id: &str,
+        worker_id: &str,
+    ) -> Result<valka_engine::DispatchInfo, valka_core::ServerError> {
+        self.inner.dispatch(task_id, worker_id).await
+    }
+    async fn return_run(&self, task_id: &str, run_id: &str) {
+        self.inner.return_run(task_id, run_id).await
+    }
+    async fn unoffer(&self, task_id: &str) {
+        self.inner.unoffer(task_id).await
+    }
+    async fn report_result(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        result: valka_engine::RunResult,
+    ) -> valka_engine::ResultOutcome {
+        self.inner.report_result(task_id, run_id, result).await
+    }
+    async fn heartbeat(&self, task_ids: &[String]) {
+        self.inner.heartbeat(task_ids).await
+    }
+    async fn checkpoint(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        step: &str,
+        output: serde_json::Value,
+    ) -> Result<valka_engine::CheckpointView, valka_core::ServerError> {
+        self.inner.checkpoint(task_id, run_id, step, output).await
+    }
+    async fn signal_delivered(&self, signal_id: &str) {
+        self.inner.signal_delivered(signal_id).await
+    }
+    async fn signal_acked(&self, signal_id: &str) {
+        self.inner.signal_acked(signal_id).await
+    }
+    async fn reset_signals(&self, task_id: &str) {
+        self.inner.reset_signals(task_id).await
+    }
+    async fn reattach(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        attempt: i32,
+        worker_id: &str,
+    ) -> Result<valka_engine::ReattachOutcome, valka_core::ServerError> {
+        use std::sync::atomic::Ordering;
+        if self
+            .fail
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(valka_core::ServerError::Unavailable(
+                "shard is moving".into(),
+            ));
+        }
+        self.inner
+            .reattach(task_id, run_id, attempt, worker_id)
+            .await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_reattach_is_retried_while_the_owner_is_unreachable() {
+    use valka_proto::RunningTask;
+    let node = TestNode::new().await;
+    node.engine
+        .set_sink(std::sync::Arc::new(valka_engine::NoopSink));
+    let live = node.create("q", "t").await;
+    let live_run = node.start(&live.id, "w-old");
+    // A dispatch record lost in a crash: only a successful reattach adopts it.
+    let lost = node.create("q", "t").await;
+    let lost_run = valka_core::new_id_in_shard(node.engine.shard_of(&lost.id).unwrap()).to_string();
+    node.dispatcher
+        .set_router(std::sync::Arc::new(FlakyReattach {
+            inner: valka_dispatcher::LocalRouter(node.engine.clone()),
+            fail: std::sync::atomic::AtomicU32::new(4),
+        }));
+
+    let (wid, _rx) = node.register_worker(&["q"], 4).await;
+    let tx = node
+        .dispatcher
+        .workers()
+        .get(wid.as_ref())
+        .unwrap()
+        .response_tx
+        .clone();
+    node.dispatcher
+        .reattach_running(
+            &wid,
+            &[
+                RunningTask {
+                    task_id: live.id.clone(),
+                    task_run_id: live_run.clone(),
+                    attempt_number: 1,
+                },
+                RunningTask {
+                    task_id: lost.id.clone(),
+                    task_run_id: lost_run.clone(),
+                    attempt_number: 1,
+                },
+            ],
+            &tx,
+        )
+        .await;
+    // Both failed: nothing changed at the owner yet.
+    assert_eq!(
+        node.engine.run_location(&live.id).unwrap().worker_id,
+        "w-old"
+    );
+    assert_eq!(
+        node.engine.get_task(&lost.id).unwrap().status,
+        TaskStatus::Pending
+    );
+
+    // The background retries get through once the owner answers again.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    settle().await;
+    assert_eq!(node.engine.run_location(&live.id).unwrap().worker_id, wid.0);
+    assert_eq!(
+        node.engine.get_task(&lost.id).unwrap().status,
+        TaskStatus::Running
+    );
+    assert_eq!(node.engine.run_location(&lost.id).unwrap().worker_id, wid.0);
+}

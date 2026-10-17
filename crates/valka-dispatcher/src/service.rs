@@ -3,6 +3,7 @@ use crate::router::{LocalRouter, TaskRouter};
 use crate::worker_handle::WorkerHandle;
 use dashmap::DashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 use valka_core::{NodeId, PartitionId, WorkerId};
@@ -14,6 +15,10 @@ use valka_proto::{
     TaskCancellation, TaskResult, TaskSignal, WorkerResponse, worker_response,
 };
 use valka_wal::logstore::LogLine;
+
+/// How long a reattach whose owner is unreachable (its shard is moving) keeps being retried
+/// while the worker still runs the task.
+const REATTACH_RETRY_FOR: Duration = Duration::from_secs(60);
 
 /// The dispatcher manages all connected workers and their gRPC streams.
 #[derive(Clone)]
@@ -86,7 +91,10 @@ impl DispatcherService {
     }
 
     /// A (re)connecting worker still runs these runs. Each is reattached to this node,
-    /// adopted if its dispatch record was lost, or cancelled on the worker if stale.
+    /// adopted if its dispatch record was lost, or cancelled on the worker if stale. A run
+    /// whose owner cannot be reached right now (its shard is moving) is retried in the
+    /// background while the worker still runs it: until the owner hears about it, cancels
+    /// and signals go to the run's old node, and a lost dispatch would not be adopted.
     pub async fn reattach_running(
         &self,
         worker_id: &WorkerId,
@@ -98,38 +106,82 @@ impl DispatcherService {
             if let Some(mut h) = self.workers.get_mut(worker_id.as_ref()) {
                 h.assign_task(r.task_id.clone());
             }
-            let outcome = router
+            match router
                 .reattach(&r.task_id, &r.task_run_id, r.attempt_number, &worker_id.0)
-                .await;
-            valka_core::metrics::record_reattach(match &outcome {
-                Ok(valka_engine::ReattachOutcome::Reattached) => "reattached",
-                Ok(valka_engine::ReattachOutcome::Adopted) => "adopted",
-                Ok(valka_engine::ReattachOutcome::Stale) => "stale",
-                Err(_) => "failed",
-            });
-            match outcome {
-                Ok(valka_engine::ReattachOutcome::Stale) => {
-                    info!(worker_id = %worker_id, task_id = %r.task_id, "stale run on reconnect: cancelling it");
-                    if let Some(mut h) = self.workers.get_mut(worker_id.as_ref()) {
-                        h.complete_task(&r.task_id);
-                    }
-                    let cancel = WorkerResponse {
-                        response: Some(worker_response::Response::TaskCancellation(
-                            TaskCancellation {
-                                task_id: r.task_id.clone(),
-                                reason: "stale run: it ended or was superseded".to_string(),
-                            },
-                        )),
-                    };
-                    let _ = tx.send(cancel).await;
+                .await
+            {
+                Ok(outcome) => self.reattached(worker_id, r, outcome, tx).await,
+                Err(e) => {
+                    valka_core::metrics::record_reattach("retrying");
+                    warn!(task_id = %r.task_id, error = %e, "reattach failed; retrying in the background");
+                    let (me, worker_id, r, tx) =
+                        (self.clone(), worker_id.clone(), r.clone(), tx.clone());
+                    tokio::spawn(async move { me.retry_reattach(worker_id, r, tx).await });
                 }
-                Ok(o) => {
-                    debug!(worker_id = %worker_id, task_id = %r.task_id, outcome = ?o, "run reattached")
-                }
-                // Owner unreachable: keep the run; its heartbeats and result retry.
-                Err(e) => warn!(task_id = %r.task_id, error = %e, "reattach failed"),
             }
         }
+    }
+
+    async fn retry_reattach(
+        &self,
+        worker_id: WorkerId,
+        r: valka_proto::RunningTask,
+        tx: mpsc::Sender<WorkerResponse>,
+    ) {
+        let deadline = tokio::time::Instant::now() + REATTACH_RETRY_FOR;
+        let mut delay = Duration::from_millis(500);
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(5));
+            let still_running = self
+                .workers
+                .get(worker_id.as_ref())
+                .is_some_and(|h| h.active_tasks.contains(&r.task_id));
+            if !still_running || tx.is_closed() {
+                return;
+            }
+            match self
+                .router()
+                .reattach(&r.task_id, &r.task_run_id, r.attempt_number, &worker_id.0)
+                .await
+            {
+                Ok(outcome) => return self.reattached(&worker_id, &r, outcome, &tx).await,
+                Err(e) => debug!(task_id = %r.task_id, error = %e, "reattach still failing"),
+            }
+        }
+        valka_core::metrics::record_reattach("failed");
+        warn!(task_id = %r.task_id, "reattach gave up: the task's owner stayed unreachable");
+    }
+
+    async fn reattached(
+        &self,
+        worker_id: &WorkerId,
+        r: &valka_proto::RunningTask,
+        outcome: valka_engine::ReattachOutcome,
+        tx: &mpsc::Sender<WorkerResponse>,
+    ) {
+        valka_core::metrics::record_reattach(match outcome {
+            valka_engine::ReattachOutcome::Reattached => "reattached",
+            valka_engine::ReattachOutcome::Adopted => "adopted",
+            valka_engine::ReattachOutcome::Stale => "stale",
+        });
+        if outcome != valka_engine::ReattachOutcome::Stale {
+            debug!(worker_id = %worker_id, task_id = %r.task_id, outcome = ?outcome, "run reattached");
+            return;
+        }
+        info!(worker_id = %worker_id, task_id = %r.task_id, "stale run on reconnect: cancelling it");
+        if let Some(mut h) = self.workers.get_mut(worker_id.as_ref()) {
+            h.complete_task(&r.task_id);
+        }
+        let cancel = WorkerResponse {
+            response: Some(worker_response::Response::TaskCancellation(
+                TaskCancellation {
+                    task_id: r.task_id.clone(),
+                    reason: "stale run: it ended or was superseded".to_string(),
+                },
+            )),
+        };
+        let _ = tx.send(cancel).await;
     }
 
     /// The worker is draining: no new tasks, but its stream stays open for results.
