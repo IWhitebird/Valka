@@ -49,7 +49,7 @@ cargo fmt --check                # Format check
 | `valka-server` | Binary: assembles all services (gRPC + REST + internal listener + engine + log ingester); `api.rs` routes every request (local / forward / scatter), `feeder.rs` remote fetching, `relay.rs` cluster events, `admin.rs` admin API |
 | `valka-sdk` | Rust worker SDK: ValkaClient (task CRUD) + ValkaWorker (builder pattern, stream) |
 | `valka-cli` | CLI: `valka task create/get/list/cancel`, `valka logs tail` |
-| `valka-tests` | Unit + integration test suite (254 tests, incl. 3-node clusters over real localhost gRPC, plus MinIO-gated) |
+| `valka-tests` | Unit + integration test suite (255 tests, incl. 3-node clusters over real localhost gRPC, plus MinIO-gated) |
 | `examples/rs` | Rust examples (producer, worker, full_lifecycle, signal_demo, steps) |
 
 ## SDKs
@@ -164,8 +164,8 @@ Dev default is `./data` via the `local` backend. MinIO for S3 semantics: `docker
 ```bash
 cargo test --workspace                                   # everything, no external services
 cargo test -p valka-wal                                  # 40: store, codec, writer under faults, snapshots, leases, owners, split/seal
-cargo test -p valka-engine                               # 62: lifecycle, timers (paused time), recovery, checkpoints, results, log budget, crash/replay proptest, multi-node takeover/drain/fencing, TLA+ regressions, randomized simulation
-cargo test -p valka-tests                                # 254: unit + REST + lifecycle + dispatcher + gRPC e2e with the SDK, server exit, 3-node routing/workers/admin/mTLS
+cargo test -p valka-engine                               # 64: lifecycle, timers (paused time), recovery, checkpoints, results, log budget, crash/replay proptest, multi-node takeover/drain/fencing, TLA+ regressions, randomized simulation
+cargo test -p valka-tests                                # 255: unit + REST + lifecycle + dispatcher + gRPC e2e with the SDK, server exit, 3-node routing/workers/admin/mTLS
 VALKA_SIM_SEEDS=200 cargo test -p valka-engine randomized_cluster   # more simulation seeds
 scripts/chaos.sh                                         # chaos on the 3-node compose cluster (docker)
 VALKA_TEST_S3_ENDPOINT=http://localhost:9000 AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \

@@ -634,6 +634,11 @@ checks that every acknowledged create exists and reaches a terminal state, and t
 idempotency key produced two tasks. Network splits and bucket slowdowns (toxiproxy) and the
 24 h soak are not part of it yet.
 
+Results so far (10-minute runs at 20 creates/s, ~9,500 acknowledged tasks each): no
+acknowledged task lost and no duplicate key in any run. Three runs failed liveness or drain
+expectations and led to the three fixes in §19b; the run after them passed with every task
+completed (6 kills, 5 freezes, 7 SIGTERM restarts, every drain complete).
+
 ### 15.5 Release gates for phase 2
 
 - TLC clean at the model sizes above.
