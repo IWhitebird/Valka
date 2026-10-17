@@ -142,9 +142,22 @@ The snapshot's log pointer is in its **key**, so garbage collection can run on L
 ### 7.1 Lease object
 
 `nodes/{node}/lease` holds
-`{inc, state: alive|draining|dead, counter, internal_addr, api_addr, version, protocol, dead_by?}`.
-Only its owner writes it, except for exactly one kind of write by another node: the
-tombstone (§7.4). Every write is a CAS (`If-Match`).
+`{inc, state: alive|draining|dead, counter, internal_addr, api_addr, version, protocol, dead_by?, incarnations}`.
+`incarnations` lists the current incarnation and every earlier one that is not split yet,
+each with its **truncation watermark** `trunc`: the lowest position of that incarnation's
+log that may still exist (§8.7). Only its owner writes it, except for exactly one kind of
+write by another node: the tombstone (§7.4). Every write is a CAS (`If-Match`).
+
+Once an incarnation is fenced (tombstoned, or superseded by a newer start) its owner can no
+longer CAS the lease, so its watermark is **frozen**. Splits rely on that (§8.3).
+
+Leases are **never deleted**. Deleting one restarts the node's incarnation counter, and a
+reused incarnation id is still named by old split markers and snapshot pointers: the
+split-log collector deletes the live reused incarnation's segments (the TLA+ model's
+`LeaseGC` counterexample loses an acknowledged record this way), a slow splitter of the old
+incarnation seals the new one's log, and when it dies claimers find "dead and split" and
+skip its split. A paused process of the old incarnation would also pass its own-lease
+checks again. A lease is a few hundred bytes per node id ever used.
 
 ### 7.2 Start
 
@@ -152,7 +165,8 @@ tombstone (§7.4). Every write is a CAS (`If-Match`).
 1. read or create cluster.json; refuse to start if num_shards / format differ from config
 2. storage self-test (§12.1); refuse clustered mode on local/memory backends
 3. read nodes/{me}/lease; CAS it to {inc: old.inc + 1, state: alive}        ← fences my previous run
-4. if my previous incarnation owned shards: split its log (§8.3)         ← as any dead node's
+   carrying every not-yet-split incarnation's watermark forward
+4. if my previous incarnations owned shards: split their logs (§8.3)    ← as any dead node's
 5. join gossip (seeds from config, else from the addresses in nodes/*/lease)
 6. wait join_delay, then take part in placement (§8.1)
 ```
@@ -217,32 +231,67 @@ Run by D's guardian. For a restarted node, it is run by the node's own next inca
 Any node may run it again after `split_timeout`; the result is idempotent.
 
 ```
-1. LIST wal/{node}/{inc}-*; find the contiguous run of segments and its first gap
-   (or an existing SEALED segment, which is then the end)
-2. PUT-create a SEALED empty segment at the first gap
-   (if that position was just filled by a late PUT: LIST again, retry at the new gap)
-3. read segments up to the seal (range GETs, in parallel), group records by (shard, gen)
-4. for each (shard, gen): load that shard's latest snapshot at that gen, apply records
-   with shard_seq > snapshot.seq in log order, PUT-create a snapshot
-   (gen, last_seq, ptr = split)
-5. PUT-create splits/{node}/{inc}                                         ← "split done"
-6. delete D's segments (garbage collector backstop: §8.7)
+1. read D's watermark w from nodes/{node}/lease          ← frozen: D is fenced (§7.1)
+2. LIST wal/{node}/{inc}-* from w; the end is the first position ≥ w that is not listed,
+   or an existing SEALED segment at or above w
+3. PUT-create a SEALED empty segment at the end
+   (if a late PUT just filled that position: LIST again, retry at the new end)
+4. read the segments from w up to the seal (range GETs, in parallel); a segment that
+   vanished meanwhile is skipped (only a finished concurrent split deletes there)
+5. only then: if splits/{node}/{inc} exists, another split finished → stop, write nothing;
+   else for each shard whose owner record names D (at gen g): load the shard's newest
+   snapshot at gen g, apply D's records of (shard, g) above its shard_seq in log order,
+   PUT-create a snapshot (g, last_seq, ptr = split) if there were any
+6. PUT-create splits/{node}/{inc}                                         ← "split done"
+7. delete D's segments (garbage collector backstop: §8.7)
 ```
 
 Why it is safe:
 - **Nothing acked is missed (G1).** A segment was acked only after its own-lease check
   (§12.3) passed. That check happened before the tombstone, which happened before this
-  LIST. The segment's PUT happened before the check, and bucket LIST is strongly consistent,
-  so step 1 sees it.
+  LIST, and the segment's PUT happened before the check. Acks resolve in order, so every
+  position from w up to the highest acked one holds a segment, and none of them is deleted
+  before D's split marker exists: truncation deletes only below a watermark it first CASed
+  into the lease (§8.7), and a fenced incarnation can no longer CAS it. A LIST is
+  linearizable per key, so a key that exists for the whole LIST is listed: the end found in
+  step 2 lies above every acked segment.
+- **Why not "the first gap after the lowest listed position".** The TLA+ model (§15.1)
+  breaks both obvious alternatives. (a) A paused D wakes up after its tombstone and keeps
+  truncating; a LIST racing those ascending deletes can see `{k, k+2, …}` with `k+1`
+  already gone. "First gap" then seals `k+1` (create-if-absent succeeds on a deleted
+  position) and every acked segment above it is lost once D's log is collected. (b) The
+  lowest listed position can sit above a position whose PUT has not landed (segment 1 in
+  flight, segment 2 landed). Reading from 2 skips shard_seqs: the split snapshot's history
+  has a hole. `max(w, lowest listed)` still has (b). Starting at w and stopping at the first
+  missing position has neither: holes below w are ignored, and a missing position at or
+  above w is the end.
 - **Nothing is added behind the seal.** A dead node's in-flight PUTs can land out of order.
   A segment after a gap was never acked, because acks resolve strictly in order. Sealing the
   gap makes the missing PUT fail, and every reader stops at the seal. Positions below the gap
   already exist and are create-if-absent, so they can't be overwritten.
-- **Deterministic.** Two splitters running at once write semantically identical snapshots;
-  create-if-absent keeps the first.
-- **Old generations are harmless.** If D owned a shard, released it and later re-claimed it,
-  its log holds records of both generations. A split snapshot of the older generation sorts
-  below the newer one and is never loaded.
+- **A slow splitter re-checks the marker before writing.** Once a split has finished, step 7
+  deletes the log *including the seal*, so a dead node's very late PUT can land at the
+  sealed position again. A splitter that started before the marker and reads after it can
+  then see a log nobody else saw: the model found one writing a split snapshot with a
+  `shard_seq` hole that became the shard's newest snapshot. Re-checking the marker after
+  reading closes it: a splitter that still finds no marker read before the marker existed,
+  so before any GC, and the log it read is the one the finished split read.
+- **Read, then load the owner records and bases.** Segments that vanish mid-read (only GC
+  after a marker deletes at or above w) are skipped or fail the split. Either is safe only
+  because what step 5 builds on is read *after* the log: by then it reflects any finished
+  split (its snapshots cover what vanished) and any release. Loading them first is not:
+  the model has a slow splitter load its base, the finished split's GC remove the log and,
+  after the owner's release, the marker as well, so the re-check passes and the stale base
+  plus the remains of the log make a snapshot with a hole.
+- **Deterministic.** Two splitters that both write (both read before any marker) read the
+  same log up to the same seal and write semantically identical snapshots; create-if-absent
+  keeps the first.
+- **Old generations are skipped.** If D owned a shard, released it and later re-claimed it,
+  its log holds records of both generations. The older generation ended with a final
+  snapshot, so step 5 rebuilds only the generation the owner record names. Grouping by every
+  (shard, gen) in the log instead can apply an old generation's records to whatever
+  snapshot of that generation pruning left behind, and write a malformed (if never loaded)
+  snapshot; the model found that too.
 
 A dead log is read **once**, by one node, instead of once per node that claims one of its
 shards. The log budget (§12.5) bounds how much there is to read.
@@ -253,9 +302,13 @@ shards. The log budget (§12.5) bounds how much there is to read.
 1. GET owners/S → {owner, gen g, etag}
    allowed if: released, unowned, or owner's incarnation is dead AND splits/… exists
 2. CAS owners/S → {B, inc_B, gen g+1, owned}                           ← S's history moves to B
-3. load S's latest snapshot by (gen, seq); its ptr must be split, final, or point into a
-   dead-and-split incarnation; anything else is a bug → refuse, alert
-   (no snapshot at all is valid only for a never-owned shard, gen 0: start empty)
+3. load S's latest snapshot by (gen, seq), a split or final snapshot ranking above a node
+   pointer at equal (gen, seq) (not plain key order: a node id can sort after "split");
+   its ptr must be split, final, or point into a dead-and-split incarnation; a pointer
+   into a dead but unsplit incarnation → split it first; anything else is a bug → refuse
+   (no snapshot at all → start empty, at any gen: a claimer serves only once its
+   acquisition snapshot exists and the newest snapshot is never pruned, so no snapshot
+   means nobody ever served S, e.g. a claimer crashed between its CAS and step 4)
 4. PUT acquisition snapshot (gen g+1, seq, ptr = B.inc_B.next_seq)       ← BEFORE serving
 5. mark S Serving; hold re-dispatch of recovered PENDING tasks for reconcile_grace (§11.4)
 ```
@@ -284,9 +337,11 @@ records after the final snapshot, and the claim proceeds normally.
 ### 8.6 Replay (own shards after restart, or while splitting)
 
 Apply a record only if its `shard` is the one being rebuilt, its `gen` equals the base
-snapshot's `gen`, and its `shard_seq` is greater than the snapshot's. Stop at a SEALED
-segment or at the first gap. The `gen` filter is a second line of defence: a record from any
-other generation is skipped and alerted, never applied.
+snapshot's `gen`, and its `shard_seq` is greater than the snapshot's. Read from the
+incarnation's watermark and stop at a SEALED segment or at the first gap at or above it.
+The `gen` filter is a second line of defence: a record from any other generation is
+skipped and alerted, never applied. The applied records' `shard_seq`s must continue the
+base's without a gap; a gap means a bug, never data to serve.
 
 ### 8.7 Truncation and garbage collection
 
@@ -294,10 +349,11 @@ Every delete is audited for *what if it runs arbitrarily late* (a zombie):
 
 | Delete | Rule | Safe if run late because… |
 |---|---|---|
-| Own log truncation | below the minimum log pointer over my Serving shards' latest durable snapshots | every snapshot a claimer could load points at or above that bound |
+| Own log truncation | first CAS the lease's `trunc` up to the bound (the minimum log pointer over my Serving shards' latest durable snapshots, and at most my acked position + 1); then delete below it, ascending. A failed CAS means fenced: poison | every snapshot a claimer could load points at or above that bound, and a split reads only from the frozen watermark up, so a late delete is always below where any split reads |
 | Snapshot prune | keep the newest 2 per shard by (gen, seq); never the newest | the newest is never deleted |
 | Dead-incarnation log | only after `splits/{node}/{inc}` exists | split snapshots cover everything in it |
-| Split markers | after the incarnation's log is gone and no snapshot key references it | nothing reads it |
+| Split markers | after the incarnation's log is gone and no snapshot key and no owner record references it | nothing reads it; a claim needs the marker while an owner record names the incarnation |
+| Leases | never | incarnation ids must never be reused (§7.1) |
 
 A garbage collector (the guardian of shard 0) LISTs `wal/`, `snapshots/` and `splits/`
 every 5 minutes and applies the same rules. It is the backstop for crashed deleters.
@@ -520,18 +576,27 @@ G1 or G2.
 
 ### 15.1 TLA+ model (before protocol code)
 
-`spec/tla/Ownership.tla`, model-checked with TLC in CI.
-- **State:** the bucket (leases, owner records, per-incarnation segments with positions,
-  snapshots with (gen, seq, ptr), split markers); per node: incarnation, owned shards, writer
-  buffer, in-flight PUTs, acked set.
-- **Actions:** start, renew, pause/resume, crash, tombstone, split, seal, claim, release,
-  append, PUT (landing late or out of order), own-lease check, ack, snapshot, truncate, GC.
-- **Invariants:** `AckedDurable` (G1); `LinearHistory` (G2: no two different records at one
-  `(shard, shard_seq)` in any reconstructable history); `NoLiveLogSealed`; `GCSafety`
-  (nothing a possible future replay needs is ever deleted).
-- **Liveness** under weak fairness: a dead node's shards are eventually served.
-- **Size:** 3 nodes, 2 shards, 2 incarnations each, a few records. Protocol bugs show up at
-  small sizes.
+`spec/tla/Ownership.tla`, model-checked with TLC in CI (the `tla` job). Done in M1; see
+`spec/tla/README.md` for what is abstracted and why that is sound.
+- **State:** the bucket (leases with per-incarnation truncation watermarks, owner records,
+  per-incarnation segments with positions, snapshots with (gen, seq, ptr), split markers);
+  requests in flight (segment and snapshot PUTs, which land late, out of order, after their
+  sender died); per incarnation: served shards and their phase, writer buffer,
+  unacknowledged segments, acked position, pending snapshots; splitters.
+- **Actions:** start, crash, tombstone (at any time), write, flush, PUT landing, own-lease
+  check and ordered ack, snapshot capture / sync / PUT, claim (CAS, load, acquisition
+  snapshot, serve), release (final snapshot, CAS), split (per-key LIST, seal, read, load
+  bases, write, marker, abort), truncation (watermark CAS, ascending deletes), snapshot
+  prune, dead-log deletion, marker GC. Pauses are interleavings.
+- **Invariants:** `AckedDurable` (G1); `LinearHistory` (G2); `WellFormed` (no history has a
+  gap in its `shard_seq`s); `NoLiveLogSealed`; `GCSafety` (from the bucket alone every
+  acknowledged record is recoverable: nothing a future replay needs is deleted).
+- **Liveness** under weak fairness: a shard whose owner is fenced is eventually served.
+- **Size:** several small configurations instead of one large one (1–2 nodes, 1–2 shards,
+  1–2 incarnations, up to 3 records, 1–2 concurrent splitters); the zombie case needs only
+  one incarnation, because a tombstoned process may keep running. Protocol bugs show up at
+  small sizes: every bug listed in §19 shows up within 45 steps.
+- **Counterexamples** for each bug below stay in `spec/tla/counterexamples/`.
 
 ### 15.2 Deterministic multi-engine tests
 
@@ -634,6 +699,32 @@ Dependencies: M0 → M1 → M2 → M3 → M4 → {M5 → M6 → M7} → M8 → M
 - **Spread over all shards → queue partitions.** Otherwise every node must exchange
   capacity with every other node.
 - **Three phase-1 bugs** (§12.2, §12.4, §11.3) are fixed in M0, before any cluster work.
+- **What the TLA+ model found (M1).** Each has a counterexample in `spec/tla/counterexamples/`.
+  - *Truncation racing a split loses acked records.* "Seal the first gap after the lowest
+    listed position" is unsafe: a paused, tombstoned owner keeps truncating, and a LIST
+    racing its deletes shows a deleted position as the end of the log. Fix: a truncation
+    watermark in the lease, raised by CAS before any delete (frozen once fenced), and
+    splits read from the watermark (§7.1, §8.3, §8.7).
+  - *Starting at the lowest listed position skips records.* With segment 1 still in flight
+    and segment 2 landed, the split applies `shard_seq` 2 without 1. Also true of
+    `max(watermark, lowest listed)`. Fix: start exactly at the watermark; a missing position
+    at or above it is the end (§8.3).
+  - *Grouping by every (shard, gen) in the log* applies an old generation's records to an
+    arbitrary surviving snapshot of that generation. Fix: rebuild only shards whose owner
+    record names the dead incarnation, at that record's generation (§8.3 step 5).
+  - *Concurrent splitters are not automatically deterministic.* GC deletes the seal with
+    the log, a late PUT re-fills the sealed position, and a slow splitter reads a log the
+    finished one never saw. Fix: re-check the split marker after reading, before writing,
+    and load owner records and bases only after reading (§8.3 steps 4–5); with bases
+    loaded first, a marker collected in the meantime defeats the re-check.
+  - *"No snapshot ⇒ start empty, only at gen 0" blocks forever* after a claimer crashes
+    between its CAS and its acquisition snapshot. "No snapshot ⇒ start empty" holds at any
+    generation (§8.4 step 3).
+  - *Deleting long-dead leases reuses incarnation ids*, and a stale split marker then lets
+    the split-log collector delete the live reused incarnation's acked segments. Leases are
+    never deleted (§7.1, §8.7).
+  - Clarified, not bugs: snapshot order at equal (gen, seq) must rank split/final above a
+    node pointer (§8.4); marker GC also waits for owner records (§8.7).
 
 ## 20. Open questions
 

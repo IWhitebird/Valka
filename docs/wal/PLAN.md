@@ -37,7 +37,7 @@ Test inventory now: valka-wal 25, valka-engine 42, valka-tests 266, web 22, Go S
 Design, decisions and milestones: [`PHASE2.md`](PHASE2.md).
 
 - [x] M0 Phase-1 hardening: snapshot durability fix, `AlreadyExists` read-back, end-to-end result acks in all four SDKs, non-blocking SDK receive loops, worker drain and server-restart protocol, exit on poison, log budget.
-- [ ] M1 TLA+ model of leases, ownership, sealing, splitting and GC; TLC in CI.
+- [x] M1 TLA+ model of leases, ownership, sealing, splitting and GC (`spec/tla/`); TLC in CI (`tla` job: five passing configurations, six counterexamples that must keep failing). Found: a split must read from a lease-held truncation watermark (not the lowest listed position, nor the max of both), load owner records and bases only after reading, rebuild only owner-named generations, and re-check its marker before writing; "no snapshot ⇒ empty" at any gen; leases are never deleted (PHASE2 §19).
 - [ ] M2 Formats: `cluster.json`, 16-bit shard ids, `gen` in records, sealable segments, `owners/`, `nodes/`, new snapshot keys.
 - [ ] M3 One node on the full protocol: incarnations, lease fencing, per-shard claim/release/split.
 - [ ] M4 Membership, guardian tombstones, rendezvous placement, takeover, GC; turmoil harness starts.
