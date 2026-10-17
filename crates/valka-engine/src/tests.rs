@@ -287,7 +287,10 @@ async fn cancel_running_reports_worker_and_blocks_stale_result() {
     let d = e.dispatch(&t.id, "w9").unwrap();
     let (v, worker) = e.cancel_task(&t.id, "user").await.unwrap();
     assert_eq!(v.status, TaskStatus::Cancelled);
-    assert_eq!(worker.as_deref(), Some("w9"));
+    let loc = worker.expect("the run was in progress");
+    assert_eq!(loc.worker_id, "w9");
+    assert_eq!(loc.node_id, "node-a");
+    assert_eq!(loc.run_id, d.run_id);
     assert!(e.complete_run(&t.id, &d.run_id, None).await.is_err());
     assert!(e.cancel_task(&t.id, "again").await.is_err());
     assert!(
@@ -1334,4 +1337,86 @@ async fn results_that_cannot_be_made_durable_are_retried() {
         crate::ResultOutcome::Retry,
         "RAM already shows the run completed, but that is not durable: never answer Applied"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn fetch_reserves_tasks_for_another_node_and_unused_reservations_lapse() {
+    let store = Store::memory();
+    let e = open(&store).await;
+    let a = e.create_task(create("q")).await.unwrap();
+    let b = e.create_task(create("q")).await.unwrap();
+    settle().await;
+    let got = e.fetch("q", 10, Duration::from_millis(10)).await;
+    assert_eq!(got.len(), 2);
+    assert_eq!(e.pending_count("q"), 0, "reserved for the fetching node");
+    assert!(
+        e.fetch("q", 10, Duration::from_millis(10)).await.is_empty(),
+        "nobody else gets them"
+    );
+    // The fetching node dispatches one to its worker; the other is never used.
+    let d = e.dispatch_to(&a.id, "remote-w", "node-b", None).unwrap();
+    assert_eq!(
+        e.runs_for_task(&a.id).unwrap()[0].assigned_node_id,
+        "node-b"
+    );
+    assert_eq!(d.attempt, 1);
+    tokio::time::advance(crate::pending::REMOTE_OFFER_TTL + Duration::from_secs(1)).await;
+    settle().await;
+    assert_eq!(e.pending_count("q"), 1, "the unused reservation lapsed");
+    assert_eq!(e.get_task(&b.id).unwrap().status, TaskStatus::Pending);
+
+    // A fetch waits for a task to appear (long poll).
+    let waiter = {
+        let e = e.clone();
+        tokio::spawn(async move { e.fetch("later", 1, Duration::from_secs(5)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let c = e.create_task(create("later")).await.unwrap();
+    let got = waiter.await.unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].task_id, c.id);
+}
+
+#[tokio::test(start_paused = true)]
+async fn dispatch_with_a_run_id_is_idempotent_and_a_returned_run_spends_no_attempt() {
+    let store = Store::memory();
+    let e = open(&store).await;
+    let t = e.create_task(create("q")).await.unwrap();
+    let shard = e.shard_of(&t.id).unwrap();
+    let run = valka_core::new_id_in_shard(shard).to_string();
+    let first = e.dispatch_to(&t.id, "w", "node-b", Some(&run)).unwrap();
+    let again = e.dispatch_to(&t.id, "w", "node-b", Some(&run)).unwrap();
+    assert_eq!(
+        first.run_id, again.run_id,
+        "a retried dispatch is the same run"
+    );
+    assert_eq!(e.runs_for_task(&t.id).unwrap().len(), 1);
+    assert!(
+        e.dispatch_to(&t.id, "other", "node-c", None).is_err(),
+        "a different dispatch is refused"
+    );
+    assert!(matches!(
+        e.dispatch_to(
+            &t.id,
+            "w",
+            "node-b",
+            Some("00000000-0000-7000-8000-00000000ffff")
+        ),
+        Err(valka_core::ServerError::InvalidArgument(_))
+    ));
+
+    // The worker was gone before the assignment reached it.
+    e.return_run(&t.id, &run).await.unwrap();
+    let v = e.get_task(&t.id).unwrap();
+    assert_eq!(v.status, TaskStatus::Pending);
+    assert_eq!(v.attempt_count, 0);
+    assert_eq!(e.runs_for_task(&t.id).unwrap()[0].status, "RETURNED");
+    let next = e.dispatch(&t.id, "w2").unwrap();
+    assert_eq!(next.attempt, 1, "the returned run did not spend an attempt");
+    // Signals sent before a run started ride on its dispatch.
+    let s = e.create_task(create("q")).await.unwrap();
+    e.send_signal(&s.id, "early", None).await.unwrap();
+    let d = e.dispatch(&s.id, "w").unwrap();
+    assert_eq!(d.pending_signals.len(), 1);
+    assert_eq!(d.pending_signals[0].signal_name, "early");
 }

@@ -87,13 +87,24 @@ pub struct CreateTask {
     pub scheduled_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DispatchInfo {
     pub run_id: String,
     pub attempt: i32,
     pub lease_until: DateTime<Utc>,
     pub task: DispatchableTask,
     pub checkpoints: Vec<CheckpointView>,
+    /// Signals created before the run started, to deliver right after the assignment.
+    #[serde(default)]
+    pub pending_signals: Vec<crate::view::SignalView>,
+}
+
+/// Where a running run lives: which worker, attached to which node.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunLocation {
+    pub run_id: String,
+    pub worker_id: String,
+    pub node_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -102,14 +113,14 @@ pub struct FailResult {
 }
 
 /// What a worker reports for a run.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RunResult {
     Completed(Option<Value>),
     Failed { error: String, retryable: bool },
 }
 
 /// The answer to a reported result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ResultOutcome {
     /// Durable: recorded now, or by an earlier delivery of the same result.
     Applied,
@@ -153,6 +164,10 @@ pub(crate) struct Inner {
     pub(crate) moved_at: Mutex<HashMap<ShardId, tokio::time::Instant>>,
     /// PENDING tasks recovered by a claim are not dispatched before this (reconcile grace).
     pub(crate) hold_until: Mutex<HashMap<ShardId, tokio::time::Instant>>,
+    /// Tasks handed to another node by `fetch` and not dispatched yet: reservation expiry.
+    pub(crate) remote_offers: Mutex<HashMap<String, tokio::time::Instant>>,
+    /// Woken whenever runnable tasks are added to the pending index (remote fetchers).
+    pub(crate) runnable: Notify,
     /// Queue configs (partition counts), cached for `QUEUE_CONFIG_TTL`.
     pub(crate) queues:
         Mutex<HashMap<String, (valka_wal::queues::QueueConfig, tokio::time::Instant)>>,
@@ -248,6 +263,8 @@ impl Engine {
             moved_at: Mutex::new(HashMap::new()),
             hold_until: Mutex::new(HashMap::new()),
             queues: Mutex::new(HashMap::new()),
+            remote_offers: Mutex::new(HashMap::new()),
+            runnable: Notify::new(),
         });
         let engine = Engine { inner };
         engine.forward_poison();
@@ -271,6 +288,11 @@ impl Engine {
             "node started"
         );
         Ok(engine)
+    }
+
+    /// A local worker started waiting: let the feeder offer it pending tasks now.
+    pub fn wake_feeder(&self) {
+        self.inner.pending_wake.notify_one();
     }
 
     /// Replace the task sink (matching service) after construction.

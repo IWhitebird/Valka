@@ -5,11 +5,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use valka_core::{ServerError, TaskStatus};
 use valka_engine::{
-    CheckpointView, CreateTask, DeadLetterView, NodeStats, RunView, ShardStats, SignalView,
-    TaskView,
+    CheckpointView, CreateTask, DeadLetterView, DispatchInfo, DispatchableTask, NodeStats,
+    ResultOutcome, RunResult, RunView, ShardStats, SignalView, TaskView,
 };
 
-/// A command about one task, run by the node that owns the task's shard.
+/// A command for another node: most are about one task and run on the owner of its
+/// shard; a few are addressed to a node chosen by the caller (see [`Command::target`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
@@ -49,21 +50,108 @@ pub enum Command {
         probe_id: String,
         key: String,
     },
+
+    // ── worker side, routed to the task's owner ──
+    /// Dispatch a task (offered to `node_id` by a fetch) to one of that node's workers.
+    /// `run_id` is minted by the caller, so a retry is idempotent.
+    Dispatch {
+        task_id: String,
+        worker_id: String,
+        node_id: String,
+        run_id: String,
+    },
+    ReturnRun {
+        task_id: String,
+        run_id: String,
+    },
+    Unoffer {
+        task_id: String,
+    },
+    ReportResult {
+        task_id: String,
+        run_id: String,
+        result: RunResult,
+    },
+    Checkpoint {
+        task_id: String,
+        run_id: String,
+        step: String,
+        output: Value,
+    },
+    SignalDelivered {
+        signal_id: String,
+    },
+    SignalAcked {
+        signal_id: String,
+    },
+    ResetSignals {
+        task_id: String,
+    },
+
+    // ── addressed to a node, not routed by shard ──
+    /// Extend the leases of these running tasks (those the receiving node owns).
+    Heartbeat {
+        task_ids: Vec<String>,
+    },
+    /// Runnable tasks of `queue` for the caller's idle workers (long poll).
+    Fetch {
+        queue: String,
+        max: usize,
+        wait_ms: u64,
+    },
+    /// Tell the worker running `task_id` on the receiving node to stop.
+    CancelOnWorker {
+        task_id: String,
+        reason: String,
+    },
+    /// Deliver a signal to the worker running its task on the receiving node.
+    DeliverSignal {
+        signal: SignalView,
+    },
+}
+
+/// Where a command goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target<'a> {
+    /// The owner of this id's shard.
+    Shard(&'a str),
+    /// A node chosen by the caller.
+    Node,
 }
 
 impl Command {
-    /// The id whose embedded shard routes this command.
-    pub fn routing_id(&self) -> &str {
+    pub fn target(&self) -> Target<'_> {
         match self {
-            Command::CreateTask { id, .. } => id,
+            Command::CreateTask { id, .. } => Target::Shard(id),
             Command::GetTask { task_id }
             | Command::CancelTask { task_id, .. }
             | Command::DeleteTask { task_id }
             | Command::SendSignal { task_id, .. }
             | Command::ListSignals { task_id, .. }
             | Command::Runs { task_id }
-            | Command::Checkpoints { task_id } => task_id,
-            Command::FindIdempotent { probe_id, .. } => probe_id,
+            | Command::Checkpoints { task_id }
+            | Command::Dispatch { task_id, .. }
+            | Command::ReturnRun { task_id, .. }
+            | Command::Unoffer { task_id }
+            | Command::ReportResult { task_id, .. }
+            | Command::Checkpoint { task_id, .. }
+            | Command::ResetSignals { task_id } => Target::Shard(task_id),
+            Command::FindIdempotent { probe_id, .. } => Target::Shard(probe_id),
+            Command::SignalDelivered { signal_id } | Command::SignalAcked { signal_id } => {
+                Target::Shard(signal_id)
+            }
+            Command::Heartbeat { .. }
+            | Command::Fetch { .. }
+            | Command::CancelOnWorker { .. }
+            | Command::DeliverSignal { .. } => Target::Node,
+        }
+    }
+
+    /// The id whose embedded shard routes this command (empty for node commands).
+    pub fn routing_id(&self) -> &str {
+        match self.target() {
+            Target::Shard(id) => id,
+            Target::Node => "",
         }
     }
 
@@ -78,6 +166,18 @@ impl Command {
             Command::Runs { .. } => "runs",
             Command::Checkpoints { .. } => "checkpoints",
             Command::FindIdempotent { .. } => "find_idempotent",
+            Command::Dispatch { .. } => "dispatch",
+            Command::ReturnRun { .. } => "return_run",
+            Command::Unoffer { .. } => "unoffer",
+            Command::ReportResult { .. } => "report_result",
+            Command::Checkpoint { .. } => "checkpoint",
+            Command::SignalDelivered { .. } => "signal_delivered",
+            Command::SignalAcked { .. } => "signal_acked",
+            Command::ResetSignals { .. } => "reset_signals",
+            Command::Heartbeat { .. } => "heartbeat",
+            Command::Fetch { .. } => "fetch",
+            Command::CancelOnWorker { .. } => "cancel_on_worker",
+            Command::DeliverSignal { .. } => "deliver_signal",
         }
     }
 }
@@ -88,10 +188,22 @@ pub enum Reply {
     Task(TaskView),
     MaybeTask(Option<TaskView>),
     Deleted(bool),
-    SignalSent { signal: SignalView, delivered: bool },
+    SignalSent {
+        signal: SignalView,
+        delivered: bool,
+    },
     Signals(Vec<SignalView>),
     Runs(Option<Vec<RunView>>),
     Checkpoints(Option<Vec<CheckpointView>>),
+    Dispatched(Box<DispatchInfo>),
+    Result(ResultOutcome),
+    Checkpoint(CheckpointView),
+    Fetched(Vec<DispatchableTask>),
+    /// Whether a worker of the receiving node got the message.
+    Delivered(bool),
+    /// Task ids the receiving node does not own.
+    NotOwned(Vec<String>),
+    Done,
 }
 
 /// A connected worker, as listed by the node its stream is attached to.

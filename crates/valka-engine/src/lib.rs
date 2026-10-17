@@ -31,7 +31,7 @@ pub use clock::{Clock, TokioClock};
 pub use cluster::{GcReport, MemberInfo};
 pub use engine::{
     CreateTask, DispatchInfo, Engine, EngineConfig, EngineEvent, FailResult, ResultOutcome,
-    RunResult,
+    RunLocation, RunResult,
 };
 pub use ingest::LogIngester;
 pub use ownership::ClaimRefused;

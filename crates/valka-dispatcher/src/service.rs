@@ -1,11 +1,12 @@
 use crate::heartbeat;
+use crate::router::{LocalRouter, TaskRouter};
 use crate::worker_handle::WorkerHandle;
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 use valka_core::{NodeId, PartitionId, WorkerId};
-use valka_engine::{Engine, ResultOutcome, RunResult};
+use valka_engine::{DispatchInfo, Engine, ResultOutcome, RunResult};
 use valka_matching::MatchingService;
 use valka_matching::partition::TaskEnvelope;
 use valka_proto::{
@@ -20,6 +21,8 @@ pub struct DispatcherService {
     workers: Arc<DashMap<String, WorkerHandle>>,
     matching: MatchingService,
     engine: Engine,
+    /// Where the worker side of each task goes (its owner). Local engine by default.
+    router: Arc<RwLock<Arc<dyn TaskRouter>>>,
     node_id: NodeId,
     log_tx: mpsc::Sender<LogLine>,
 }
@@ -34,6 +37,7 @@ impl DispatcherService {
         Self {
             workers: Arc::new(DashMap::new()),
             matching,
+            router: Arc::new(RwLock::new(Arc::new(LocalRouter(engine.clone())))),
             engine,
             node_id,
             log_tx,
@@ -42,6 +46,19 @@ impl DispatcherService {
 
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    pub fn matching(&self) -> &MatchingService {
+        &self.matching
+    }
+
+    /// Route the worker side of tasks through `router` (the server's cluster router).
+    pub fn set_router(&self, router: Arc<dyn TaskRouter>) {
+        *self.router.write().unwrap() = router;
+    }
+
+    pub fn router(&self) -> Arc<dyn TaskRouter> {
+        self.router.read().unwrap().clone()
     }
 
     pub async fn register_worker(&self, handle: WorkerHandle) {
@@ -54,8 +71,9 @@ impl DispatcherService {
         if let Some((_, handle)) = self.workers.remove(worker_id.as_ref()) {
             self.matching.deregister_worker(worker_id);
             // Delivered-but-unacked signals go back to PENDING for redelivery.
+            let router = self.router();
             for task_id in &handle.active_tasks {
-                self.engine.reset_signals(task_id);
+                router.reset_signals(task_id).await;
             }
             info!(
                 worker_id = %worker_id,
@@ -106,6 +124,8 @@ impl DispatcherService {
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                 continue;
             }
+            // A worker is waiting: let the local feeder offer it pending tasks right away.
+            self.engine.wake_feeder();
 
             let futs: Vec<_> = receivers
                 .into_iter()
@@ -114,13 +134,11 @@ impl DispatcherService {
 
             let (first_result, _index, remaining) = futures::future::select_all(futs).await;
 
+            // Tasks matched on the other partitions in the same instant go back to their
+            // owners' pending index (they may be another node's).
             for fut in remaining {
-                if let Some((q, p, Ok(envelope))) = fut.now_or_never()
-                    && !self
-                        .matching
-                        .buffer_task(&q, p, envelope.clone_for_requeue())
-                {
-                    self.engine.unoffer(&envelope.task_id);
+                if let Some((_, _, Ok(envelope))) = fut.now_or_never() {
+                    self.router().unoffer(&envelope.task_id).await;
                 }
             }
 
@@ -136,18 +154,20 @@ impl DispatcherService {
     }
 
     async fn dispatch_to_worker(&self, worker_id: &WorkerId, envelope: TaskEnvelope) {
+        let router = self.router();
         // Is the worker still here? If not, hand the task back before recording anything.
         if !self.workers.contains_key(worker_id.as_ref()) {
-            self.engine.unoffer(&envelope.task_id);
+            router.unoffer(&envelope.task_id).await;
             return;
         }
 
-        // Record the dispatch (RUNNING + run + lease) in the engine.
-        let info = match self.engine.dispatch(&envelope.task_id, &worker_id.0) {
+        // Record the dispatch (RUNNING + run + lease) with the task's owner.
+        let info: DispatchInfo = match router.dispatch(&envelope.task_id, &worker_id.0).await {
             Ok(info) => info,
             Err(e) => {
-                // Cancelled / deleted / already running: nothing to do.
-                debug!(task_id = %envelope.task_id, error = %e, "dispatch refused by engine");
+                // Cancelled / deleted / already running / owner unreachable: the owner keeps
+                // the task (a reservation lapses back to PENDING).
+                debug!(task_id = %envelope.task_id, error = %e, "dispatch refused");
                 return;
             }
         };
@@ -177,8 +197,8 @@ impl DispatcherService {
 
         let tx = {
             let Some(mut handle) = self.workers.get_mut(worker_id.as_ref()) else {
-                // Worker vanished between the check and now: the lease will expire and
-                // the task retries. At-least-once.
+                // Worker vanished between the check and now: the run never started.
+                router.return_run(&envelope.task_id, &info.run_id).await;
                 return;
             };
             handle.assign_task(envelope.task_id.clone());
@@ -189,11 +209,15 @@ impl DispatcherService {
         };
         if tx.send(response).await.is_err() {
             warn!(worker_id = %worker_id, "Failed to send task assignment - worker disconnected");
+            if let Some(mut handle) = self.workers.get_mut(worker_id.as_ref()) {
+                handle.complete_task(&envelope.task_id);
+            }
+            router.return_run(&envelope.task_id, &info.run_id).await;
             return;
         }
 
-        // Deliver any pending signals for this task.
-        for sig in self.engine.pending_signals(&envelope.task_id) {
+        // Deliver signals sent before the run started.
+        for sig in info.pending_signals {
             let signal_response = WorkerResponse {
                 response: Some(worker_response::Response::TaskSignal(TaskSignal {
                     signal_id: sig.id.clone(),
@@ -204,7 +228,7 @@ impl DispatcherService {
                 })),
             };
             if tx.send(signal_response).await.is_ok() {
-                self.engine.signal_delivered(&sig.id);
+                router.signal_delivered(&sig.id).await;
             }
         }
     }
@@ -230,7 +254,7 @@ impl DispatcherService {
             }
         };
         let outcome = self
-            .engine
+            .router()
             .report_result(&result.task_id, &result.task_run_id, run_result)
             .await;
         let status = match outcome {
@@ -262,7 +286,7 @@ impl DispatcherService {
         if let Some(mut handle) = self.workers.get_mut(worker_id.as_ref()) {
             handle.update_heartbeat();
         }
-        self.engine.heartbeat(&heartbeat.active_task_ids);
+        self.router().heartbeat(&heartbeat.active_task_ids).await;
     }
 
     pub async fn handle_log_batch(&self, _worker_id: &WorkerId, batch: LogBatch) {
@@ -319,7 +343,7 @@ impl DispatcherService {
 
     /// Handle a signal acknowledgement from a worker
     pub async fn handle_signal_ack(&self, ack: &SignalAck) {
-        self.engine.signal_acked(&ack.signal_id);
+        self.router().signal_acked(&ack.signal_id).await;
     }
 
     pub fn workers(&self) -> &Arc<DashMap<String, WorkerHandle>> {

@@ -244,6 +244,41 @@ impl ShardState {
                 }
             }
 
+            WalRecord::RunReturned { task_id, run_id } => {
+                let Some(t) = self.tasks.get_mut(task_id) else {
+                    return out;
+                };
+                if t.status != TaskStatus::Running {
+                    return out;
+                }
+                let Some(run) = t.runs.last_mut().filter(|r| r.id == *run_id) else {
+                    return out;
+                };
+                if run.status != RunStatus::Running {
+                    return out;
+                }
+                run.status = RunStatus::Returned;
+                run.completed_at = Some(now);
+                run.ended_by = Some(RunEnd::Returned);
+                let attempt = run.attempt_number;
+                let worker = run.worker_id.clone();
+                t.attempt_count = attempt - 1;
+                t.status = TaskStatus::Pending;
+                t.due = true;
+                t.next_attempt_at = None;
+                t.offered = false;
+                t.updated_at = now;
+                out.push(Transition {
+                    task_id: task_id.clone(),
+                    queue_name: t.spec.queue_name.clone(),
+                    from: Some(TaskStatus::Running),
+                    to: Some(TaskStatus::Pending),
+                    attempt: t.attempt_count,
+                    worker_id: Some(worker),
+                    error: None,
+                });
+            }
+
             WalRecord::TaskCheckpointed {
                 task_id,
                 run_id,
@@ -586,6 +621,33 @@ mod tests {
             .is_empty()
         );
         assert_eq!(s.tasks["a"].status, TaskStatus::Cancelled);
+    }
+
+    #[test]
+    fn returned_run_goes_back_to_pending_without_spending_an_attempt() {
+        let mut s = ShardState::new(ShardId(0));
+        s.apply(&mut env(WalRecord::TaskCreated { task: spec("a") }));
+        dispatched(&mut s, "a", "r1", 1);
+        let tr = s.apply(&mut env(WalRecord::RunReturned {
+            task_id: "a".into(),
+            run_id: "r1".into(),
+        }));
+        assert_eq!(tr[0].to, Some(TaskStatus::Pending));
+        let t = &s.tasks["a"];
+        assert_eq!(t.status, TaskStatus::Pending);
+        assert_eq!(t.attempt_count, 0);
+        assert!(t.is_runnable());
+        assert_eq!(t.runs[0].status, crate::state::RunStatus::Returned);
+        // The next dispatch is attempt 1 again; a stale return is a no-op.
+        dispatched(&mut s, "a", "r2", 1);
+        assert!(
+            s.apply(&mut env(WalRecord::RunReturned {
+                task_id: "a".into(),
+                run_id: "r1".into(),
+            }))
+            .is_empty()
+        );
+        assert_eq!(s.tasks["a"].status, TaskStatus::Running);
     }
 
     #[test]

@@ -13,12 +13,12 @@ use valka_wal::Store;
 
 use super::helpers::*;
 
-const SHARDS: u32 = 64;
-const TOKEN: &str = "test-cluster-token";
+pub(super) const SHARDS: u32 = 64;
+pub(super) const TOKEN: &str = "test-cluster-token";
 
-struct Cluster {
-    nodes: Vec<TestNode>,
-    shutdown: tokio::sync::watch::Sender<bool>,
+pub(super) struct Cluster {
+    pub(super) nodes: Vec<TestNode>,
+    pub(super) shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 impl Drop for Cluster {
@@ -42,12 +42,12 @@ fn cfg(node: &str, internal_addr: &str) -> EngineConfig {
     c
 }
 
-struct Tls {
-    server: tonic::transport::ServerTlsConfig,
-    client: tonic::transport::ClientTlsConfig,
+pub(super) struct Tls {
+    pub(super) server: tonic::transport::ServerTlsConfig,
+    pub(super) client: tonic::transport::ClientTlsConfig,
 }
 
-async fn start_node(
+pub(super) async fn start_node(
     backing: &std::sync::Arc<dyn object_store::ObjectStore>,
     name: &str,
     server_token: Option<&str>,
@@ -72,6 +72,7 @@ async fn start_node(
     tokio::spawn(valka_server::internal_grpc::serve_internal(
         listener,
         node.api.clone(),
+        node.event_tx.clone(),
         server_token.map(str::to_string),
         server_tls,
         shutdown.subscribe(),
@@ -79,7 +80,7 @@ async fn start_node(
     node
 }
 
-async fn cluster(n: usize) -> Cluster {
+pub(super) async fn cluster(n: usize) -> Cluster {
     let backing: std::sync::Arc<dyn object_store::ObjectStore> =
         std::sync::Arc::new(object_store::memory::InMemory::new());
     let (shutdown, _) = tokio::sync::watch::channel(false);
@@ -104,7 +105,7 @@ async fn cluster(n: usize) -> Cluster {
 
 impl Cluster {
     /// Every node serves its share and every shard is served.
-    async fn converge(&self) {
+    pub(super) async fn converge(&self) {
         for _ in 0..200 {
             let total: usize = self
                 .nodes
@@ -127,14 +128,14 @@ impl Cluster {
         panic!("cluster did not converge");
     }
 
-    fn owner_of(&self, task_id: &str) -> Option<usize> {
+    pub(super) fn owner_of(&self, task_id: &str) -> Option<usize> {
         self.nodes
             .iter()
             .position(|n| n.engine.shard_of(task_id).is_some_and(|s| n.engine.owns(s)))
     }
 }
 
-async fn call(node: &TestNode, req: Request<Body>) -> (StatusCode, serde_json::Value) {
+pub(super) async fn call(node: &TestNode, req: Request<Body>) -> (StatusCode, serde_json::Value) {
     let resp = node.router().oneshot(req).await.unwrap();
     let status = resp.status();
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -148,7 +149,7 @@ async fn call(node: &TestNode, req: Request<Body>) -> (StatusCode, serde_json::V
     (status, json)
 }
 
-fn post(uri: &str, body: serde_json::Value) -> Request<Body> {
+pub(super) fn post(uri: &str, body: serde_json::Value) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(uri)
@@ -157,11 +158,11 @@ fn post(uri: &str, body: serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
-fn get(uri: &str) -> Request<Body> {
+pub(super) fn get(uri: &str) -> Request<Body> {
     Request::builder().uri(uri).body(Body::empty()).unwrap()
 }
 
-fn delete(uri: &str) -> Request<Body> {
+pub(super) fn delete(uri: &str) -> Request<Body> {
     Request::builder()
         .method("DELETE")
         .uri(uri)
@@ -543,7 +544,7 @@ async fn grpc_api_routes_like_rest() {
     drop(l);
     let (api, events, logs, rx) = (
         c.nodes[1].api.clone(),
-        c.nodes[1].event_tx.clone(),
+        c.nodes[1].cluster_events.clone(),
         c.nodes[1].logs.clone(),
         c.shutdown.subscribe(),
     );

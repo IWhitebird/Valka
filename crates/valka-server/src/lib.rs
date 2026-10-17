@@ -1,7 +1,9 @@
 pub mod api;
 pub mod cluster;
 pub mod convert;
+pub mod feeder;
 pub mod grpc;
 pub mod internal_grpc;
+pub mod relay;
 pub mod rest;
 pub mod server;

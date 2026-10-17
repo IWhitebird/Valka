@@ -86,6 +86,12 @@ pub enum WalRecord {
         run_id: String,
         lease_until: DateTime<Utc>,
     },
+    /// A dispatched run never started (its worker was gone before the assignment reached
+    /// it): back to PENDING without spending an attempt.
+    RunReturned {
+        task_id: String,
+        run_id: String,
+    },
     /// A running run finished `step`; retries of the task resume after it.
     TaskCheckpointed {
         task_id: String,
@@ -137,6 +143,7 @@ impl WalRecord {
             | RunFailed { task_id, .. }
             | LeaseExpired { task_id, .. }
             | LeaseExtended { task_id, .. }
+            | RunReturned { task_id, .. }
             | TaskCheckpointed { task_id, .. }
             | TaskPromoted { task_id }
             | TaskCancelled { task_id, .. }
@@ -158,6 +165,7 @@ impl WalRecord {
             RunFailed { .. } => "run_failed",
             LeaseExpired { .. } => "lease_expired",
             LeaseExtended { .. } => "lease_extended",
+            RunReturned { .. } => "run_returned",
             TaskCheckpointed { .. } => "task_checkpointed",
             TaskPromoted { .. } => "task_promoted",
             TaskCancelled { .. } => "task_cancelled",

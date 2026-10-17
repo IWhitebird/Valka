@@ -19,6 +19,8 @@ pub enum RunStatus {
     Running,
     Completed,
     Failed,
+    /// Dispatched but never started; the task went back to PENDING.
+    Returned,
 }
 
 impl RunStatus {
@@ -27,6 +29,7 @@ impl RunStatus {
             RunStatus::Running => "RUNNING",
             RunStatus::Completed => "COMPLETED",
             RunStatus::Failed => "FAILED",
+            RunStatus::Returned => "RETURNED",
         }
     }
 }
@@ -38,6 +41,7 @@ pub enum RunEnd {
     Failed,
     Expired,
     Cancelled,
+    Returned,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

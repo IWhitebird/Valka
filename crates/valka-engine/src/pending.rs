@@ -1,6 +1,8 @@
 //! The runnable-task index and the hand-off to the matching layer.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
+use tracing::debug;
 use valka_core::TaskStatus;
 
 use crate::engine::{Engine, PendingKey};
@@ -8,6 +10,9 @@ use crate::sink::{DispatchableTask, OfferOutcome};
 use crate::state::Transition;
 use crate::timers::TimerKind;
 use crate::write_path::{dispatchable, pending_key};
+
+/// How long a task handed to another node by `fetch` stays reserved for it.
+pub const REMOTE_OFFER_TTL: Duration = Duration::from_secs(30);
 
 impl Engine {
     pub fn queues(&self) -> Vec<String> {
@@ -82,9 +87,78 @@ impl Engine {
                 None
             }
         };
-        if let Some((q, k)) = key {
-            self.inner.pending.lock().entry(q).or_default().insert(k);
+        self.inner.remote_offers.lock().remove(task_id);
+        if let Some(entry) = key {
+            self.add_runnable([entry]);
+        }
+    }
+
+    /// Put runnable tasks in the pending index and wake whoever hands them out: the local
+    /// feeder and other nodes' fetches.
+    pub(crate) fn add_runnable(&self, entries: impl IntoIterator<Item = (String, PendingKey)>) {
+        let mut added = false;
+        {
+            let mut p = self.inner.pending.lock();
+            for (q, k) in entries {
+                p.entry(q).or_default().insert(k);
+                added = true;
+            }
+        }
+        if added {
             self.inner.pending_wake.notify_one();
+            self.inner.runnable.notify_waiters();
+        }
+    }
+
+    /// Hand up to `max` runnable tasks of `queue` to another node, waiting up to `wait`
+    /// for one to appear (long poll). The tasks stay PENDING, reserved for the caller in
+    /// RAM only: it dispatches each to one of its workers with
+    /// [`Engine::dispatch_to`], or gives it back with [`Engine::unoffer`]; a reservation
+    /// not used within `REMOTE_OFFER_TTL` lapses.
+    pub async fn fetch(&self, queue: &str, max: usize, wait: Duration) -> Vec<DispatchableTask> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let notified = self.inner.runnable.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let tasks = if self.is_serving() {
+                self.take_pending(queue, max)
+            } else {
+                Vec::new()
+            };
+            if !tasks.is_empty() || tokio::time::Instant::now() >= deadline {
+                let lapse = tokio::time::Instant::now() + REMOTE_OFFER_TTL;
+                let mut offers = self.inner.remote_offers.lock();
+                for t in &tasks {
+                    offers.insert(t.task_id.clone(), lapse);
+                }
+                return tasks;
+            }
+            tokio::select! {
+                _ = &mut notified => {}
+                _ = tokio::time::sleep_until(deadline) => {}
+            }
+        }
+    }
+
+    /// Reservations handed out by `fetch` and never used: make the tasks runnable again.
+    pub(crate) fn lapse_remote_offers(&self) {
+        let now = tokio::time::Instant::now();
+        let lapsed: Vec<String> = {
+            let mut offers = self.inner.remote_offers.lock();
+            let lapsed: Vec<String> = offers
+                .iter()
+                .filter(|(_, at)| **at <= now)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &lapsed {
+                offers.remove(id);
+            }
+            lapsed
+        };
+        for id in lapsed {
+            debug!(task_id = %id, "remote reservation lapsed");
+            self.unoffer(&id);
         }
     }
 
@@ -157,13 +231,7 @@ impl Engine {
                     t.offered = false;
                 }
                 if let Some(k) = key {
-                    self.inner
-                        .pending
-                        .lock()
-                        .entry(queue)
-                        .or_default()
-                        .insert(k);
-                    self.inner.pending_wake.notify_one();
+                    self.add_runnable([(queue, k)]);
                 }
             }
         }

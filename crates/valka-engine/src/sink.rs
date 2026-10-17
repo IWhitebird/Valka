@@ -3,7 +3,7 @@
 use serde_json::Value;
 
 /// Everything a worker needs to start a task, minus the run id (assigned at dispatch).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DispatchableTask {
     pub task_id: String,
     pub queue_name: String,
@@ -27,8 +27,10 @@ pub enum OfferOutcome {
 }
 
 pub trait TaskSink: Send + Sync {
+    /// Hand a runnable task to a waiting local worker. `Rejected` keeps it in the engine's
+    /// pending index, where local feeders and other nodes' fetches can take it.
     fn offer(&self, task: DispatchableTask) -> OfferOutcome;
-    /// Free capacity for a queue, so the feeder does not over-offer.
+    /// Local workers waiting for this queue, so the feeder does not over-offer.
     fn capacity(&self, queue_name: &str) -> usize;
 }
 

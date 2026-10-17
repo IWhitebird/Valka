@@ -24,6 +24,8 @@ pub struct TestNode {
     pub logs: Arc<LogIngester>,
     pub log_tx: mpsc::Sender<LogLine>,
     pub event_tx: broadcast::Sender<valka_proto::TaskEvent>,
+    /// The whole cluster's events, as a node's REST and gRPC subscribers see them.
+    pub cluster_events: broadcast::Sender<valka_proto::TaskEvent>,
     pub api: Api,
     #[allow(dead_code)]
     pub node_id: NodeId,
@@ -79,6 +81,15 @@ impl TestNode {
             dispatcher.clone(),
             PeerClients::new(node_id, token, tls, Duration::from_secs(5)),
         );
+        dispatcher.set_router(Arc::new(api.clone()));
+        valka_server::feeder::spawn_remote_feeder(api.clone(), ingester_shutdown.subscribe());
+        let (cluster_events, _) = broadcast::channel::<valka_proto::TaskEvent>(1024);
+        valka_server::relay::spawn_event_relay(
+            api.clone(),
+            event_tx.clone(),
+            cluster_events.clone(),
+            ingester_shutdown.subscribe(),
+        );
         Self {
             store,
             engine,
@@ -87,6 +98,7 @@ impl TestNode {
             logs,
             log_tx,
             event_tx,
+            cluster_events,
             api,
             node_id: node,
             _ingester_shutdown: ingester_shutdown,
@@ -99,7 +111,7 @@ impl TestNode {
             .handle();
         valka_server::rest::build_api_router(
             self.api.clone(),
-            self.event_tx.clone(),
+            self.cluster_events.clone(),
             self.logs.clone(),
             metrics_handle,
             valka_server::cluster::NodeInfo::new("127.0.0.1:50051", "127.0.0.1:8989", 5),

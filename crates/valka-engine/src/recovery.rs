@@ -76,10 +76,7 @@ impl Engine {
             }
         }
         if !held {
-            let mut pending = self.inner.pending.lock();
-            for (q, k) in runnable {
-                pending.entry(q).or_default().insert(k);
-            }
+            self.add_runnable(runnable);
         }
         self.inner.pending_wake.notify_one();
     }
@@ -98,12 +95,7 @@ impl Engine {
                 .map(|t| (t.spec.queue_name.clone(), pending_key(t)))
                 .collect()
         };
-        let mut pending = self.inner.pending.lock();
-        for (q, k) in runnable {
-            pending.entry(q).or_default().insert(k);
-        }
-        drop(pending);
-        self.inner.pending_wake.notify_one();
+        self.add_runnable(runnable);
     }
 
     pub(crate) async fn snapshotter(self) {
@@ -113,7 +105,7 @@ impl Engine {
         let mut last_round = tokio::time::Instant::now();
         loop {
             tokio::select! {
-                _ = shutdown.changed() => { if *shutdown.borrow() { return; } }
+                r = shutdown.changed() => { if r.is_err() || *shutdown.borrow() { return; } }
                 _ = tokio::time::sleep(tick) => {}
             }
             if self.poisoned().is_some() {

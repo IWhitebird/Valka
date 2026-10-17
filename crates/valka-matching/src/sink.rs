@@ -34,6 +34,9 @@ impl MatchingSink {
 }
 
 impl TaskSink for MatchingSink {
+    /// Match with a waiting worker or reject. Tasks are not buffered here: a runnable task
+    /// waits in its owner's pending index, where this node's feeder and other nodes'
+    /// fetches can both take it.
     fn offer(&self, task: DispatchableTask) -> OfferOutcome {
         let queue = task.queue_name.clone();
         let partition = self.partition(&queue, &task.task_id);
@@ -42,17 +45,11 @@ impl TaskSink for MatchingSink {
             .offer_task(&queue, partition, Self::envelope(task))
         {
             Ok(()) => OfferOutcome::Matched,
-            Err(envelope) => {
-                if self.matching.buffer_task(&queue, partition, envelope) {
-                    OfferOutcome::Buffered
-                } else {
-                    OfferOutcome::Rejected
-                }
-            }
+            Err(_) => OfferOutcome::Rejected,
         }
     }
 
     fn capacity(&self, queue_name: &str) -> usize {
-        self.matching.free_capacity(queue_name)
+        self.matching.waiting(queue_name)
     }
 }

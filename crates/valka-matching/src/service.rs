@@ -15,6 +15,8 @@ type PartitionKey = (String, i32);
 pub struct MatchingService {
     partitions: Arc<DashMap<PartitionKey, PartitionQueue>>,
     config: MatchingConfig,
+    /// Woken whenever a worker starts waiting (feeders and remote fetchers listen).
+    waiting_changed: Arc<tokio::sync::Notify>,
 }
 
 impl MatchingService {
@@ -22,7 +24,47 @@ impl MatchingService {
         Self {
             partitions: Arc::new(DashMap::new()),
             config,
+            waiting_changed: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Notified whenever a worker registers as waiting.
+    pub fn waiting_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.waiting_changed.clone()
+    }
+
+    /// Distinct workers currently waiting for a task of `queue`. A worker waits on every
+    /// partition of a queue at once but takes one task per wait.
+    pub fn waiting(&self, queue_name: &str) -> usize {
+        let mut workers = std::collections::HashSet::new();
+        for i in 0..self.config.num_partitions {
+            if let Some(p) = self.partitions.get(&(queue_name.to_string(), i)) {
+                for slot in &p.waiting_workers {
+                    if !slot.task_sender.is_closed() {
+                        workers.insert(slot.worker_id.clone());
+                    }
+                }
+            }
+        }
+        workers.len()
+    }
+
+    /// Queues with at least one waiting worker.
+    pub fn queues_with_waiters(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .partitions
+            .iter()
+            .filter(|e| {
+                e.value()
+                    .waiting_workers
+                    .iter()
+                    .any(|s| !s.task_sender.is_closed())
+            })
+            .map(|e| e.key().0.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// Ensure partitions exist for a queue, building the partition tree.
@@ -105,16 +147,19 @@ impl MatchingService {
             task_sender: tx,
         };
 
-        if let Some(mut partition) = self.get_partition_mut(queue_name, partition_id) {
-            let matched = partition.register_worker(slot);
-            if matched {
-                debug!(
-                    queue = queue_name,
-                    partition = partition_id.0,
-                    worker = %worker_id,
-                    "Worker immediately matched with pending task"
-                );
-            }
+        let matched = match self.get_partition_mut(queue_name, partition_id) {
+            Some(mut partition) => partition.register_worker(slot),
+            None => false,
+        };
+        if matched {
+            debug!(
+                queue = queue_name,
+                partition = partition_id.0,
+                worker = %worker_id,
+                "Worker immediately matched with pending task"
+            );
+        } else {
+            self.waiting_changed.notify_waiters();
         }
 
         rx

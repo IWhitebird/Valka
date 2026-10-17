@@ -40,10 +40,11 @@ impl Engine {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = shutdown.changed() => { if *shutdown.borrow() { return; } }
+                r = shutdown.changed() => { if r.is_err() || *shutdown.borrow() { return; } }
                 _ = tick.tick() => {
                     self.fire_due_timers();
                     self.flush_lease_records();
+                    self.lapse_remote_offers();
                 }
             }
         }
@@ -267,7 +268,7 @@ impl Engine {
         let interval = self.inner.cfg.feeder_interval;
         loop {
             tokio::select! {
-                _ = shutdown.changed() => { if *shutdown.borrow() { return; } }
+                r = shutdown.changed() => { if r.is_err() || *shutdown.borrow() { return; } }
                 _ = self.inner.pending_wake.notified() => {}
                 _ = tokio::time::sleep(interval) => {}
             }

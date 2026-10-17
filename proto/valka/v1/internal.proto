@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package valka.v1;
 
+import "valka/v1/events.proto";
+
 // Node-to-node RPCs on the internal listener (cluster.internal_addr). Every call carries
 // `authorization: Bearer <cluster.token>`; mTLS is optional. Bodies are JSON-encoded Rust
 // types from `valka-cluster` (`Command`, `Reply`, `Query`, `ScatterReply`), so adding a
@@ -15,8 +17,16 @@ service InternalService {
     // Answer a cluster-wide query from this node's shards only (list, count, stats).
     rpc Scatter(ScatterRequest) returns (ScatterResponse);
 
+    // This node's task events (status changes of the shards it serves), for nodes whose
+    // subscribers want the whole cluster's stream.
+    rpc Events(EventsRequest) returns (stream TaskEvent);
+
     // Health and identity.
     rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message EventsRequest {
+    string from_node = 1;
 }
 
 message ExecuteRequest {

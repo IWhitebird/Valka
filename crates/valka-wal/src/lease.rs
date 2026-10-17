@@ -493,7 +493,7 @@ impl LeaseKeeper {
         tick.tick().await;
         loop {
             tokio::select! {
-                _ = shutdown.changed() => { if *shutdown.borrow() { return; } }
+                r = shutdown.changed() => { if r.is_err() || *shutdown.borrow() { return; } }
                 _ = tick.tick() => {}
             }
             if self.fenced().is_some() {

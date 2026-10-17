@@ -20,7 +20,10 @@ pub struct Node {
     pub matching: MatchingService,
     pub dispatcher: DispatcherService,
     pub logs: Arc<LogIngester>,
+    /// Events of the shards this node serves.
     pub event_tx: broadcast::Sender<valka_proto::TaskEvent>,
+    /// The whole cluster's events (this node's plus its peers', while anyone listens).
+    pub cluster_events: broadcast::Sender<valka_proto::TaskEvent>,
     /// The request layer (routing to shard owners, scatter-gather).
     pub api: Api,
     /// The internal listener, bound when `cluster.enabled` (or by tests).
@@ -91,6 +94,16 @@ impl Node {
             Duration::from_secs(10),
         );
         let api = Api::new(engine.clone(), dispatcher.clone(), peers);
+        // Workers here may run tasks owned anywhere: route their side through the Api.
+        dispatcher.set_router(std::sync::Arc::new(api.clone()));
+        crate::feeder::spawn_remote_feeder(api.clone(), shutdown_rx.clone());
+        let (cluster_events, _) = broadcast::channel::<valka_proto::TaskEvent>(4096);
+        crate::relay::spawn_event_relay(
+            api.clone(),
+            event_tx.clone(),
+            cluster_events.clone(),
+            shutdown_rx.clone(),
+        );
         // Bind before serving anything so a bad address fails the start.
         let internal_listener = if config.cluster.enabled {
             Some(tokio::net::TcpListener::bind(&config.cluster.internal_addr).await?)
@@ -113,6 +126,7 @@ impl Node {
             dispatcher,
             logs,
             event_tx,
+            cluster_events,
             api,
             internal_listener,
             shutdown_tx,

@@ -275,7 +275,7 @@ impl worker_service_server::WorkerService for WorkerServiceImpl {
         let req = request.into_inner();
         let output = parse_json("output", &req.output)?.unwrap_or(serde_json::Value::Null);
         self.dispatcher
-            .engine()
+            .router()
             .checkpoint(&req.task_id, &req.task_run_id, &req.step, output)
             .await
             .map_err(Status::from)?;

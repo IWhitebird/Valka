@@ -44,8 +44,9 @@ async fn main() -> Result<()> {
 
     let mut node = node;
     let internal_handle = node.internal_listener.take().map(|listener| {
-        let (api, token, shutdown, failed) = (
+        let (api, local_events, token, shutdown, failed) = (
             node.api.clone(),
+            node.event_tx.clone(),
             config.cluster.token.clone(),
             node.shutdown_rx.clone(),
             node.shutdown_tx.clone(),
@@ -54,8 +55,15 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let r = match tls {
                 Ok(tls) => {
-                    valka_server::internal_grpc::serve_internal(listener, api, token, tls, shutdown)
-                        .await
+                    valka_server::internal_grpc::serve_internal(
+                        listener,
+                        api,
+                        local_events,
+                        token,
+                        tls,
+                        shutdown,
+                    )
+                    .await
                 }
                 Err(e) => Err(e),
             };
@@ -71,7 +79,7 @@ async fn main() -> Result<()> {
     let grpc_handle = tokio::spawn({
         let (api, event_tx, logs, shutdown) = (
             node.api.clone(),
-            node.event_tx.clone(),
+            node.cluster_events.clone(),
             node.logs.clone(),
             node.shutdown_rx.clone(),
         );
@@ -88,7 +96,7 @@ async fn main() -> Result<()> {
     let http_handle = tokio::spawn({
         let (api, event_tx, logs, shutdown, web_dir) = (
             node.api.clone(),
-            node.event_tx.clone(),
+            node.cluster_events.clone(),
             node.logs.clone(),
             node.shutdown_rx.clone(),
             config.web_dir.clone(),

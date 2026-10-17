@@ -425,7 +425,7 @@ impl Engine {
             // Jitter keeps nodes from moving in lockstep.
             let jitter = interval.mul_f64(rand::random::<f64>() * 0.2);
             tokio::select! {
-                _ = shutdown.changed() => { if *shutdown.borrow() { return; } }
+                r = shutdown.changed() => { if r.is_err() || *shutdown.borrow() { return; } }
                 _ = tokio::time::sleep(interval + jitter) => {}
             }
             if self.poisoned().is_some() {

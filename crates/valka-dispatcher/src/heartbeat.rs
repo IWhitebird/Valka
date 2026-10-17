@@ -41,8 +41,8 @@ pub async fn heartbeat_checker(
 
     loop {
         tokio::select! {
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
+            r = shutdown.changed() => {
+                if r.is_err() || *shutdown.borrow() {
                     info!("Heartbeat checker shutting down");
                     break;
                 }

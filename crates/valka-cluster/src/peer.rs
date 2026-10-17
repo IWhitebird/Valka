@@ -199,6 +199,58 @@ impl PeerClients {
             .map_err(|e| RpcError::Transport(format!("{addr}: bad reply: {e}")))
     }
 
+    /// The task events of the node at `addr` (its own shards only).
+    pub async fn events(
+        &self,
+        addr: &str,
+        from: &str,
+    ) -> Result<tonic::Streaming<valka_proto::TaskEvent>, RpcError> {
+        self.admit(addr)?;
+        // A long-lived stream: no per-call timeout on this channel.
+        let ch = {
+            let scheme = if self.inner.tls.is_some() {
+                "https"
+            } else {
+                "http"
+            };
+            let mut ep = Endpoint::from_shared(format!("{scheme}://{addr}"))
+                .map_err(|e| RpcError::Transport(format!("bad peer address {addr}: {e}")))?
+                .connect_timeout(Duration::from_secs(3))
+                .http2_keep_alive_interval(Duration::from_secs(10))
+                .keep_alive_while_idle(true);
+            if let Some(tls) = &self.inner.tls {
+                let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
+                ep = ep
+                    .tls_config(tls.clone().domain_name(host.trim_matches(['[', ']'])))
+                    .map_err(|e| RpcError::Transport(format!("tls config: {e}")))?;
+            }
+            ep.connect_lazy()
+        };
+        let auth = self
+            .inner
+            .token
+            .as_ref()
+            .map(|t| MetadataValue::try_from(format!("Bearer {t}")))
+            .transpose()
+            .map_err(|e| RpcError::Transport(format!("bad token: {e}")))?;
+        let mut client =
+            InternalServiceClient::with_interceptor(ch, move |mut req: tonic::Request<()>| {
+                if let Some(a) = &auth {
+                    req.metadata_mut().insert("authorization", a.clone());
+                }
+                Ok(req)
+            });
+        let s = client
+            .events(valka_proto::EventsRequest {
+                from_node: from.to_string(),
+            })
+            .await
+            .map_err(|s| self.transport(addr, s))?
+            .into_inner();
+        self.record(addr, true);
+        Ok(s)
+    }
+
     /// The node id answering at `addr`.
     pub async fn ping(&self, addr: &str) -> Result<valka_proto::PingResponse, RpcError> {
         self.admit(addr)?;

@@ -16,6 +16,8 @@ use valka_proto::*;
 
 pub struct InternalServiceImpl {
     pub api: Api,
+    /// This node's own task events (not the cluster-wide channel: no relay loops).
+    pub local_events: tokio::sync::broadcast::Sender<TaskEvent>,
 }
 
 impl InternalServiceImpl {
@@ -69,6 +71,26 @@ impl internal_service_server::InternalService for InternalServiceImpl {
         Ok(Response::new(resp))
     }
 
+    type EventsStream =
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<TaskEvent, Status>> + Send + 'static>>;
+
+    async fn events(
+        &self,
+        _request: Request<EventsRequest>,
+    ) -> Result<Response<Self::EventsStream>, Status> {
+        let mut rx = self.local_events.subscribe();
+        let stream = async_stream::stream! {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => yield Ok(ev),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        };
+        Ok(Response::new(Box::pin(stream)))
+    }
+
     async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         Ok(Response::new(PingResponse {
             node_id: self.api.node_id().to_string(),
@@ -83,13 +105,14 @@ impl internal_service_server::InternalService for InternalServiceImpl {
 pub async fn serve_internal(
     listener: tokio::net::TcpListener,
     api: Api,
+    local_events: tokio::sync::broadcast::Sender<TaskEvent>,
     token: Option<String>,
     tls: Option<tonic::transport::ServerTlsConfig>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
     let addr: SocketAddr = listener.local_addr()?;
     let svc = internal_service_server::InternalServiceServer::with_interceptor(
-        InternalServiceImpl { api },
+        InternalServiceImpl { api, local_events },
         valka_cluster::security::token_check(token),
     );
     let mut builder = tonic::transport::Server::builder()

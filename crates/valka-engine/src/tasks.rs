@@ -5,8 +5,10 @@ use serde_json::Value;
 use valka_core::{ServerError, ShardId, TaskStatus};
 use valka_wal::{TaskSpec, WalRecord};
 
-use crate::engine::{CreateTask, DispatchInfo, Engine, FailResult, ResultOutcome, RunResult};
-use crate::state::{RunEnd, RunStatus};
+use crate::engine::{
+    CreateTask, DispatchInfo, Engine, FailResult, ResultOutcome, RunLocation, RunResult,
+};
+use crate::state::{RunEnd, RunStatus, SignalStatus};
 use crate::timers::TimerKind;
 use crate::view::{DeadLetterView, RunView, TaskView};
 use crate::write_path::{decide_outcome, dispatchable, ensure_running};
@@ -220,14 +222,15 @@ impl Engine {
             .sum()
     }
 
-    /// Cancel a non-terminal task. Returns the view and the worker to notify if running.
+    /// Cancel a non-terminal task. Returns the view and, if a run was in progress, where
+    /// it lives (so the caller can tell its worker).
     pub async fn cancel_task(
         &self,
         task_id: &str,
         reason: &str,
-    ) -> Result<(TaskView, Option<String>), ServerError> {
+    ) -> Result<(TaskView, Option<RunLocation>), ServerError> {
         let shard = self.shard_for(task_id)?;
-        let (durable, transitions, _, view) = self.mutate(
+        let (durable, transitions, running, view) = self.mutate(
             shard,
             |st| {
                 let t = st
@@ -240,22 +243,46 @@ impl Engine {
                         to: "CANCELLED".into(),
                     });
                 }
+                let running = t
+                    .current_run()
+                    .filter(|r| r.status == RunStatus::Running)
+                    .map(|r| RunLocation {
+                        run_id: r.id.clone(),
+                        worker_id: r.worker_id.clone(),
+                        node_id: r.node_id.clone(),
+                    });
                 Ok((
                     WalRecord::TaskCancelled {
                         task_id: task_id.into(),
                         reason: reason.into(),
                     },
-                    (),
+                    running,
                 ))
             },
             |st| st.tasks.get(task_id).map(|t| t.view()),
         )?;
         durable.wait().await?;
         self.after_durable(&transitions);
-        let worker = transitions.first().and_then(|t| t.worker_id.clone());
         let view =
             view.ok_or_else(|| ServerError::Internal("task vanished after cancel".into()))?;
-        Ok((view, worker))
+        Ok((view, running))
+    }
+
+    /// Where a task's current run lives, if it is running.
+    pub fn run_location(&self, task_id: &str) -> Option<RunLocation> {
+        let shard = self.shard_of(task_id)?;
+        let st = self.inner.shards[shard.index()].lock();
+        let t = st.tasks.get(task_id)?;
+        if t.status != TaskStatus::Running {
+            return None;
+        }
+        t.current_run()
+            .filter(|r| r.status == RunStatus::Running)
+            .map(|r| RunLocation {
+                run_id: r.id.clone(),
+                worker_id: r.worker_id.clone(),
+                node_id: r.node_id.clone(),
+            })
     }
 
     pub async fn delete_task(&self, task_id: &str) -> Result<bool, ServerError> {
@@ -317,14 +344,42 @@ impl Engine {
         Ok(total)
     }
 
-    /// Record a dispatch. Does **not** wait for durability: the dispatch record is
-    /// asynchronous by design (see DESIGN.md §5); a lost dispatch record only costs a
-    /// possible duplicate execution, which the at-least-once contract already allows.
+    /// Record a dispatch to a worker of this node. See [`Engine::dispatch_to`].
     pub fn dispatch(&self, task_id: &str, worker_id: &str) -> Result<DispatchInfo, ServerError> {
+        let node = self.inner.cfg.node_id.clone();
+        self.dispatch_to(task_id, worker_id, &node, None)
+    }
+
+    /// Record a dispatch of a PENDING task to `worker_id`, attached to `node_id` (this node
+    /// or the node that fetched the task). Does **not** wait for durability: the dispatch
+    /// record is asynchronous by design (DESIGN.md §5); a lost dispatch record only costs
+    /// a possible duplicate execution, which the at-least-once contract already allows.
+    ///
+    /// With `run_id` (minted by the caller for this task's shard) a retried call is
+    /// idempotent: if that run is already the task's running run, its info is returned.
+    pub fn dispatch_to(
+        &self,
+        task_id: &str,
+        worker_id: &str,
+        node_id: &str,
+        run_id: Option<&str>,
+    ) -> Result<DispatchInfo, ServerError> {
         let shard = self.shard_for(task_id)?;
+        if let Some(rid) = run_id
+            && let Some(info) = self.running_dispatch(shard, task_id, rid, worker_id)
+        {
+            return Ok(info);
+        }
         let now = self.inner.clock.now();
-        let run_id = valka_core::new_id_in_shard(shard).to_string();
-        let node_id = self.inner.cfg.node_id.clone();
+        let run_id = match run_id {
+            Some(r) if self.shard_of(r) == Some(shard) => r.to_string(),
+            Some(r) => {
+                return Err(ServerError::InvalidArgument(format!(
+                    "run id {r} is not in task {task_id}'s shard"
+                )));
+            }
+            None => valka_core::new_id_in_shard(shard).to_string(),
+        };
         let grace = self.inner.cfg.scheduler.lease_grace_secs;
         let (durable, transitions, info, _) = self.mutate(
             shard,
@@ -348,6 +403,12 @@ impl Engine {
                     lease_until,
                     task: dispatchable(t, attempt),
                     checkpoints: t.checkpoint_views(),
+                    pending_signals: st
+                        .signals
+                        .values()
+                        .filter(|s| s.task_id == task_id && s.status == SignalStatus::Pending)
+                        .map(|s| s.view())
+                        .collect(),
                 };
                 Ok((
                     WalRecord::TaskDispatched {
@@ -355,7 +416,7 @@ impl Engine {
                         run_id: run_id.clone(),
                         attempt,
                         worker_id: worker_id.into(),
-                        node_id: node_id.clone(),
+                        node_id: node_id.into(),
                         lease_until,
                     },
                     info,
@@ -363,6 +424,7 @@ impl Engine {
             },
             |_| (),
         )?;
+        self.inner.remote_offers.lock().remove(task_id);
         self.inner.timers.lock().schedule(
             info.lease_until,
             TimerKind::LeaseExpiry {
@@ -372,6 +434,64 @@ impl Engine {
         );
         self.spawn_after_durable(durable, transitions);
         Ok(info)
+    }
+
+    /// The info of a dispatch that already happened (a retried `dispatch_to`).
+    fn running_dispatch(
+        &self,
+        shard: ShardId,
+        task_id: &str,
+        run_id: &str,
+        worker_id: &str,
+    ) -> Option<DispatchInfo> {
+        let st = self.inner.shards[shard.index()].lock();
+        if !st.serving() {
+            return None;
+        }
+        let t = st.tasks.get(task_id)?;
+        let r = t.current_run()?;
+        if t.status != TaskStatus::Running
+            || r.id != run_id
+            || r.worker_id != worker_id
+            || r.status != RunStatus::Running
+        {
+            return None;
+        }
+        Some(DispatchInfo {
+            run_id: r.id.clone(),
+            attempt: r.attempt_number,
+            lease_until: r.lease_until,
+            task: dispatchable(t, r.attempt_number),
+            checkpoints: t.checkpoint_views(),
+            pending_signals: Vec::new(),
+        })
+    }
+
+    /// The run was dispatched but its worker never got the assignment: put the task back
+    /// to PENDING without spending an attempt. Returns once durable.
+    pub async fn return_run(&self, task_id: &str, run_id: &str) -> Result<(), ServerError> {
+        let shard = self.shard_for(task_id)?;
+        let (durable, transitions, _, _) = self.mutate(
+            shard,
+            |st| {
+                let t = st
+                    .tasks
+                    .get(task_id)
+                    .ok_or_else(|| ServerError::TaskNotFound(task_id.into()))?;
+                ensure_running(t, run_id)?;
+                Ok((
+                    WalRecord::RunReturned {
+                        task_id: task_id.into(),
+                        run_id: run_id.into(),
+                    },
+                    (),
+                ))
+            },
+            |_| (),
+        )?;
+        durable.wait().await?;
+        self.after_durable(&transitions);
+        Ok(())
     }
 
     pub async fn complete_run(

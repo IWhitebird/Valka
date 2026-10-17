@@ -34,8 +34,8 @@ impl LogIngester {
         info!("Log ingester started");
         loop {
             tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                r = shutdown.changed() => {
+                    if r.is_err() || *shutdown.borrow() {
                         self.flush_all(&mut buffers).await;
                         info!("Log ingester shutting down");
                         return;
