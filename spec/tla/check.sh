@@ -5,6 +5,8 @@
 #   spec/tla/check.sh Restart.cfg              just these
 #   spec/tla/check.sh --expect-fail counterexamples/*.cfg
 #                                              each must end in a property violation
+#   spec/tla/check.sh --simulate 50000 TwoNodes.cfg
+#                                              random behaviours instead of every state
 #
 # TLA2TOOLS points at tla2tools.jar (default: ./tla2tools.jar next to this script).
 # TLC_WORKERS defaults to "auto".
@@ -14,9 +16,14 @@ cd "$(dirname "$0")"
 jar=${TLA2TOOLS:-tla2tools.jar}
 workers=${TLC_WORKERS:-auto}
 expect_fail=0
+mode=()
 if [[ ${1:-} == --expect-fail ]]; then
   expect_fail=1
   shift
+fi
+if [[ ${1:-} == --simulate ]]; then
+  mode=(-simulate "num=$2" -depth 80)
+  shift 2
 fi
 cfgs=("$@")
 if [[ ${#cfgs[@]} -eq 0 ]]; then
@@ -30,11 +37,11 @@ for cfg in "${cfgs[@]}"; do
   start=$(date +%s)
   set +e
   java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -config "$cfg" -workers "$workers" \
-    -deadlock -nowarning -metadir "$meta" Ownership.tla >"$log" 2>&1
+    "${mode[@]}" -deadlock -nowarning -metadir "$meta" Ownership.tla >"$log" 2>&1
   code=$?
   set -e
   secs=$(( $(date +%s) - start ))
-  summary=$({ grep -E "distinct states found|violated" "$log" || true; } | tail -2 | tr '\n' ' ')
+  summary=$({ grep -E "distinct states found|states checked|violated" "$log" || true; } | tail -2 | tr '\n' ' ')
   # TLC exits 12 on a safety violation and 13 on a liveness violation.
   if [[ $expect_fail -eq 1 ]]; then
     if [[ $code -eq 12 || $code -eq 13 ]]; then

@@ -95,21 +95,12 @@ impl Engine {
             return 0;
         }
         let _moves = self.inner.moves.lock().await;
-        // One LIST for every shard's snapshots instead of one per shard.
-        let snaps = match snapshot::list_all(&self.inner.store).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(error = %e, "claim round: listing snapshots failed");
-                return 0;
-            }
-        };
         let cache = tokio::sync::Mutex::new(IncCache::default());
         let concurrency = self.inner.cfg.cluster.claim_concurrency.max(1);
         let results: Vec<(ShardId, Result<(), ClaimRefused>)> = futures::stream::iter(shards)
             .map(|s| {
-                let listed = snaps.get(&s).cloned().unwrap_or_default();
                 let cache = &cache;
-                async move { (s, self.claim_one(s, listed, cache).await) }
+                async move { (s, self.claim_one(s, cache).await) }
             })
             .buffer_unordered(concurrency)
             .collect()
@@ -145,7 +136,6 @@ impl Engine {
     async fn claim_one(
         &self,
         shard: ShardId,
-        listed: Vec<SnapshotKey>,
         cache: &tokio::sync::Mutex<IncCache>,
     ) -> Result<(), ClaimRefused> {
         {
@@ -155,7 +145,7 @@ impl Engine {
             }
             st.phase = ShardPhase::Loading;
         }
-        let r = self.claim_loading(shard, listed, cache).await;
+        let r = self.claim_loading(shard, cache).await;
         if r.is_err() {
             let mut st = self.inner.shards[shard.index()].lock();
             if st.phase == ShardPhase::Loading {
@@ -168,7 +158,6 @@ impl Engine {
     async fn claim_loading(
         &self,
         shard: ShardId,
-        listed: Vec<SnapshotKey>,
         cache: &tokio::sync::Mutex<IncCache>,
     ) -> Result<(), ClaimRefused> {
         let store = &self.inner.store;
@@ -191,6 +180,8 @@ impl Engine {
                     .map_err(io)?,
             };
             if !movable {
+                // Definitely someone else's: not a claim of ours to finish.
+                self.inner.stranded.lock().remove(&shard);
                 return Err(ClaimRefused::Busy(format!(
                     "owned by {}.{} (gen {})",
                     r.node, r.inc, r.generation
@@ -210,14 +201,23 @@ impl Engine {
             generation,
             state: OwnerState::Owned,
         };
+        // Once the CAS may have landed, the record may name this incarnation: then nobody
+        // else can claim the shard while this incarnation lives, so it must finish the
+        // claim even if a later step (or the CAS's own response) fails. An ambiguous
+        // failure counts: the PUT may have landed with its response lost.
+        self.inner.stranded.lock().insert(shard);
         if !owners::cas(store, shard, current.as_ref(), &next)
             .await
             .map_err(io)?
         {
+            self.inner.stranded.lock().remove(&shard);
             return Err(ClaimRefused::Lost);
         }
 
-        // 3. Its newest snapshot. No snapshot at all: nobody ever served it.
+        // 3. Its newest snapshot, listed only now: a split that finished after an earlier
+        //    LIST (its marker is what made the shard claimable) wrote newer snapshots.
+        //    No snapshot at all: nobody ever served it.
+        let listed = snapshot::list(store, shard).await.map_err(io)?;
         let newest = match listed.last() {
             None => None,
             Some(_) => snapshot::load_newest_of::<ShardSnapshot>(store, &listed, |_| true)
@@ -304,6 +304,7 @@ impl Engine {
             }
             *st = state;
         }
+        self.inner.stranded.lock().remove(&shard);
         let now = tokio::time::Instant::now();
         self.inner.moved_at.lock().insert(shard, now);
         let grace = Duration::from_millis(self.inner.cfg.cluster.reconcile_grace_ms);

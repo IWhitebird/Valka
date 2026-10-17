@@ -45,4 +45,6 @@ mod cluster_tests;
 #[cfg(test)]
 mod safety_tests;
 #[cfg(test)]
+mod sim_tests;
+#[cfg(test)]
 mod tests;

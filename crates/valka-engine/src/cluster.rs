@@ -325,6 +325,7 @@ impl Engine {
 
         let mut claims = Vec::new();
         let mut releases = Vec::new();
+        let stranded: std::collections::HashSet<ShardId> = self.inner.stranded.lock().clone();
         {
             let backoff = self.inner.membership.backoff.lock();
             let residency = Duration::from_secs(self.inner.cfg.cluster.min_residency_secs);
@@ -334,6 +335,13 @@ impl Engine {
                 let phase = m.lock().phase;
                 let desired = self.desired_owner(shard, &eligible);
                 match phase {
+                    // A claim of ours that failed after its CAS: only we can finish it.
+                    ShardPhase::Unowned
+                        if stranded.contains(&shard)
+                            && backoff.get(&shard).is_none_or(|(at, _)| now >= *at) =>
+                    {
+                        claims.push(shard)
+                    }
                     ShardPhase::Unowned
                         if !draining
                             && desired == Some(me.as_str())

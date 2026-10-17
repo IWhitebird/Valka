@@ -745,6 +745,18 @@ The model's findings (§19) are all implemented, each with a regression test
   section, so a shard's records appear in the log in `shard_seq` order. Coalesced
   heartbeat records once broke this (assigned under the lock, appended after it); replay
   would then have skipped them.
+- **Three bugs found by the randomized multi-node simulation** (`valka-engine/src/sim_tests.rs`,
+  hundreds of seeds of kills, freezes, drains and bucket faults with a history checker), all
+  in claims, none in the protocol as modelled:
+  - *Claims must list the shard's snapshots after their owner CAS.* Claims of a batch
+    shared one LIST taken before the owner records were read; a split that finished in
+    between (its marker is what made the shard claimable) wrote newer snapshots, and the
+    claim loaded the stale one, losing acknowledged records.
+  - *A claimer must finish a claim whose CAS may have landed.* Once the owner record names
+    an incarnation, nobody else can claim the shard while it lives. A claim that failed
+    after its CAS, or whose CAS response was lost, left the shard unserved forever when
+    placement then preferred another node. Such shards are now "stranded" and retried by
+    their claimer whatever placement says; once served, they are handed over normally.
 - **A claim that finds its newest snapshot pointing into a dead, unsplit log backs off**
   for the guardian's split rather than splitting inline: after the claim's own CAS the
   owner record names the claimer, so an inline split would skip the very shard.

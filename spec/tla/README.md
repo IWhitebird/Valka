@@ -92,7 +92,20 @@ They may abort at any point and start over.
 | `Splitters.cfg` | safety | 1 node, 1 shard, 2 concurrent splitters, 2 records |
 | `Liveness.cfg` | liveness | 2 nodes (one never fails), 1 shard, 2 incarnations, 1 record |
 
-RESULTS_TABLE
+Results of the last full run (TLC 1.7.4, 2 workers, capped at 2 cores of a laptop):
+
+| Configuration | Mode | Result | States | Time |
+|---|---|---|---|---|
+| `Ownership.cfg` | exhaustive | all invariants hold | 7,163,671 distinct (63.7 M generated) | 6 min |
+| `Splitters.cfg` | exhaustive | all invariants hold | 9,184,292 distinct (88.8 M generated) | 7 min |
+| `Liveness.cfg` | exhaustive | invariants and `EventuallyServed` hold | 99,756 distinct | 23 s |
+| `Restart.cfg` | simulation, 200,000 behaviours, depth 80 | no violation | 11.7 M checked | 2 min |
+| `TwoNodes.cfg` | simulation, 200,000 behaviours, depth 80 | no violation | 14.8 M checked | 3 min |
+| `counterexamples/*.cfg` | exhaustive | each violates its property, as it must | — | 1 s – 8 min each |
+
+`Restart.cfg` and `TwoNodes.cfg` did not finish exhaustively within 90 minutes on 2 cores; CI
+simulates them on every push and checks them exhaustively in a nightly job
+(`.github/workflows/tla-nightly.yml`).
 
 `counterexamples/` holds configurations that **must fail**; each reproduces a protocol bug
 the model found in an earlier draft (see below). CI checks that they still fail, so a change

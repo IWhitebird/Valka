@@ -111,7 +111,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cfg: [Ownership, Restart, TwoNodes, Splitters, Liveness, counterexamples]
+        # Restart and TwoNodes take hours exhaustively: simulated here, checked in full
+        # nightly (tla-nightly.yml).
+        cfg: [Ownership, Splitters, Liveness, Restart-sim, TwoNodes-sim, counterexamples]
     env:
       TLA2TOOLS: ${{ github.workspace }}/tla2tools.jar
     steps:
@@ -125,9 +127,15 @@ jobs:
           curl -sSfLo "$TLA2TOOLS" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
           echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $TLA2TOOLS" | sha256sum -c -
       - name: Model-check
-        if: matrix.cfg != 'counterexamples'
+        if: matrix.cfg != 'counterexamples' && !endsWith(matrix.cfg, '-sim')
         working-directory: spec/tla
         run: ./check.sh ${{ matrix.cfg }}.cfg
+      - name: Simulate
+        if: endsWith(matrix.cfg, '-sim')
+        working-directory: spec/tla
+        run: ./check.sh --simulate 100000 "${CFG%-sim}.cfg"
+        env:
+          CFG: ${{ matrix.cfg }}
       - name: Counterexamples still fail
         if: matrix.cfg == 'counterexamples'
         working-directory: spec/tla

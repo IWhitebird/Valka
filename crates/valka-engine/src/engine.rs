@@ -175,6 +175,11 @@ pub(crate) struct Inner {
     pub(crate) moves: tokio::sync::Mutex<()>,
     /// When each shard last moved to or from this node (for `min_residency`).
     pub(crate) moved_at: Mutex<HashMap<ShardId, tokio::time::Instant>>,
+    /// Shards whose owner record this incarnation took (claim CAS) but which it does not
+    /// serve because a later claim step failed. Nobody else can claim them while this
+    /// incarnation lives, so this node retries them whatever placement says (and hands
+    /// them over normally once it serves them).
+    pub(crate) stranded: Mutex<std::collections::HashSet<ShardId>>,
     /// PENDING tasks recovered by a claim are not dispatched before this (reconcile grace).
     pub(crate) hold_until: Mutex<HashMap<ShardId, tokio::time::Instant>>,
     /// Tasks handed to another node by `fetch` and not dispatched yet: reservation expiry.
@@ -291,6 +296,7 @@ impl Engine {
             membership,
             moves: tokio::sync::Mutex::new(()),
             moved_at: Mutex::new(HashMap::new()),
+            stranded: Mutex::new(std::collections::HashSet::new()),
             hold_until: Mutex::new(HashMap::new()),
             queues: Mutex::new(HashMap::new()),
             remote_offers: Mutex::new(HashMap::new()),
