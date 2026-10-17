@@ -218,8 +218,19 @@ impl Engine {
         if dirty.is_empty() {
             return;
         }
-        let mut envs = Vec::with_capacity(dirty.len());
+        // Per shard: assign shard_seqs and append in one critical section, so the log holds
+        // each shard's records in shard_seq order (replay and splits rely on it).
+        let mut by_shard: std::collections::BTreeMap<
+            ShardId,
+            Vec<(String, String, DateTime<Utc>)>,
+        > = std::collections::BTreeMap::new();
         for (task_id, (shard, run_id, lease_until)) in dirty {
+            by_shard
+                .entry(shard)
+                .or_default()
+                .push((task_id, run_id, lease_until));
+        }
+        for (shard, leases) in by_shard {
             let mut st = self.inner.shards[shard.index()].lock();
             // Serving, or releasing (whose final snapshot must include it).
             if !matches!(
@@ -228,24 +239,25 @@ impl Engine {
             ) {
                 continue;
             }
-            let mut env = Envelope::with_ts(
-                shard,
-                self.inner.clock.now(),
-                WalRecord::LeaseExtended {
-                    task_id,
-                    run_id,
-                    lease_until,
-                },
-            );
-            env.generation = st.generation;
             let was_clean = st.records_since_snapshot == 0;
-            st.apply(&mut env);
+            let mut envs = Vec::with_capacity(leases.len());
+            for (task_id, run_id, lease_until) in leases {
+                let mut env = Envelope::with_ts(
+                    shard,
+                    self.inner.clock.now(),
+                    WalRecord::LeaseExtended {
+                        task_id,
+                        run_id,
+                        lease_until,
+                    },
+                );
+                env.generation = st.generation;
+                st.apply(&mut env);
+                envs.push(env);
+            }
             if was_clean {
                 st.dirty_since_lsn = Some(self.inner.writer.next_lsn());
             }
-            envs.push(env);
-        }
-        if !envs.is_empty() {
             drop(self.inner.writer.append(envs));
         }
     }

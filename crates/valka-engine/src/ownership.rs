@@ -238,10 +238,22 @@ impl Engine {
                             .map_err(io)?
                     };
                     if !ok {
-                        return Err(ClaimRefused::Invariant(format!(
+                        // Unreachable while GC keeps markers that snapshots point at. If
+                        // the log is dead but unsplit, its guardian splits it: back off.
+                        let dead = match lease::get(store, node).await.map_err(io)? {
+                            Some(l) => l.record.is_dead_incarnation(*pinc),
+                            None => true,
+                        };
+                        let why = format!(
                             "newest snapshot {} points into a log that is not split",
                             key.key()
-                        )));
+                        );
+                        return Err(if dead {
+                            error!(shard = %shard, why, "waiting for that log's split");
+                            ClaimRefused::Busy(why)
+                        } else {
+                            ClaimRefused::Invariant(why)
+                        });
                     }
                 }
                 ShardState::from_snapshot(snap, Some(key))
@@ -403,38 +415,70 @@ impl Engine {
         inc: u32,
         trunc: u64,
     ) -> Result<(), ServerError> {
+        let Some(log) = self.split_read(node, inc, trunc).await? else {
+            return Ok(());
+        };
+        self.split_commit(node, inc, log).await
+    }
+
+    /// Phase 1: read the log from the watermark to its sealed end. `None` when the
+    /// incarnation is already split.
+    pub(crate) async fn split_read(
+        &self,
+        node: &str,
+        inc: u32,
+        trunc: u64,
+    ) -> Result<Option<split::SealedLog>, ServerError> {
         let store = &self.inner.store;
+        if split::marker_exists(store, node, inc).await? {
+            return Ok(None);
+        }
+        match split::read_sealed(store, node, inc, trunc).await {
+            Ok(l) => Ok(Some(l)),
+            // Segments at or above the watermark vanish only once a split has finished.
+            Err(_) if split::marker_exists(store, node, inc).await? => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Phase 2: write the split snapshots and the marker. Everything this builds on is
+    /// read *after* the log (PHASE2 §8.3 steps 4–5): the marker re-check, the owner
+    /// records, the base snapshots.
+    pub(crate) async fn split_commit(
+        &self,
+        node: &str,
+        inc: u32,
+        log: split::SealedLog,
+    ) -> Result<(), ServerError> {
+        let store = &self.inner.store;
+        let started = std::time::Instant::now();
+        // A split that finished while this one was reading may have deleted the log, seal
+        // included, and a late PUT may have refilled the sealed position: this read is
+        // then not the log the finished split read. Write nothing.
         if split::marker_exists(store, node, inc).await? {
             return Ok(());
         }
-        let started = std::time::Instant::now();
-        let log = match split::read_sealed(store, node, inc, trunc).await {
-            Ok(l) => l,
-            Err(e) => {
-                if split::marker_exists(store, node, inc).await? {
-                    return Ok(());
-                }
-                return Err(e.into());
-            }
-        };
         let total = log.records.len();
-
-        // Per shard, the records of the newest generation this log holds for it.
-        let mut groups: BTreeMap<ShardId, (u64, Vec<Envelope>)> = BTreeMap::new();
+        let mut by_shard: BTreeMap<ShardId, Vec<Envelope>> = BTreeMap::new();
         for (_, env) in log.records {
-            let g = groups
-                .entry(env.shard)
-                .or_insert((env.generation, Vec::new()));
-            if env.generation > g.0 {
-                *g = (env.generation, Vec::new());
-            }
-            if env.generation == g.0 {
-                g.1.push(env);
-            }
+            by_shard.entry(env.shard).or_default().push(env);
         }
-        let written: Vec<Result<bool, ServerError>> = futures::stream::iter(groups)
-            .map(|(shard, (generation, records))| async move {
-                self.split_shard(shard, generation, records).await
+        // Rebuild only the shards whose owner record names this incarnation, at that
+        // record's generation. Older generations in the log ended with a final snapshot.
+        let written: Vec<Result<bool, ServerError>> = futures::stream::iter(by_shard)
+            .map(|(shard, records)| async move {
+                if shard.0 as u32 >= self.inner.num_shards {
+                    warn!(shard = %shard, "split: records for a shard outside the cluster");
+                    return Ok(false);
+                }
+                let Some(owner) = owners::get(store, shard).await? else {
+                    return Ok(false);
+                };
+                if owner.record.node != node || owner.record.inc != inc {
+                    return Ok(false);
+                }
+                self.split_shard(shard, owner.record.generation, records)
+                    .await
             })
             .buffer_unordered(32)
             .collect()
@@ -474,16 +518,14 @@ impl Engine {
     }
 
     /// Rebuild one shard at `generation` from its newest snapshot plus `records`.
+    /// The applied records must continue the base's `shard_seq` without a gap; a gap is
+    /// a bug, never data to serve, so the split fails instead of writing it.
     async fn split_shard(
         &self,
         shard: ShardId,
         generation: u64,
         records: Vec<Envelope>,
     ) -> Result<bool, ServerError> {
-        if shard.0 as u32 >= self.inner.num_shards {
-            warn!(shard = %shard, "split: record for a shard outside the cluster; skipped");
-            return Ok(false);
-        }
         let store = &self.inner.store;
         let listed = snapshot::list(store, shard).await?;
         if listed.iter().any(|k| k.generation > generation) {
@@ -506,13 +548,20 @@ impl Engine {
                 skipped_gen.insert(env.generation);
                 continue;
             }
-            if env.shard_seq > st.shard_seq {
-                st.apply(&mut env);
-                applied += 1;
+            if env.shard_seq <= st.shard_seq {
+                continue;
             }
+            if env.shard_seq != st.shard_seq + 1 {
+                return Err(ServerError::Internal(format!(
+                    "split of shard {shard} gen {generation}: shard_seq jumps from {} to {}",
+                    st.shard_seq, env.shard_seq
+                )));
+            }
+            st.apply(&mut env);
+            applied += 1;
         }
         if !skipped_gen.is_empty() {
-            warn!(shard = %shard, generation, ?skipped_gen, "split skipped records of other generations");
+            debug!(shard = %shard, generation, ?skipped_gen, "split skipped records of older generations");
         }
         if applied == 0 {
             return Ok(false);

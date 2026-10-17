@@ -464,7 +464,7 @@ impl Engine {
 
     /// Delete what no future replay or claim can need (docs/wal/PHASE2.md §8.7):
     /// logs of split incarnations, snapshots beyond the newest few per shard, split
-    /// markers nothing references, long-dead leases, self-test leftovers.
+    /// markers nothing references, self-test leftovers. Never leases.
     pub async fn gc_round(&self) -> Result<GcReport, valka_core::ServerError> {
         let store = &self.inner.store;
         let mut report = GcReport::default();
@@ -513,19 +513,9 @@ impl Engine {
             .filter(|m| !logs.contains_key(*m) && !referenced.contains(*m))
             .collect();
         let mut owner_refs: BTreeSet<(String, u32)> = BTreeSet::new();
-        let mut owner_nodes: BTreeSet<String> = BTreeSet::new();
-        let any_dead_lease = {
-            let ms = self.inner.membership.members.lock();
-            ms.values().any(|m| {
-                m.lease
-                    .as_ref()
-                    .is_some_and(|l| l.state == LeaseState::Dead)
-            })
-        };
-        if !candidates.is_empty() || any_dead_lease {
+        if !candidates.is_empty() {
             for (_, v) in owners::list_all(store).await? {
                 owner_refs.insert((v.record.node.clone(), v.record.inc));
-                owner_nodes.insert(v.record.node);
             }
         }
         for m in candidates {
@@ -535,33 +525,11 @@ impl Engine {
             }
         }
 
-        // 4. Leases of nodes dead for a long time that nothing refers to any more.
-        let long = Duration::from_secs(3600).max(self.inner.membership.split_timeout * 4);
-        let now = Instant::now();
-        let dead: Vec<String> = {
-            let ms = self.inner.membership.members.lock();
-            ms.iter()
-                .filter(|(_, m)| m.dead_since.is_some_and(|d| now.duration_since(d) >= long))
-                .map(|(n, _)| n.clone())
-                .collect()
-        };
-        for node in dead {
-            if owner_nodes.contains(&node) || logs.keys().any(|(n, _)| *n == node) {
-                continue;
-            }
-            if let Some(v) = lease::get(store, &node).await?
-                && v.record.state == LeaseState::Dead
-                && v.record.incarnations().iter().all(|u| {
-                    markers.contains(&(node.clone(), u.inc))
-                        || !logs.contains_key(&(node.clone(), u.inc))
-                })
-            {
-                lease::delete_if_unchanged(store, &v).await?;
-                report.leases_deleted += 1;
-            }
-        }
+        // Leases are never deleted: a deleted lease restarts its node's incarnation
+        // counter, and old split markers and snapshot pointers would then name a live,
+        // reused incarnation (PHASE2 §7.1; the TLA+ model's LeaseGC counterexample).
 
-        // 5. Self-test probes left behind by crashed starts.
+        // 4. Self-test probes left behind by crashed starts.
         for (k, meta) in store.list("selftest/").await? {
             if Utc::now() - meta.last_modified > chrono::Duration::hours(1) {
                 store.delete(&k).await?;
@@ -579,5 +547,4 @@ pub struct GcReport {
     pub segments_deleted: usize,
     pub snapshots_deleted: usize,
     pub markers_deleted: usize,
-    pub leases_deleted: usize,
 }

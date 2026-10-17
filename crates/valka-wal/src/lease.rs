@@ -171,21 +171,6 @@ pub async fn tombstone(
     ))
 }
 
-/// Remove a dead node's lease (garbage collection), only if unchanged since read.
-pub async fn delete_if_unchanged(store: &Store, observed: &VersionedLease) -> Result<(), WalError> {
-    // Object stores have no conditional delete everywhere; re-check right before deleting.
-    // A dead lease never changes again except by its own node restarting, which the
-    // collector rules out by requiring the lease to be dead for a long time.
-    if let Some(cur) = get(store, &observed.record.node).await?
-        && cur.etag == observed.etag
-    {
-        store
-            .delete(&keys::node_lease(&observed.record.node))
-            .await?;
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone)]
 pub struct LeaseConfig {
     pub interval: Duration,

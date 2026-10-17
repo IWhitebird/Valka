@@ -43,4 +43,6 @@ pub use view::{CheckpointView, DeadLetterView, RunView, SignalView, TaskView};
 #[cfg(test)]
 mod cluster_tests;
 #[cfg(test)]
+mod safety_tests;
+#[cfg(test)]
 mod tests;
