@@ -23,8 +23,22 @@ pub struct QueueConfig {
     pub partitions: u32,
     #[serde(default)]
     pub previous: Option<PreviousPartitions>,
+    /// The most partitions this queue ever had. After a shrink, partitions at or above
+    /// `partitions` take no new tasks but may still hold some, so they stay served.
+    #[serde(default)]
+    pub max_partitions: u32,
     pub version: u64,
     pub created_at: DateTime<Utc>,
+}
+
+impl QueueConfig {
+    /// Partitions that may hold tasks: every partition the queue ever had (new tasks go
+    /// only to the first `partitions`).
+    pub fn served_partitions(&self) -> u32 {
+        self.partitions
+            .max(self.max_partitions)
+            .max(self.previous.as_ref().map_or(0, |p| p.partitions))
+    }
 }
 
 /// Read a queue's config, creating it with `default_partitions` if it does not exist.
@@ -43,6 +57,7 @@ pub async fn get_or_create(
             queue: queue.to_string(),
             partitions: default_partitions.max(1),
             previous: None,
+            max_partitions: default_partitions.max(1),
             version: 1,
             created_at: Utc::now(),
         };
@@ -88,6 +103,7 @@ pub async fn set_partitions(
                 partitions: cur.partitions,
                 changed_at: Utc::now(),
             }),
+            max_partitions: cur.served_partitions().max(partitions),
             version: cur.version + 1,
             ..cur
         };
@@ -131,5 +147,19 @@ mod tests {
         assert_eq!(c.previous.unwrap().partitions, 16);
         assert!(set_partitions(&s, "emails", 0, 16).await.is_err());
         assert_eq!(list(&s).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn partitions_removed_by_a_shrink_stay_served() {
+        let s = Store::memory();
+        get_or_create(&s, "q", 16).await.unwrap();
+        let a = set_partitions(&s, "q", 4, 16).await.unwrap();
+        assert_eq!((a.partitions, a.served_partitions()), (4, 16));
+        // A later change overwrites `previous`; the high-water mark keeps 16.
+        let b = set_partitions(&s, "q", 8, 16).await.unwrap();
+        assert_eq!(b.previous.as_ref().unwrap().partitions, 4);
+        assert_eq!((b.partitions, b.served_partitions()), (8, 16));
+        let c = set_partitions(&s, "q", 32, 16).await.unwrap();
+        assert_eq!(c.served_partitions(), 32);
     }
 }

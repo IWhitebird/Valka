@@ -114,6 +114,7 @@ fn member_json(m: &valka_engine::MemberInfo) -> Value {
         "lease_age_ms": m.lease_age_ms,
         "eligible": m.eligible,
         "unsplit": m.unsplit,
+        "dead_by": m.dead_by,
     })
 }
 
@@ -138,8 +139,13 @@ fn node_json(
             "alive"
         },
         "lease_age_ms": stats.lease_age_ms,
-        "grpc_addr": if me { Some(state.node_info.grpc_addr.clone()) } else { member.and_then(|m| m.grpc_addr.clone()) },
-        "http_addr": if me { Some(state.node_info.http_addr.clone()) } else { member.and_then(|m| m.http_addr.clone()) },
+        // Advertised addresses (what clients use); this node's listen address if it has none.
+        "grpc_addr": member
+            .and_then(|m| m.grpc_addr.clone())
+            .or_else(|| me.then(|| state.node_info.grpc_addr.clone())),
+        "http_addr": member
+            .and_then(|m| m.http_addr.clone())
+            .or_else(|| me.then(|| state.node_info.http_addr.clone())),
         "version": member.map_or(state.node_info.version.clone(), |m| m.version.clone()),
         "started_at": stats.started_at.to_rfc3339(),
         "storage_backend": state.engine.store().backend_label(),
@@ -215,6 +221,9 @@ pub struct ShardsQuery {
     dirty: Option<bool>,
     #[serde(default)]
     min_tasks: Option<usize>,
+    /// Only shards nobody serves right now.
+    #[serde(default)]
+    unowned: Option<bool>,
 }
 
 pub async fn list_shards(
@@ -239,6 +248,7 @@ pub async fn list_shards(
                 .as_deref()
                 .is_none_or(|n| s.owner.as_deref() == Some(n))
         })
+        .filter(|s| !q.unowned.unwrap_or(false) || s.owner.is_none())
         .filter(|s| !q.dirty.unwrap_or(false) || s.records_since_snapshot > 0)
         .filter(|s| q.min_tasks.is_none_or(|m| s.tasks >= m))
         .collect();

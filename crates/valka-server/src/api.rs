@@ -1099,7 +1099,8 @@ impl Api {
             return Vec::new();
         };
         let me = self.node_id();
-        let mut out: Vec<String> = (0..cfg.partitions)
+        // Partitions a shrink removed still hold tasks until they drain: fetch from them too.
+        let mut out: Vec<String> = (0..cfg.served_partitions())
             .map(|p| valka_core::partition_shard(queue, p, e.num_shards()))
             .filter(|s| !e.owns(*s))
             .filter_map(|s| self.guess_owner(s))

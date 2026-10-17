@@ -469,6 +469,45 @@ async fn requests_reach_the_new_owner_after_a_takeover() {
         let (status, _) = call(&c.nodes[via], get(&format!("/api/v1/tasks/{id}"))).await;
         assert_eq!(status, StatusCode::OK, "acked task {id} after takeover");
     }
+    // Membership names the dead node and the guardian that tombstoned it; no shard is
+    // left unowned. (The reads above may have been served before the takeover: a halted
+    // node answers until its lease is too old.)
+    let victim_id = c.nodes[victim].engine.node_id().to_string();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let row = loop {
+        let (_, m) = call(&c.nodes[via], get("/api/v1/cluster/members")).await;
+        let row = m
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["node_id"] == victim_id.as_str())
+            .unwrap()
+            .clone();
+        if row["status"] == "dead" {
+            break row;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never tombstoned: {row}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let guardian = row["dead_by"].as_str().expect("dead_by");
+    assert!(guardian != victim_id && guardian.starts_with('n'), "{row}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let (_, unowned) = call(&c.nodes[via], get("/api/v1/cluster/shards?unowned=true")).await;
+        let unowned = unowned.as_array().unwrap();
+        if unowned.is_empty() {
+            break;
+        }
+        assert!(unowned.iter().all(|r| r["owner"].is_null()));
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "shards left unowned"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn certs(names: &[&str]) -> (String, Vec<(String, String)>) {
@@ -825,7 +864,11 @@ async fn changing_partitions_reaches_every_node() {
         .iter()
         .find(|q| q["queue"] == "grow")
         .unwrap();
-    assert_eq!(grow["partition_shards"].as_array().unwrap().len(), 4);
+    // A shrink: the 12 removed partitions take no new tasks but stay served until empty.
+    let rows = grow["partition_shards"].as_array().unwrap();
+    assert_eq!(rows.len(), 16);
+    assert_eq!(rows.iter().filter(|r| r["draining"] == true).count(), 12);
+    assert_eq!(grow["served_partitions"], 16);
     let (s, _) = admin_call(
         &c.nodes[1],
         "PUT",

@@ -199,19 +199,22 @@ pub async fn list_queues(State(state): State<AppState>) -> Result<impl IntoRespo
         .await?
         .into_iter()
         .map(|c| {
-            let partitions: Vec<Value> = (0..c.partitions)
+            let partitions: Vec<Value> = (0..c.served_partitions())
                 .map(|p| {
                     let shard = valka_core::partition_shard(&c.queue, p, n);
                     json!({
                         "partition": p,
                         "shard": shard.0,
                         "desired_owner": state.engine.desired_owner(shard, &eligible),
+                        // Removed by a shrink: no new tasks, served until empty.
+                        "draining": p >= c.partitions,
                     })
                 })
                 .collect();
             json!({
                 "queue": c.queue,
                 "partitions": c.partitions,
+                "served_partitions": c.served_partitions(),
                 "previous": c.previous,
                 "version": c.version,
                 "created_at": c.created_at,

@@ -56,6 +56,9 @@ pub struct MemberInfo {
     pub started_at: Option<DateTime<Utc>>,
     /// Earlier incarnations of the node whose logs are not split yet.
     pub unsplit: Vec<u32>,
+    /// Who marked the lease dead: a guardian's node id (tombstone) or the node itself
+    /// (clean exit).
+    pub dead_by: Option<String>,
 }
 
 pub(crate) struct Membership {
@@ -288,6 +291,7 @@ impl Engine {
             protocol: me.protocol,
             started_at: Some(me.started_at),
             unsplit: me.unsplit.iter().map(|u| u.inc).collect(),
+            dead_by: me.dead_by.clone(),
         });
         for (node, m) in ms.members.lock().iter() {
             let Some(l) = &m.lease else { continue };
@@ -306,6 +310,7 @@ impl Engine {
                 protocol: l.protocol,
                 started_at: Some(l.started_at),
                 unsplit: l.unsplit.iter().map(|u| u.inc).collect(),
+                dead_by: l.dead_by.clone(),
             });
         }
         out

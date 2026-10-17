@@ -399,3 +399,42 @@ async fn a_result_survives_the_owners_death() {
     let t = wait_status(&c.nodes[2], &id, "COMPLETED", 5).await;
     assert_eq!(t["attempt_count"], 1, "the task ran once");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tasks_left_in_partitions_removed_by_a_shrink_reach_remote_workers() {
+    let c = cluster(3).await;
+    // 24 tasks over the default 16 partitions, on every node; no worker yet.
+    let mut ids = Vec::new();
+    for n in 0..24 {
+        ids.push(create_via(&c.nodes[n % 3], "shrink", serde_json::json!({ "n": n })).await);
+    }
+    let owners: HashSet<usize> = ids.iter().filter_map(|id| c.owner_of(id)).collect();
+    assert_eq!(owners.len(), 3, "tasks on every node");
+
+    // Shrink to one partition: the other 15 take no new tasks but still hold these.
+    valka_wal::queues::set_partitions(c.nodes[0].engine.store(), "shrink", 1, 16)
+        .await
+        .unwrap();
+    for n in &c.nodes {
+        n.engine.invalidate_queue("shrink");
+    }
+
+    // Only node 1 has a worker: it must fetch from the owners of the removed partitions.
+    let addr = serve_public(&c, 1).await;
+    let worker = ValkaWorker::builder()
+        .name("after-shrink")
+        .server_addr(&addr)
+        .queues(&["shrink"])
+        .concurrency(4)
+        .handler(|_ctx| async move { Ok(serde_json::json!({})) })
+        .build()
+        .await
+        .unwrap();
+    let stop = worker.shutdown_handle();
+    let run = tokio::spawn(worker.run());
+    for id in &ids {
+        wait_status(&c.nodes[0], id, "COMPLETED", 20).await;
+    }
+    stop.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+}
