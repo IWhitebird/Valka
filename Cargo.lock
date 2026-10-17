@@ -2977,6 +2977,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing-subscriber",
+ "valka-proto",
  "valka-sdk",
 ]
 
@@ -3034,6 +3035,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
+ "bytes",
  "chrono",
  "dotenvy",
  "figment",

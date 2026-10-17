@@ -82,15 +82,6 @@ jobs:
   minio:
     name: MinIO (S3) Tests
     runs-on: ubuntu-latest
-    services:
-      minio:
-        image: bitnami/minio:latest
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-          MINIO_DEFAULT_BUCKETS: valka-test
-        ports:
-          - 9000:9000
     env:
       VALKA_TEST_S3_ENDPOINT: http://localhost:9000
       AWS_ACCESS_KEY_ID: minioadmin
@@ -101,6 +92,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # pgsty/silo is an S3-compatible MinIO fork (minio/minio is no longer on Docker Hub).
+      - name: Start the object store
+        run: |
+          docker run -d --name s3 -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            pgsty/silo:latest server /data
+          for i in $(seq 1 60); do curl -sf http://localhost:9000/minio/health/live && break; sleep 1; done
+          docker exec s3 sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin && mc mb --ignore-existing local/valka-test"
       - name: Run MinIO-backed tests
         run: cargo test -p valka-tests --features minio minio_
 

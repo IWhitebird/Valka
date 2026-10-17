@@ -1,0 +1,115 @@
+# A three-node Valka cluster on one S3-compatible bucket.
+#
+#   docker compose -f docker-compose.cluster.yml up -d --build
+#
+# REST (and the dashboard) on every node: http://localhost:8981, :8982, :8983
+# gRPC (workers, SDK clients) on every node: localhost:50061, :50062, :50063
+# Any node takes any request; workers may attach to any node.
+#
+# Watch a takeover: open http://localhost:8981/cluster, then
+#   docker compose -f docker-compose.cluster.yml kill -s SIGKILL valka-2   (kill -9 a node)
+#   docker compose -f docker-compose.cluster.yml pause valka-3   (freeze: fenced on wake-up)
+# Chaos test: scripts/chaos.sh. Admin API token below: change it.
+#
+# The object store is pgsty/silo, an S3-compatible MinIO fork (the minio/minio images are
+# no longer published on Docker Hub). In production use a real bucket (S3, GCS, R2, ...)
+# and drop the `minio` services.
+
+x-valka: &valka
+  image: valka:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      # Keep a laptop usable while building.
+      CARGO_BUILD_JOBS: "4"
+  depends_on:
+    minio-init:
+      condition: service_completed_successfully
+  restart: unless-stopped
+  environment: &valka-env
+    VALKA_STORAGE__BACKEND: s3
+    VALKA_STORAGE__BUCKET: valka
+    VALKA_STORAGE__ENDPOINT: http://minio:9000
+    VALKA_STORAGE__REGION: us-east-1
+    VALKA_STORAGE__ALLOW_HTTP: "true"
+    VALKA_STORAGE__ACCESS_KEY_ID: minioadmin
+    VALKA_STORAGE__SECRET_ACCESS_KEY: minioadmin
+    VALKA_CLUSTER__ENABLED: "true"
+    VALKA_CLUSTER__TOKEN: change-me-cluster-token
+    VALKA_CLUSTER__INTERNAL_ADDR: "0.0.0.0:50052"
+    VALKA_ADMIN_TOKEN: change-me-admin-token
+    VALKA_GRPC_ADDR: "0.0.0.0:50051"
+    VALKA_HTTP_ADDR: "0.0.0.0:8989"
+    RUST_LOG: valka=info,tower_http=warn
+
+services:
+  minio:
+    image: pgsty/silo:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    # Nodes reach the store over the compose network; publish it only to look inside:
+    # ports: ["19000:9000", "19001:9001"]
+    volumes:
+      - clusterdata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  minio-init:
+    image: pgsty/silo:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/valka &&
+      echo bucket ready"
+
+  valka-1:
+    <<: *valka
+    hostname: valka-1
+    environment:
+      <<: *valka-env
+      VALKA_NODE_ID: valka-1
+      VALKA_CLUSTER__ADVERTISE_INTERNAL_ADDR: valka-1:50052
+      VALKA_CLUSTER__ADVERTISE_GRPC_ADDR: localhost:50061
+      VALKA_CLUSTER__ADVERTISE_HTTP_ADDR: localhost:8981
+    ports:
+      - "50061:50051"
+      - "8981:8989"
+
+  valka-2:
+    <<: *valka
+    hostname: valka-2
+    environment:
+      <<: *valka-env
+      VALKA_NODE_ID: valka-2
+      VALKA_CLUSTER__ADVERTISE_INTERNAL_ADDR: valka-2:50052
+      VALKA_CLUSTER__ADVERTISE_GRPC_ADDR: localhost:50062
+      VALKA_CLUSTER__ADVERTISE_HTTP_ADDR: localhost:8982
+    ports:
+      - "50062:50051"
+      - "8982:8989"
+
+  valka-3:
+    <<: *valka
+    hostname: valka-3
+    environment:
+      <<: *valka-env
+      VALKA_NODE_ID: valka-3
+      VALKA_CLUSTER__ADVERTISE_INTERNAL_ADDR: valka-3:50052
+      VALKA_CLUSTER__ADVERTISE_GRPC_ADDR: localhost:50063
+      VALKA_CLUSTER__ADVERTISE_HTTP_ADDR: localhost:8983
+    ports:
+      - "50063:50051"
+      - "8983:8989"
+
+volumes:
+  clusterdata:

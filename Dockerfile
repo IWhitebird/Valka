@@ -21,6 +21,10 @@ COPY proto/ proto/
 COPY crates/ crates/
 COPY examples/ examples/
 
+# Parallel compile jobs (empty: all cores). Lower it to keep a laptop responsive.
+ARG CARGO_BUILD_JOBS=
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+
 # Build release with BuildKit cache mounts for cargo registry + target
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -48,7 +52,8 @@ ENV VALKA_WEB_DIR=/usr/share/valka/web \
     VALKA_STORAGE__BACKEND=local \
     VALKA_STORAGE__PATH=/var/lib/valka/data
 
-EXPOSE 50051 8989 7280/udp
+# 50051 public gRPC, 8989 REST + dashboard, 50052 node-to-node (never expose publicly)
+EXPOSE 50051 8989 50052
 
 HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -sf http://localhost:8989/healthz || exit 1

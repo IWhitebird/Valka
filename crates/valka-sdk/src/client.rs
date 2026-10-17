@@ -49,6 +49,20 @@ impl ValkaClient {
             .ok_or_else(|| SdkError::Handler("No task in response".to_string()))
     }
 
+    /// Create a task with every option of the API (priority, retries, timeout,
+    /// idempotency key, metadata, schedule).
+    pub async fn create_task_request(
+        &mut self,
+        request: CreateTaskRequest,
+    ) -> Result<TaskMeta, SdkError> {
+        self.inner
+            .create_task(request)
+            .await?
+            .into_inner()
+            .task
+            .ok_or_else(|| SdkError::Handler("No task in response".to_string()))
+    }
+
     pub async fn get_task(&mut self, task_id: &str) -> Result<TaskMeta, SdkError> {
         let response = self
             .inner

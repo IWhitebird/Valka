@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 valka-sdk = { path = "../../crates/valka-sdk" }
+valka-proto = { path = "../../crates/valka-proto" }
 tokio = { version = "1.49", features = ["full"] }
 serde_json = "1.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -29,3 +30,7 @@ path = "signal_demo.rs"
 [[example]]
 name = "steps"
 path = "steps.rs"
+
+[[example]]
+name = "chaos"
+path = "chaos.rs"

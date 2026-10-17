@@ -2,7 +2,7 @@
 # The bucket is the only durable state. For production variants, see deploy/docker/
 services:
   minio:
-    image: minio/minio:latest
+    image: pgsty/silo:latest  # S3-compatible MinIO fork; minio/minio is no longer on Docker Hub
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -21,7 +21,7 @@ services:
 
   # Creates the buckets once MinIO is up, then exits.
   minio-init:
-    image: minio/mc:latest
+    image: pgsty/silo:latest  # ships the mc client
     depends_on:
       minio:
         condition: service_healthy
