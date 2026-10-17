@@ -1,4 +1,4 @@
-use valka_core::{GossipConfig, LogIngesterConfig, MatchingConfig, SchedulerConfig, ServerConfig};
+use valka_core::{ClusterConfig, LogIngesterConfig, MatchingConfig, SchedulerConfig, ServerConfig};
 
 #[test]
 fn test_matching_config_defaults() {
@@ -43,11 +43,15 @@ fn test_log_ingester_config_defaults() {
 }
 
 #[test]
-fn test_gossip_config_defaults() {
-    let config = GossipConfig::default();
-    assert_eq!(config.listen_addr, "0.0.0.0:7280");
-    assert!(config.seed_nodes.is_empty());
-    assert_eq!(config.cluster_id, "valka");
+fn test_cluster_config_defaults() {
+    let config = ClusterConfig::default();
+    assert!(!config.enabled);
+    assert_eq!(config.num_shards, 0, "0 = whatever the bucket says");
+    assert_eq!(config.internal_addr, "0.0.0.0:50052");
+    assert_eq!(config.lease_interval_ms, 2_000);
+    assert_eq!(config.lease_timeout_ms, 10_000);
+    assert!(config.lease_safety_margin_ms < config.lease_timeout_ms);
+    assert!(config.token.is_none());
 }
 
 #[test]
@@ -60,7 +64,7 @@ fn test_server_config_all_sub_configs() {
     assert_eq!(config.matching.num_partitions, 4);
     assert_eq!(config.scheduler.timer_tick_ms, 100);
     assert_eq!(config.log_ingester.batch_size, 100);
-    assert_eq!(config.gossip.cluster_id, "valka");
+    assert!(!config.cluster.enabled);
 }
 
 #[test]

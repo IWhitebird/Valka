@@ -14,11 +14,10 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
+use crate::api::Api;
 use crate::cluster::{self, NodeInfo, StorageCache};
 use crate::convert::log_line_to_json;
-use valka_cluster::ClusterManager;
 use valka_core::{ServerError, TaskStatus};
-use valka_dispatcher::DispatcherService;
 use valka_engine::state::SignalStatus;
 use valka_engine::{CreateTask, Engine, LogIngester};
 
@@ -87,34 +86,43 @@ impl IntoResponse for ApiError {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub(crate) api: Api,
     pub(crate) engine: Engine,
     pub(crate) event_tx: broadcast::Sender<valka_proto::TaskEvent>,
-    pub(crate) dispatcher: DispatcherService,
     pub(crate) logs: Arc<LogIngester>,
     pub(crate) metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
-    #[allow(dead_code)] // the gossip ring goes away with request routing (PHASE2 M5)
-    pub(crate) cluster: Arc<ClusterManager>,
     pub(crate) node_info: NodeInfo,
     pub(crate) storage_cache: Arc<StorageCache>,
 }
 
+/// Header set when a cluster-wide answer is missing some node's part.
+const PARTIAL_HEADER: &str = "x-valka-partial";
+
+fn partial_headers(missing: &[String]) -> [(axum::http::HeaderName, String); 1] {
+    [(
+        axum::http::HeaderName::from_static(PARTIAL_HEADER),
+        if missing.is_empty() {
+            "false".to_string()
+        } else {
+            format!("true; missing={}", missing.join(","))
+        },
+    )]
+}
+
 /// Build the API router (useful for testing with tower::ServiceExt::oneshot)
 pub fn build_api_router(
-    engine: Engine,
+    api: Api,
     event_tx: broadcast::Sender<valka_proto::TaskEvent>,
-    dispatcher: DispatcherService,
     logs: Arc<LogIngester>,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
-    cluster: Arc<ClusterManager>,
     node_info: NodeInfo,
 ) -> Router {
     let state = AppState {
-        engine,
+        engine: api.engine().clone(),
+        api,
         event_tx,
-        dispatcher,
         logs,
         metrics_handle,
-        cluster,
         node_info,
         storage_cache: cluster::new_storage_cache(),
     };
@@ -150,6 +158,7 @@ pub fn build_api_router(
         .route("/api/v1/cluster/shards/{shard}", get(cluster::get_shard))
         .route("/api/v1/cluster/storage", get(cluster::storage))
         .route("/api/v1/cluster/snapshot", post(cluster::snapshot_now))
+        .route("/api/v1/cluster/members", get(cluster::members))
         .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
         .with_state(state)
@@ -159,25 +168,15 @@ pub fn build_api_router(
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_rest(
     addr: SocketAddr,
-    engine: Engine,
+    api: Api,
     event_tx: broadcast::Sender<valka_proto::TaskEvent>,
-    dispatcher: DispatcherService,
     logs: Arc<LogIngester>,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
-    cluster: Arc<ClusterManager>,
     node_info: NodeInfo,
     web_dir: String,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
-    let api_routes = build_api_router(
-        engine,
-        event_tx,
-        dispatcher,
-        logs,
-        metrics_handle,
-        cluster,
-        node_info,
-    );
+    let api_routes = build_api_router(api, event_tx, logs, metrics_handle, node_info);
 
     let index_path = format!("{web_dir}/index.html");
     let spa_fallback = ServeDir::new(&web_dir).not_found_service(ServeFile::new(index_path));
@@ -250,7 +249,7 @@ async fn create_task(
         ),
     };
     let task = state
-        .engine
+        .api
         .create_task(CreateTask {
             queue_name: body.queue_name,
             task_name: body.task_name,
@@ -271,8 +270,9 @@ async fn get_task(
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let task = state
-        .engine
+        .api
         .get_task(&task_id)
+        .await?
         .ok_or_else(|| ApiError::NotFound("Task not found".to_string()))?;
     Ok(Json(task.to_json()))
 }
@@ -288,22 +288,25 @@ async fn list_tasks(
                 .ok_or_else(|| ApiError::BadRequest(format!("Unknown status {s}")))?,
         ),
     };
-    let tasks = state.engine.list_tasks(
-        query.queue_name.as_deref(),
-        status,
-        query.limit.clamp(1, 1000) as usize,
-        query.offset.max(0) as usize,
-    );
-    let result: Vec<serde_json::Value> = tasks.iter().map(|t| t.to_json()).collect();
-    Ok(Json(result))
+    let tasks = state
+        .api
+        .list_tasks(
+            query.queue_name.as_deref(),
+            status,
+            query.limit.clamp(1, 1000) as usize,
+            query.offset.clamp(0, 100_000) as usize,
+        )
+        .await?;
+    let result: Vec<serde_json::Value> = tasks.value.iter().map(|t| t.to_json()).collect();
+    Ok((partial_headers(&tasks.missing), Json(result)))
 }
 
 async fn cancel_task(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (task, running_on) = state
-        .engine
+    let task = state
+        .api
         .cancel_task(&task_id, "Cancelled by user")
         .await
         .map_err(|e| match e {
@@ -312,9 +315,6 @@ async fn cancel_task(
             }
             other => other.into(),
         })?;
-    if running_on.is_some() {
-        state.dispatcher.cancel_task_on_worker(&task_id).await;
-    }
     Ok(Json(task.to_json()))
 }
 
@@ -330,8 +330,8 @@ async fn send_signal(
     Path(task_id): Path<String>,
     Json(body): Json<SendSignalBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let signal = state
-        .engine
+    let (signal, delivered) = state
+        .api
         .send_signal(&task_id, &body.signal_name, body.payload)
         .await
         .map_err(|e| match e {
@@ -340,25 +340,6 @@ async fn send_signal(
             }
             other => other.into(),
         })?;
-
-    let task_signal = valka_proto::TaskSignal {
-        signal_id: signal.id.clone(),
-        task_id: signal.task_id.clone(),
-        signal_name: signal.signal_name.clone(),
-        payload: signal
-            .payload
-            .clone()
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
-        timestamp_ms: signal.created_at.timestamp_millis(),
-    };
-    let delivered = state
-        .dispatcher
-        .send_signal_to_worker(&task_id, task_signal)
-        .await;
-    if delivered {
-        state.engine.signal_delivered(&signal.id);
-    }
 
     Ok((
         StatusCode::CREATED,
@@ -388,8 +369,9 @@ async fn list_signals(
         ),
     };
     let result: Vec<serde_json::Value> = state
-        .engine
+        .api
         .list_signals(&task_id, status)
+        .await?
         .iter()
         .map(|s| s.to_json())
         .collect();
@@ -400,7 +382,7 @@ async fn delete_task(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let deleted = state.engine.delete_task(&task_id).await?;
+    let deleted = state.api.delete_task(&task_id).await?;
     if !deleted {
         return Err(ApiError::NotFound("Task not found".to_string()));
     }
@@ -408,15 +390,18 @@ async fn delete_task(
 }
 
 async fn clear_all_tasks(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
-    let count = state.engine.clear_all_tasks().await?;
-    Ok(Json(serde_json::json!({ "deleted_count": count })))
+    let count = state.api.clear_all_tasks().await?;
+    Ok((
+        partial_headers(&count.missing),
+        Json(serde_json::json!({ "deleted_count": count.value })),
+    ))
 }
 
 async fn get_task_runs(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let runs = state.engine.runs_for_task(&task_id).unwrap_or_default();
+    let runs = state.api.runs(&task_id).await?.unwrap_or_default();
     let result: Vec<serde_json::Value> = runs.iter().map(|r| r.to_json()).collect();
     Ok(Json(result))
 }
@@ -426,8 +411,9 @@ async fn get_task_checkpoints(
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let checkpoints = state
-        .engine
-        .checkpoints_for_task(&task_id)
+        .api
+        .checkpoints(&task_id)
+        .await?
         .ok_or(ServerError::TaskNotFound(task_id))?;
     let result: Vec<serde_json::Value> = checkpoints.iter().map(|c| c.to_json()).collect();
     Ok(Json(result))
@@ -465,26 +451,25 @@ async fn get_run_logs(
 }
 
 async fn list_workers(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
-    let workers: Vec<serde_json::Value> = state
-        .dispatcher
-        .workers()
+    let workers = state.api.workers().await?;
+    let rows: Vec<serde_json::Value> = workers
+        .value
         .iter()
-        .map(|entry| {
-            let h = entry.value();
+        .map(|w| {
             serde_json::json!({
-                "id": h.worker_id.0,
-                "node_id": state.dispatcher.node_id().0,
-                "name": h.worker_name,
-                "queues": h.queues,
-                "concurrency": h.concurrency,
-                "active_tasks": h.active_tasks.len(),
+                "id": w.id,
+                "node_id": w.node_id,
+                "name": w.name,
+                "queues": w.queues,
+                "concurrency": w.concurrency,
+                "active_tasks": w.active_tasks,
                 "status": "CONNECTED",
-                "last_heartbeat": h.last_heartbeat.to_rfc3339(),
-                "connected_at": h.connected_at.to_rfc3339(),
+                "last_heartbeat": w.last_heartbeat.to_rfc3339(),
+                "connected_at": w.connected_at.to_rfc3339(),
             })
         })
         .collect();
-    Ok(Json(workers))
+    Ok((partial_headers(&workers.missing), Json(rows)))
 }
 
 #[derive(Deserialize)]
@@ -501,13 +486,16 @@ async fn list_dead_letters(
     State(state): State<AppState>,
     Query(query): Query<DeadLetterQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let dls = state.engine.list_dead_letters(
-        query.queue_name.as_deref(),
-        query.limit.clamp(1, 1000) as usize,
-        query.offset.max(0) as usize,
-    );
-    let result: Vec<serde_json::Value> = dls.iter().map(|d| d.to_json()).collect();
-    Ok(Json(result))
+    let dls = state
+        .api
+        .dead_letters(
+            query.queue_name.as_deref(),
+            query.limit.clamp(1, 1000) as usize,
+            query.offset.clamp(0, 100_000) as usize,
+        )
+        .await?;
+    let result: Vec<serde_json::Value> = dls.value.iter().map(|d| d.to_json()).collect();
+    Ok((partial_headers(&dls.missing), Json(result)))
 }
 
 async fn subscribe_events_sse(

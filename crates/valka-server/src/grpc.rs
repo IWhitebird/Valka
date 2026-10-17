@@ -8,16 +8,15 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::info;
 
+use crate::api::Api;
 use crate::convert::{log_line_to_proto, proto_to_status, task_to_proto};
-use crate::internal_grpc::InternalServiceImpl;
-use valka_core::{NodeId, ServerError};
+use valka_core::ServerError;
 use valka_dispatcher::DispatcherService;
-use valka_engine::{CreateTask, Engine, LogIngester};
+use valka_engine::{CreateTask, LogIngester};
 use valka_proto::*;
 
 pub struct ApiServiceImpl {
-    engine: Engine,
-    dispatcher: DispatcherService,
+    api: Api,
     event_tx: broadcast::Sender<TaskEvent>,
     logs: Arc<LogIngester>,
 }
@@ -55,7 +54,7 @@ impl api_service_server::ApiService for ApiServiceImpl {
             )
         };
         let task = self
-            .engine
+            .api
             .create_task(CreateTask {
                 queue_name: req.queue_name,
                 task_name: req.task_name,
@@ -92,8 +91,10 @@ impl api_service_server::ApiService for ApiServiceImpl {
     ) -> Result<Response<GetTaskResponse>, Status> {
         let req = request.into_inner();
         let task = self
-            .engine
+            .api
             .get_task(&req.task_id)
+            .await
+            .map_err(Status::from)?
             .ok_or_else(|| Status::not_found(format!("Task not found: {}", req.task_id)))?;
         Ok(Response::new(GetTaskResponse {
             task: Some(task_to_proto(task)),
@@ -122,8 +123,11 @@ impl api_service_server::ApiService for ApiServiceImpl {
             (50, 0)
         };
         let tasks = self
-            .engine
-            .list_tasks(queue_name, status_filter, limit, offset);
+            .api
+            .list_tasks(queue_name, status_filter, limit, offset)
+            .await
+            .map_err(Status::from)?
+            .value;
         let next_token = if tasks.len() == limit {
             (offset + limit).to_string()
         } else {
@@ -140,8 +144,8 @@ impl api_service_server::ApiService for ApiServiceImpl {
         request: Request<CancelTaskRequest>,
     ) -> Result<Response<CancelTaskResponse>, Status> {
         let req = request.into_inner();
-        let (task, running_on) = self
-            .engine
+        let task = self
+            .api
             .cancel_task(&req.task_id, "Cancelled by user")
             .await
             .map_err(|e| match e {
@@ -153,9 +157,6 @@ impl api_service_server::ApiService for ApiServiceImpl {
                 }
                 other => Status::from(other),
             })?;
-        if running_on.is_some() {
-            self.dispatcher.cancel_task_on_worker(&req.task_id).await;
-        }
         Ok(Response::new(CancelTaskResponse {
             task: Some(task_to_proto(task)),
         }))
@@ -167,8 +168,8 @@ impl api_service_server::ApiService for ApiServiceImpl {
     ) -> Result<Response<SendSignalResponse>, Status> {
         let req = request.into_inner();
         let payload = parse_json("payload", &req.payload)?;
-        let signal = self
-            .engine
+        let (signal, delivered) = self
+            .api
             .send_signal(&req.task_id, &req.signal_name, payload)
             .await
             .map_err(|e| match e {
@@ -177,22 +178,6 @@ impl api_service_server::ApiService for ApiServiceImpl {
                 ),
                 other => Status::from(other),
             })?;
-        let delivered = self
-            .dispatcher
-            .send_signal_to_worker(
-                &req.task_id,
-                TaskSignal {
-                    signal_id: signal.id.clone(),
-                    task_id: signal.task_id.clone(),
-                    signal_name: signal.signal_name.clone(),
-                    payload: signal.payload.map(|v| v.to_string()).unwrap_or_default(),
-                    timestamp_ms: signal.created_at.timestamp_millis(),
-                },
-            )
-            .await;
-        if delivered {
-            self.engine.signal_delivered(&signal.id);
-        }
         Ok(Response::new(SendSignalResponse {
             signal_id: signal.id,
             delivered,
@@ -300,28 +285,17 @@ impl worker_service_server::WorkerService for WorkerServiceImpl {
 
 pub async fn serve_grpc(
     addr: SocketAddr,
-    engine: Engine,
-    dispatcher: DispatcherService,
+    api: Api,
     event_tx: broadcast::Sender<TaskEvent>,
-    node_id: NodeId,
     logs: Arc<LogIngester>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
-    let api_service = ApiServiceImpl {
-        engine: engine.clone(),
-        dispatcher: dispatcher.clone(),
-        event_tx: event_tx.clone(),
-        logs: logs.clone(),
-    };
-
     let worker_service = WorkerServiceImpl {
-        dispatcher,
+        dispatcher: api.dispatcher().clone(),
         shutdown: shutdown.clone(),
     };
-
-    let internal_service = InternalServiceImpl {
-        engine,
-        node_id,
+    let api_service = ApiServiceImpl {
+        api,
         event_tx,
         logs,
     };
@@ -345,9 +319,6 @@ pub async fn serve_grpc(
         .add_service(api_service_server::ApiServiceServer::new(api_service))
         .add_service(worker_service_server::WorkerServiceServer::new(
             worker_service,
-        ))
-        .add_service(internal_service_server::InternalServiceServer::new(
-            internal_service,
         ))
         .serve_with_shutdown(addr, async move {
             let _ = shutdown.changed().await;

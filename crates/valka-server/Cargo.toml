@@ -40,5 +40,6 @@ figment = { workspace = true }
 dotenvy = { workspace = true }
 tikv-jemallocator = { workspace = true }
 tokio-stream = { workspace = true }
+parking_lot = { workspace = true }
 futures = { workspace = true }
 async-stream = { workspace = true }

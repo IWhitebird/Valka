@@ -2,8 +2,6 @@
 mod integration;
 
 #[cfg(test)]
-mod cluster_tests;
-#[cfg(test)]
 mod config_tests;
 #[cfg(test)]
 mod dispatcher_tests;

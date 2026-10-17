@@ -13,8 +13,11 @@ impl Engine {
     pub fn queues(&self) -> Vec<String> {
         let mut qs: BTreeSet<String> = BTreeSet::new();
         for m in &self.inner.shards {
-            for t in m.lock().tasks.values() {
-                qs.insert(t.spec.queue_name.clone());
+            let st = m.lock();
+            if st.serving() {
+                for t in st.tasks.values() {
+                    qs.insert(t.spec.queue_name.clone());
+                }
             }
         }
         qs.into_iter().collect()

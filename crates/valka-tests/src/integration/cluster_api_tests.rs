@@ -201,6 +201,7 @@ async fn poisoned_writer_shows_critical_health() {
         std::sync::Arc::new(object_store::memory::InMemory::new());
     let (store, faults) = valka_wal::fault::faulty_over(backing, 1);
     let node = TestNode::on_store(store, "n").await;
+    node.engine.create_task(task_req("q", "t")).await.unwrap();
     faults.set_puts_down(true);
     let _ = node.engine.create_task(task_req("q", "t")).await; // fails after retries
     tokio::time::sleep(std::time::Duration::from_secs(30)).await;

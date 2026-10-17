@@ -1,6 +1,6 @@
 # Phase 2: Valka on many nodes
 
-Status: **plan, not started.** Companion to `DESIGN.md` (single-node architecture) and
+Status: **M0, M2–M5 implemented** (M1 model in progress); M6–M10 pending. Companion to `DESIGN.md` (single-node architecture) and
 `PLAN.md` (checklist). Where this document and `DESIGN.md` disagree, this one is newer;
 `DESIGN.md` is rewritten as each milestone lands.
 
@@ -634,6 +634,26 @@ Dependencies: M0 → M1 → M2 → M3 → M4 → {M5 → M6 → M7} → M8 → M
 - **Spread over all shards → queue partitions.** Otherwise every node must exchange
   capacity with every other node.
 - **Three phase-1 bugs** (§12.2, §12.4, §11.3) are fixed in M0, before any cluster work.
+
+## 19a. Changes made while implementing M2–M5
+
+- **Membership is bucket-only (D13 revised).** One LIST of `nodes/` per
+  `membership_interval` (3 s) plus a GET of a lease when its ETag changes; a lease whose
+  ETag has not changed for `lease_timeout` by the observer's own clock is suspect, and its
+  guardian tombstones it. Failover stays within 10–15 s without gossip, and there is no
+  UDP port to secure. Cost is one LIST per node per interval plus GETs of changed leases,
+  fine up to roughly a hundred nodes; gossip can be added back later as a suspicion
+  accelerator if LIST cost matters at larger sizes.
+- **Truncation watermark (§8.3, §8.7).** A LIST racing a zombie's ascending deletes can
+  show a hole in the middle of a log, and sealing there would lose acked records. The
+  lease now carries `trunc` (raised by CAS before any delete) and `unsplit` (older
+  incarnations of the node still to split); the splitter seals at the first gap at or
+  above `trunc`.
+- **No snapshot at all means start empty, at any generation (§8.4).** A claimer serves
+  only after its acquisition snapshot exists and prune never deletes the newest, so a
+  missing snapshot means nobody ever served the shard.
+- **Split-marker GC (§8.7)** also keeps a marker while an owner record still names that
+  incarnation: a claim needs the marker.
 
 ## 20. Open questions
 

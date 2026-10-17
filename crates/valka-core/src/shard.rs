@@ -94,6 +94,33 @@ pub fn shard_of_task_id(task_id: &str) -> Option<ShardId> {
     Some(ShardId(u16::from_be_bytes([b[14], b[15]])))
 }
 
+/// Default number of partitions a queue is created with.
+pub const DEFAULT_QUEUE_PARTITIONS: u32 = 16;
+
+/// The shard partition `p` of `queue` lives on. All of a partition's tasks share one
+/// shard, so one owner and one matching queue serve it.
+pub fn partition_shard(queue_name: &str, partition: u32, num_shards: u32) -> ShardId {
+    let mut buf = Vec::with_capacity(queue_name.len() + 5);
+    buf.extend_from_slice(queue_name.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(&partition.to_be_bytes());
+    ShardId((xxh3_64(&buf) & (num_shards as u64 - 1)) as u16)
+}
+
+/// Jump consistent hash (Lamping & Veach): a bucket in `0..buckets` for `key`. When
+/// `buckets` grows by one, only about `1/buckets` of the keys move.
+pub fn jump_hash(key: &str, buckets: u32) -> u32 {
+    let mut k = xxh3_64(key.as_bytes());
+    let (mut b, mut j): (i64, i64) = (-1, 0);
+    let n = buckets.max(1) as i64;
+    while j < n {
+        b = j;
+        k = k.wrapping_mul(2_862_933_555_777_941_757).wrapping_add(1);
+        j = (((b + 1) as f64) * ((1u64 << 31) as f64 / (((k >> 33) + 1) as f64))) as i64;
+    }
+    b as u32
+}
+
 /// Two hex digits of a hash of `rest`. Prefixed to high-rate key families so a burst of
 /// writes (a takeover storm) spreads over the bucket's partitions instead of one prefix.
 pub fn hash_prefix(rest: &str) -> String {
@@ -163,6 +190,32 @@ mod tests {
         assert!(!valid_shard_count(8));
         assert!(!valid_shard_count(1000));
         assert!(!valid_shard_count(131_072));
+    }
+
+    #[test]
+    fn jump_hash_is_stable_and_moves_little() {
+        let mut moved = 0;
+        for i in 0..10_000 {
+            let k = format!("key-{i}");
+            let a = jump_hash(&k, 16);
+            assert!(a < 16);
+            assert_eq!(a, jump_hash(&k, 16));
+            let b = jump_hash(&k, 17);
+            if a != b {
+                assert_eq!(b, 16, "keys only move to the new bucket");
+                moved += 1;
+            }
+        }
+        assert!((400..800).contains(&moved), "about 1/17 move, got {moved}");
+        assert_eq!(jump_hash("x", 1), 0);
+    }
+
+    #[test]
+    fn partitions_map_into_the_shard_space() {
+        for p in 0..16 {
+            assert!(partition_shard("q", p, 256).0 < 256);
+        }
+        assert_eq!(partition_shard("q", 3, 4096), partition_shard("q", 3, 4096));
     }
 
     #[test]

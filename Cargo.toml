@@ -51,10 +51,6 @@ rand = "0.10"
 parking_lot = "0.12"
 xxhash-rust = { version = "0.8", features = ["xxh3", "xxh64"] }
 
-# Cluster
-chitchat = "0.10"
-hashring = "0.3"
-
 # Concurrent state
 dashmap = "6"
 
@@ -101,6 +97,6 @@ valka-sdk = { path = "crates/valka-sdk" }
 dotenvy = "0.15"
 
 # Misc
-tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-stream = { version = "0.1", features = ["sync", "net"] }
 futures = "0.3"
 async-stream = "0.3"

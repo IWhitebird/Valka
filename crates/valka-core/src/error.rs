@@ -1,6 +1,7 @@
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+/// Serializable so a node can return the exact error to the node that forwarded a call.
+#[derive(Debug, Clone, PartialEq, Error, serde::Serialize, serde::Deserialize)]
 pub enum ServerError {
     #[error("Task not found: {0}")]
     TaskNotFound(String),

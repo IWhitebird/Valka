@@ -7,15 +7,15 @@ license.workspace = true
 [dependencies]
 valka-core = { workspace = true }
 valka-proto = { workspace = true }
-chitchat = { workspace = true }
-hashring = { workspace = true }
+valka-engine = { workspace = true }
 tokio = { workspace = true }
-tonic = { workspace = true }
-tonic-prost = { workspace = true }
+tonic = { workspace = true, features = ["tls-ring"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
-tokio-stream = { workspace = true }
 futures = { workspace = true }
+parking_lot = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

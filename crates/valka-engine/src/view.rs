@@ -1,11 +1,11 @@
 //! Read models handed to the API layers. JSON shapes match the pre-WAL REST responses.
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use valka_core::TaskStatus;
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TaskView {
     pub id: String,
     pub queue_name: String,
@@ -48,7 +48,7 @@ impl TaskView {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunView {
     pub id: String,
     pub task_id: String,
@@ -83,7 +83,7 @@ impl RunView {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SignalView {
     pub id: String,
     pub task_id: String,
@@ -110,7 +110,7 @@ impl SignalView {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CheckpointView {
     pub task_id: String,
     pub step: String,
@@ -133,7 +133,7 @@ impl CheckpointView {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeadLetterView {
     pub id: String,
     pub task_id: String,

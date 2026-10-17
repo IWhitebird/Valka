@@ -25,7 +25,8 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 futures = { workspace = true }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["tls-ring"] }
+rcgen = "0.13"
 dashmap = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }

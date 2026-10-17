@@ -61,6 +61,8 @@ async fn node_whose_bucket_fails_decides_to_exit() {
         node.engine.poison_watch(),
         srx,
     ));
+    // The queue's config is cached by a first create; then the WAL PUTs start failing.
+    node.engine.create_task(task_req("q", "t")).await.unwrap();
     faults.set_puts_down(true);
     assert!(node.engine.create_task(task_req("q", "t")).await.is_err());
     let reason = exit.await.unwrap();

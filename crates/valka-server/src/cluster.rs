@@ -1,7 +1,7 @@
 //! Operator-facing cluster endpoints: node health, shard map, bucket storage.
 //!
-//! Phase 1 reports the single node that owns every shard; the response shapes already
-//! carry a node list so the UI does not change when ownership is distributed.
+//! Node stats and the shard map are gathered from every live node; membership (including
+//! dead and suspect nodes) comes from this node's view of the leases in the bucket.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -49,26 +49,29 @@ const STORAGE_CACHE_TTL: Duration = Duration::from_secs(30);
 /// S3 Standard PUT price, USD per 1000 requests (us-east-1). Only for the estimate.
 const S3_PUT_USD_PER_1000: f64 = 0.005;
 
-fn health(stats: &NodeStats, members: &[valka_engine::MemberInfo]) -> Value {
-    let peers_live = members.iter().any(|m| m.node_id != stats.node_id && m.live);
-    // Alone, every shard should be ours. With peers, ownership is spread and counted by
-    // the scatter endpoint; here only this node's view is known.
-    let unowned = (!peers_live).then(|| stats.num_shards as usize - stats.shards_owned);
+fn health(
+    stats: &[NodeStats],
+    members: &[valka_engine::MemberInfo],
+    num_shards: u32,
+    partial: bool,
+) -> Value {
+    let owned: usize = stats.iter().map(|s| s.shards_owned).sum();
+    // Only a complete answer can count unowned shards.
+    let unowned = (!partial).then(|| (num_shards as usize).saturating_sub(owned));
     let poisoned: Vec<&str> = stats
-        .wal
-        .poisoned
-        .as_ref()
-        .map(|_| stats.node_id.as_str())
-        .into_iter()
+        .iter()
+        .filter(|s| s.wal.poisoned.is_some())
+        .map(|s| s.node_id.as_str())
         .collect();
+    let fenced = stats.iter().any(|s| !s.serving);
     let suspect: Vec<&str> = members
         .iter()
         .filter(|m| m.suspect)
         .map(|m| m.node_id.as_str())
         .collect();
-    let status = if !poisoned.is_empty() || !stats.serving {
+    let status = if !poisoned.is_empty() || fenced {
         "critical"
-    } else if unowned.is_some_and(|u| u > 0) || !suspect.is_empty() {
+    } else if unowned.is_none_or(|u| u > 0) || !suspect.is_empty() {
         "degraded"
     } else {
         "ok"
@@ -78,6 +81,7 @@ fn health(stats: &NodeStats, members: &[valka_engine::MemberInfo]) -> Value {
         "unowned_shards": unowned,
         "poisoned_nodes": poisoned,
         "suspect_nodes": suspect,
+        "partial": partial,
     })
 }
 
@@ -95,8 +99,8 @@ fn member_status(m: &valka_engine::MemberInfo) -> &'static str {
     }
 }
 
-/// A peer as this node sees it through the bucket (lease) — no RPC.
-fn peer_json(m: &valka_engine::MemberInfo) -> Value {
+/// A node known only from its lease (dead, suspect, or not answering).
+fn member_json(m: &valka_engine::MemberInfo) -> Value {
     json!({
         "node_id": m.node_id,
         "inc": m.inc,
@@ -113,7 +117,14 @@ fn peer_json(m: &valka_engine::MemberInfo) -> Value {
     })
 }
 
-fn node_json(state: &AppState, stats: &NodeStats) -> Value {
+/// A node that answered with its stats.
+fn node_json(
+    state: &AppState,
+    stats: &NodeStats,
+    member: Option<&valka_engine::MemberInfo>,
+    workers: usize,
+) -> Value {
+    let me = stats.node_id == state.engine.node_id();
     json!({
         "node_id": stats.node_id,
         "inc": stats.wal.inc,
@@ -121,43 +132,79 @@ fn node_json(state: &AppState, stats: &NodeStats) -> Value {
             "poisoned"
         } else if !stats.serving {
             "fenced"
+        } else if member.is_some_and(|m| m.state == "draining") {
+            "draining"
         } else {
             "alive"
         },
         "lease_age_ms": stats.lease_age_ms,
-        "grpc_addr": state.node_info.grpc_addr,
-        "http_addr": state.node_info.http_addr,
-        "version": state.node_info.version,
+        "grpc_addr": if me { Some(state.node_info.grpc_addr.clone()) } else { member.and_then(|m| m.grpc_addr.clone()) },
+        "http_addr": if me { Some(state.node_info.http_addr.clone()) } else { member.and_then(|m| m.http_addr.clone()) },
+        "version": member.map_or(state.node_info.version.clone(), |m| m.version.clone()),
         "started_at": stats.started_at.to_rfc3339(),
         "storage_backend": state.engine.store().backend_label(),
         "shards_owned": stats.shards_owned,
         "shards_with_tasks": stats.shards_with_tasks,
         "tasks": stats.tasks,
         "queues": stats.queues,
-        "workers_connected": state.dispatcher.workers().len(),
+        "workers_connected": workers,
         "wal": stats.wal,
         "snapshots": stats.snapshots,
+        "eligible": member.is_some_and(|m| m.eligible),
     })
 }
 
-pub async fn cluster_overview(State(state): State<AppState>) -> impl IntoResponse {
-    let stats = state.engine.stats();
+pub async fn cluster_overview(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let stats = state.api.node_stats().await?;
+    let workers = state.api.workers().await?;
     let members = state.engine.members();
-    let mut nodes = vec![node_json(&state, &stats)];
+    let mut nodes: Vec<Value> = stats
+        .value
+        .iter()
+        .map(|s| {
+            let m = members.iter().find(|m| m.node_id == s.node_id);
+            let w = workers
+                .value
+                .iter()
+                .filter(|w| w.node_id == s.node_id)
+                .count();
+            node_json(&state, s, m, w)
+        })
+        .collect();
     nodes.extend(
         members
             .iter()
-            .filter(|m| m.node_id != stats.node_id)
-            .map(peer_json),
+            .filter(|m| !stats.value.iter().any(|s| s.node_id == m.node_id))
+            .map(member_json),
     );
-    Json(json!({
+    let num_shards = state.engine.num_shards();
+    Ok(Json(json!({
         "cluster_id": state.engine.cluster_meta().cluster_id,
-        "this_node": stats.node_id,
+        "this_node": state.engine.node_id(),
         "clustered": state.engine.config().cluster.enabled,
-        "num_shards": stats.num_shards,
-        "health": health(&stats, &members),
+        "num_shards": num_shards,
+        "health": health(&stats.value, &members, num_shards, stats.partial()),
         "nodes": nodes,
-    }))
+    })))
+}
+
+/// This node's view of membership, straight from the bucket's leases.
+pub async fn members(State(state): State<AppState>) -> impl IntoResponse {
+    let rows: Vec<Value> = state
+        .engine
+        .members()
+        .iter()
+        .map(|m| {
+            let mut v = member_json(m);
+            v["live"] = json!(m.live);
+            v["suspect"] = json!(m.suspect);
+            v["state"] = json!(m.state);
+            v
+        })
+        .collect();
+    Json(rows)
 }
 
 #[derive(Deserialize)]
@@ -173,11 +220,20 @@ pub struct ShardsQuery {
 pub async fn list_shards(
     State(state): State<AppState>,
     Query(q): Query<ShardsQuery>,
-) -> impl IntoResponse {
-    let rows: Vec<_> = state
-        .engine
-        .shard_stats()
-        .into_iter()
+) -> Result<impl IntoResponse, ApiError> {
+    // Every node reports the shards it serves; the rest are unowned right now.
+    let served = state.api.shard_map().await?;
+    let mut by_shard: std::collections::BTreeMap<u16, valka_engine::ShardStats> =
+        served.value.into_iter().map(|s| (s.shard, s)).collect();
+    let local = state.engine.shard_stats();
+    let rows: Vec<_> = ShardId::all(state.engine.num_shards())
+        .map(|s| {
+            by_shard.remove(&s.0).unwrap_or_else(|| {
+                let mut row = local[s.index()].clone();
+                row.owner = None;
+                row
+            })
+        })
         .filter(|s| {
             q.node
                 .as_deref()
@@ -186,7 +242,7 @@ pub async fn list_shards(
         .filter(|s| !q.dirty.unwrap_or(false) || s.records_since_snapshot > 0)
         .filter(|s| q.min_tasks.is_none_or(|m| s.tasks >= m))
         .collect();
-    Json(rows)
+    Ok(Json(rows))
 }
 
 pub async fn get_shard(

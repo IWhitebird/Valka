@@ -11,20 +11,117 @@ use crate::timers::TimerKind;
 use crate::view::{DeadLetterView, RunView, TaskView};
 use crate::write_path::{decide_outcome, dispatchable, ensure_running};
 
+/// How long a node trusts its cached copy of a queue's partition count.
+const QUEUE_CONFIG_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl Engine {
+    /// Create a task on a partition of its queue this node serves. Fails with `NotOwner`
+    /// when placement picks a shard served elsewhere; the API layer routes instead (see
+    /// [`Engine::place_task`] and [`Engine::create_task_at`]).
     pub async fn create_task(&self, req: CreateTask) -> Result<TaskView, ServerError> {
+        let (id, _) = self.place_task(&req).await?;
+        self.create_task_at(&id, req).await
+    }
+
+    /// The partition count of a queue (created with the default on first use).
+    pub async fn queue_config(
+        &self,
+        queue: &str,
+    ) -> Result<valka_wal::queues::QueueConfig, ServerError> {
+        let cached = self.inner.queues.lock().get(queue).cloned();
+        if let Some((c, at)) = &cached
+            && at.elapsed() < QUEUE_CONFIG_TTL
+        {
+            return Ok(c.clone());
+        }
+        let mut delay = std::time::Duration::from_millis(20);
+        for attempt in 0.. {
+            match valka_wal::queues::get_or_create(
+                &self.inner.store,
+                queue,
+                valka_core::DEFAULT_QUEUE_PARTITIONS,
+            )
+            .await
+            {
+                Ok(c) => {
+                    self.inner
+                        .queues
+                        .lock()
+                        .insert(queue.to_string(), (c.clone(), tokio::time::Instant::now()));
+                    return Ok(c);
+                }
+                // A stale partition count only moves new tasks between partitions.
+                Err(_) if cached.is_some() => return Ok(cached.unwrap().0),
+                Err(e) if attempt >= 5 => {
+                    return Err(ServerError::Unavailable(format!(
+                        "reading queue {queue}: {e}"
+                    )));
+                }
+                Err(_) => {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    /// Drop the cached partition count of a queue (after an admin change).
+    pub fn invalidate_queue(&self, queue: &str) {
+        self.inner.queues.lock().remove(queue);
+    }
+
+    /// Choose the partition (and so the shard) for a new task and mint its id. With an
+    /// idempotency key the partition is `jump_hash(key, P)`, so the key always lands on
+    /// one shard and dedupes there. Without one, a partition this node serves is
+    /// preferred (no hop), otherwise a random one.
+    pub async fn place_task(&self, req: &CreateTask) -> Result<(String, ShardId), ServerError> {
         if req.queue_name.is_empty() || req.task_name.is_empty() {
             return Err(ServerError::InvalidArgument(
                 "queue_name and task_name are required".into(),
             ));
         }
-        let (uuid, shard) = valka_core::new_task_uuid(
-            &req.queue_name,
-            req.idempotency_key.as_deref(),
-            self.inner.num_shards,
-        );
-        let id = uuid.to_string();
+        if !self.is_serving() {
+            return Err(ServerError::Unavailable(
+                "this node's lease is not current; retry".into(),
+            ));
+        }
+        let cfg = self.queue_config(&req.queue_name).await?;
+        let n = self.inner.num_shards;
+        let p = match &req.idempotency_key {
+            Some(k) => valka_core::jump_hash(k, cfg.partitions),
+            None => {
+                let local: Vec<u32> = (0..cfg.partitions)
+                    .filter(|p| self.owns(valka_core::partition_shard(&req.queue_name, *p, n)))
+                    .collect();
+                if local.is_empty() {
+                    rand::random_range(0..cfg.partitions)
+                } else {
+                    local[rand::random_range(0..local.len())]
+                }
+            }
+        };
+        let shard = valka_core::partition_shard(&req.queue_name, p, n);
+        Ok((valka_core::new_id_in_shard(shard).to_string(), shard))
+    }
+
+    /// Create a task under an id minted by [`Engine::place_task`] (possibly on another
+    /// node). Creating the same id again returns the existing task, so a forwarded create
+    /// can be retried safely.
+    pub async fn create_task_at(&self, id: &str, req: CreateTask) -> Result<TaskView, ServerError> {
+        if req.queue_name.is_empty() || req.task_name.is_empty() {
+            return Err(ServerError::InvalidArgument(
+                "queue_name and task_name are required".into(),
+            ));
+        }
+        let shard = self
+            .shard_of(id)
+            .ok_or_else(|| ServerError::InvalidArgument(format!("bad task id {id}")))?;
+        if let Some(existing) = self.get_task(id) {
+            return Ok(existing);
+        }
         let now = self.inner.clock.now();
+        let id = id.to_string();
         let spec = TaskSpec {
             id: id.clone(),
             queue_name: req.queue_name.clone(),
@@ -56,6 +153,13 @@ impl Engine {
         view.ok_or_else(|| ServerError::Internal("task vanished after create".into()))
     }
 
+    /// The task holding idempotency key `key` in `shard`, if any.
+    pub fn find_by_idempotency_key(&self, shard: ShardId, key: &str) -> Option<TaskView> {
+        let st = self.inner.shards.get(shard.index())?.lock();
+        let id = st.idempotency.get(key)?;
+        st.tasks.get(id).map(|t| t.view())
+    }
+
     pub fn get_task(&self, task_id: &str) -> Option<TaskView> {
         let shard = self.shard_of(task_id)?;
         self.inner.shards[shard.index()]
@@ -75,6 +179,9 @@ impl Engine {
         let mut all: Vec<TaskView> = Vec::new();
         for m in &self.inner.shards {
             let st = m.lock();
+            if !st.serving() {
+                continue;
+            }
             for t in st.tasks.values() {
                 if queue.is_some_and(|q| q != t.spec.queue_name) {
                     continue;
@@ -98,8 +205,11 @@ impl Engine {
             .shards
             .iter()
             .map(|m| {
-                m.lock()
-                    .tasks
+                let st = m.lock();
+                if !st.serving() {
+                    return 0;
+                }
+                st.tasks
                     .values()
                     .filter(|t| {
                         queue.is_none_or(|q| q == t.spec.queue_name)
@@ -432,6 +542,9 @@ impl Engine {
         let mut all: Vec<DeadLetterView> = Vec::new();
         for m in &self.inner.shards {
             let st = m.lock();
+            if !st.serving() {
+                continue;
+            }
             all.extend(
                 st.dead_letters
                     .values()

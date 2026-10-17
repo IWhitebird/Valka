@@ -2,8 +2,6 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use std::sync::Arc;
-
 use anyhow::Result;
 use tracing::{error, info};
 
@@ -44,40 +42,41 @@ async fn main() -> Result<()> {
         .install_recorder()
         .expect("Failed to install Prometheus recorder");
 
-    // Event relay across nodes (clustered mode only).
-    if node.cluster.is_clustered() {
-        let relay_cluster = node.cluster.clone();
-        let relay_forwarder = node.forwarder.clone();
-        let relay_event_rx = node.event_tx.subscribe();
-        let relay_shutdown = node.shutdown_rx.clone();
+    let mut node = node;
+    let internal_handle = node.internal_listener.take().map(|listener| {
+        let (api, token, shutdown, failed) = (
+            node.api.clone(),
+            config.cluster.token.clone(),
+            node.shutdown_rx.clone(),
+            node.shutdown_tx.clone(),
+        );
+        let tls = valka_cluster::security::server_tls(&config.cluster);
         tokio::spawn(async move {
-            valka_cluster::event_relay::run_event_relay(
-                relay_cluster,
-                relay_forwarder,
-                relay_event_rx,
-                relay_shutdown,
-            )
-            .await;
-        });
-    }
+            let r = match tls {
+                Ok(tls) => {
+                    valka_server::internal_grpc::serve_internal(listener, api, token, tls, shutdown)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            if let Err(e) = r {
+                tracing::error!(error = %e, "internal listener failed");
+                let _ = failed.send(true);
+            }
+        })
+    });
 
     let grpc_addr = config.grpc_addr.parse()?;
     let shutdown_tx_grpc = node.shutdown_tx.clone();
     let grpc_handle = tokio::spawn({
-        let (engine, dispatcher, event_tx, node_id, logs, shutdown) = (
-            node.engine.clone(),
-            node.dispatcher.clone(),
+        let (api, event_tx, logs, shutdown) = (
+            node.api.clone(),
             node.event_tx.clone(),
-            node.node_id.clone(),
             node.logs.clone(),
             node.shutdown_rx.clone(),
         );
         async move {
-            if let Err(e) = grpc::serve_grpc(
-                grpc_addr, engine, dispatcher, event_tx, node_id, logs, shutdown,
-            )
-            .await
-            {
+            if let Err(e) = grpc::serve_grpc(grpc_addr, api, event_tx, logs, shutdown).await {
                 tracing::error!(error = %e, "gRPC server failed");
                 let _ = shutdown_tx_grpc.send(true);
             }
@@ -87,11 +86,9 @@ async fn main() -> Result<()> {
     let http_addr = config.http_addr.parse()?;
     let shutdown_tx_rest = node.shutdown_tx.clone();
     let http_handle = tokio::spawn({
-        let (engine, dispatcher, event_tx, cluster, logs, shutdown, web_dir) = (
-            node.engine.clone(),
-            node.dispatcher.clone(),
+        let (api, event_tx, logs, shutdown, web_dir) = (
+            node.api.clone(),
             node.event_tx.clone(),
-            node.cluster.clone(),
             node.logs.clone(),
             node.shutdown_rx.clone(),
             config.web_dir.clone(),
@@ -104,12 +101,10 @@ async fn main() -> Result<()> {
         async move {
             if let Err(e) = rest::serve_rest(
                 http_addr,
-                engine,
+                api,
                 event_tx,
-                dispatcher,
                 logs,
                 metrics_handle,
-                cluster,
                 node_info,
                 web_dir,
                 shutdown,
@@ -147,6 +142,9 @@ async fn main() -> Result<()> {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let _ = grpc_handle.await;
         let _ = http_handle.await;
+        if let Some(h) = internal_handle {
+            let _ = h.await;
+        }
     })
     .await;
 
@@ -156,10 +154,6 @@ async fn main() -> Result<()> {
         && let Err(e) = node.engine.stop().await
     {
         tracing::error!(error = %e, "engine shutdown failed");
-    }
-
-    if let Ok(cluster) = Arc::try_unwrap(node.cluster) {
-        cluster.shutdown().await;
     }
 
     if reason.is_clean() {

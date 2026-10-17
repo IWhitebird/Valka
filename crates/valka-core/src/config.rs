@@ -13,7 +13,6 @@ pub struct ServerConfig {
     pub storage: StorageConfig,
     pub wal: WalConfig,
     pub cluster: ClusterConfig,
-    pub gossip: GossipConfig,
     pub matching: MatchingConfig,
     pub scheduler: SchedulerConfig,
     pub log_ingester: LogIngesterConfig,
@@ -119,14 +118,6 @@ pub struct ClusterConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GossipConfig {
-    pub listen_addr: String,
-    pub seed_nodes: Vec<String>,
-    pub cluster_id: String,
-    pub advertise_addr: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchingConfig {
     pub num_partitions: i32,
     pub branching_factor: usize,
@@ -167,7 +158,6 @@ impl Default for ServerConfig {
             storage: StorageConfig::default(),
             wal: WalConfig::default(),
             cluster: ClusterConfig::default(),
-            gossip: GossipConfig::default(),
             matching: MatchingConfig::default(),
             scheduler: SchedulerConfig::default(),
             log_ingester: LogIngesterConfig::default(),
@@ -252,17 +242,6 @@ impl ClusterConfig {
             reconcile_grace_ms: 0,
             startup_lease_check: false,
             ..Default::default()
-        }
-    }
-}
-
-impl Default for GossipConfig {
-    fn default() -> Self {
-        Self {
-            listen_addr: "0.0.0.0:7280".to_string(),
-            seed_nodes: vec![],
-            cluster_id: "valka".to_string(),
-            advertise_addr: None,
         }
     }
 }

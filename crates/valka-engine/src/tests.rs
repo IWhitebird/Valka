@@ -1111,8 +1111,9 @@ async fn snapshot_round_spanning_many_batches_covers_every_dirty_shard() {
     let mut ids = Vec::new();
     {
         let e = open(&store).await;
-        for _ in 0..300 {
-            ids.push(e.create_task(create("q")).await.unwrap().id);
+        // Tasks of one queue share its 16 partition shards: spread over many queues.
+        for i in 0..300 {
+            ids.push(e.create_task(create(&format!("q{i}"))).await.unwrap().id);
         }
         let dirty = e.shard_stats().iter().filter(|s| s.tasks > 0).count();
         assert!(

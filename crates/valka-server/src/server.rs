@@ -3,9 +3,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch};
-use tracing::info;
 
-use valka_cluster::{ClusterManager, NodeForwarder};
+use valka_cluster::PeerClients;
+
+use crate::api::Api;
 use valka_core::{NodeId, ServerConfig};
 use valka_dispatcher::DispatcherService;
 use valka_engine::{Engine, EngineConfig, LogIngester};
@@ -20,8 +21,10 @@ pub struct Node {
     pub dispatcher: DispatcherService,
     pub logs: Arc<LogIngester>,
     pub event_tx: broadcast::Sender<valka_proto::TaskEvent>,
-    pub cluster: Arc<ClusterManager>,
-    pub forwarder: NodeForwarder,
+    /// The request layer (routing to shard owners, scatter-gather).
+    pub api: Api,
+    /// The internal listener, bound when `cluster.enabled` (or by tests).
+    pub internal_listener: Option<tokio::net::TcpListener>,
     pub shutdown_tx: watch::Sender<bool>,
     pub shutdown_rx: watch::Receiver<bool>,
 }
@@ -71,21 +74,6 @@ impl Node {
         .await?;
         crate::convert::spawn_event_bridge(&engine, event_tx.clone());
 
-        let cluster = Arc::new(if config.gossip.seed_nodes.is_empty() {
-            info!("Starting in single-node mode (no seed_nodes configured)");
-            ClusterManager::new_single_node(node_id.clone(), config.matching.num_partitions)
-        } else {
-            info!(seeds = ?config.gossip.seed_nodes, "Starting in clustered mode");
-            ClusterManager::new_clustered(
-                node_id.clone(),
-                config.matching.num_partitions,
-                &config.gossip,
-                &config.grpc_addr,
-            )
-            .await?
-        });
-        let forwarder = NodeForwarder::new();
-
         let (log_tx, log_rx) = mpsc::channel(10_000);
         let logs = LogIngester::new(
             store.clone(),
@@ -96,6 +84,19 @@ impl Node {
 
         let dispatcher =
             DispatcherService::new(matching.clone(), engine.clone(), node_id.clone(), log_tx);
+        let peers = PeerClients::new(
+            &node_id.0,
+            config.cluster.token.clone(),
+            valka_cluster::security::client_tls(&config.cluster)?,
+            Duration::from_secs(10),
+        );
+        let api = Api::new(engine.clone(), dispatcher.clone(), peers);
+        // Bind before serving anything so a bad address fails the start.
+        let internal_listener = if config.cluster.enabled {
+            Some(tokio::net::TcpListener::bind(&config.cluster.internal_addr).await?)
+        } else {
+            None
+        };
 
         let (_hb_handle, mut dead_rx) = dispatcher.start_heartbeat_checker(shutdown_rx.clone());
         let d2 = dispatcher.clone();
@@ -112,8 +113,8 @@ impl Node {
             dispatcher,
             logs,
             event_tx,
-            cluster,
-            forwarder,
+            api,
+            internal_listener,
             shutdown_tx,
             shutdown_rx,
         })

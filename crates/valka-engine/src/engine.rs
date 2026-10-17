@@ -74,7 +74,7 @@ pub struct EngineEvent {
     pub ts: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CreateTask {
     pub queue_name: String,
     pub task_name: String,
@@ -153,6 +153,9 @@ pub(crate) struct Inner {
     pub(crate) moved_at: Mutex<HashMap<ShardId, tokio::time::Instant>>,
     /// PENDING tasks recovered by a claim are not dispatched before this (reconcile grace).
     pub(crate) hold_until: Mutex<HashMap<ShardId, tokio::time::Instant>>,
+    /// Queue configs (partition counts), cached for `QUEUE_CONFIG_TTL`.
+    pub(crate) queues:
+        Mutex<HashMap<String, (valka_wal::queues::QueueConfig, tokio::time::Instant)>>,
 }
 
 #[derive(Clone)]
@@ -244,6 +247,7 @@ impl Engine {
             moves: tokio::sync::Mutex::new(()),
             moved_at: Mutex::new(HashMap::new()),
             hold_until: Mutex::new(HashMap::new()),
+            queues: Mutex::new(HashMap::new()),
         });
         let engine = Engine { inner };
         engine.forward_poison();

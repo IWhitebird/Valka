@@ -1,14 +1,14 @@
 //! Read-only statistics for operators: node health, shard map, task counts.
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use valka_core::{ShardId, TaskStatus};
 
 use crate::engine::Engine;
 use crate::state::ShardState;
 
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskCounts {
     pub pending: usize,
     pub running: usize,
@@ -35,7 +35,7 @@ impl TaskCounts {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WalStats {
     /// This process's incarnation.
     pub inc: u32,
@@ -46,7 +46,7 @@ pub struct WalStats {
     pub poisoned: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SnapshotStats {
     pub last_round_at: Option<DateTime<Utc>>,
     pub dirty_shards: usize,
@@ -54,7 +54,7 @@ pub struct SnapshotStats {
     pub shards_with_snapshot: usize,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeStats {
     pub node_id: String,
     pub started_at: DateTime<Utc>,
@@ -70,14 +70,14 @@ pub struct NodeStats {
     pub snapshots: SnapshotStats,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ShardStats {
     pub shard: u16,
     pub owner: Option<String>,
     /// Ownership generation (0 when this node does not hold the shard).
     #[serde(rename = "gen")]
     pub generation: u64,
-    pub phase: &'static str,
+    pub phase: String,
     pub tasks: usize,
     pub pending: usize,
     pub running: usize,
@@ -92,7 +92,7 @@ pub struct ShardStats {
     pub dirty_since_lsn: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ShardDetail {
     #[serde(flatten)]
     pub stats: ShardStats,
@@ -203,7 +203,7 @@ impl Engine {
             shard: shard.0,
             owner: owned.then(|| self.inner.cfg.node_id.clone()),
             generation: st.generation,
-            phase: st.phase.as_str(),
+            phase: st.phase.as_str().to_string(),
             tasks: st.tasks.len(),
             pending,
             running,

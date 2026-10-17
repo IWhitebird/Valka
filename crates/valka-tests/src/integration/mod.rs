@@ -5,6 +5,7 @@
 pub(crate) mod helpers;
 
 mod cluster_api_tests;
+mod cluster_routing_tests;
 mod dispatcher_tests;
 mod e2e_tests;
 mod lifecycle_tests;

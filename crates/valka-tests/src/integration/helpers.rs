@@ -4,13 +4,14 @@ use std::time::Duration;
 use axum::Router;
 use axum::http::StatusCode;
 use tokio::sync::{broadcast, mpsc};
-use valka_cluster::ClusterManager;
+use valka_cluster::PeerClients;
 use valka_core::{MatchingConfig, NodeId, TaskStatus, WorkerId};
 use valka_dispatcher::DispatcherService;
 use valka_dispatcher::worker_handle::WorkerHandle;
 use valka_engine::{CreateTask, Engine, EngineConfig, LogIngester, TaskView};
 use valka_matching::{MatchingService, MatchingSink};
 use valka_proto::WorkerResponse;
+use valka_server::api::Api;
 use valka_wal::Store;
 use valka_wal::logstore::LogLine;
 
@@ -23,7 +24,8 @@ pub struct TestNode {
     pub logs: Arc<LogIngester>,
     pub log_tx: mpsc::Sender<LogLine>,
     pub event_tx: broadcast::Sender<valka_proto::TaskEvent>,
-    pub cluster: Arc<ClusterManager>,
+    pub api: Api,
+    #[allow(dead_code)]
     pub node_id: NodeId,
     /// Keeps the log ingester's shutdown channel open for the life of the node.
     _ingester_shutdown: tokio::sync::watch::Sender<bool>,
@@ -36,8 +38,19 @@ impl TestNode {
 
     /// Build (or rebuild after a simulated crash) a node on an existing store.
     pub async fn on_store(store: Store, node_id: &str) -> Self {
+        Self::build(store, EngineConfig::for_tests(node_id), None, None).await
+    }
+
+    /// A node with its own engine config, cluster token and client TLS (cluster tests).
+    pub async fn build(
+        store: Store,
+        cfg: EngineConfig,
+        token: Option<String>,
+        tls: Option<tonic::transport::ClientTlsConfig>,
+    ) -> Self {
+        let node_id = cfg.node_id.clone();
+        let node_id = node_id.as_str();
         let matching = MatchingService::new(MatchingConfig::default());
-        let cfg = EngineConfig::for_tests(node_id);
         let engine = Engine::open_with(
             store.clone(),
             cfg,
@@ -61,10 +74,11 @@ impl TestNode {
             node.clone(),
             log_tx.clone(),
         );
-        let cluster = Arc::new(ClusterManager::new_single_node(
-            node.clone(),
-            matching.config().num_partitions,
-        ));
+        let api = Api::new(
+            engine.clone(),
+            dispatcher.clone(),
+            PeerClients::new(node_id, token, tls, Duration::from_secs(5)),
+        );
         Self {
             store,
             engine,
@@ -73,7 +87,7 @@ impl TestNode {
             logs,
             log_tx,
             event_tx,
-            cluster,
+            api,
             node_id: node,
             _ingester_shutdown: ingester_shutdown,
         }
@@ -84,12 +98,10 @@ impl TestNode {
             .build_recorder()
             .handle();
         valka_server::rest::build_api_router(
-            self.engine.clone(),
+            self.api.clone(),
             self.event_tx.clone(),
-            self.dispatcher.clone(),
             self.logs.clone(),
             metrics_handle,
-            self.cluster.clone(),
             valka_server::cluster::NodeInfo::new("127.0.0.1:50051", "127.0.0.1:8989", 5),
         )
     }
