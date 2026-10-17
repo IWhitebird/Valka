@@ -264,9 +264,10 @@ impl DispatcherService {
         let info: DispatchInfo = match router.dispatch(&envelope.task_id, &worker_id.0).await {
             Ok(info) => info,
             Err(e) => {
-                // Cancelled / deleted / already running / owner unreachable: the owner keeps
-                // the task (a reservation lapses back to PENDING).
+                // Cancelled / deleted / already running / owner briefly not serving: hand the
+                // offer back so a PENDING task is runnable again now (a no-op otherwise).
                 debug!(task_id = %envelope.task_id, error = %e, "dispatch refused");
+                router.unoffer(&envelope.task_id).await;
                 return;
             }
         };

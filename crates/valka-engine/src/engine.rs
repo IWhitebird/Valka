@@ -185,8 +185,9 @@ pub(crate) struct Inner {
     pub(crate) stranded: Mutex<std::collections::HashSet<ShardId>>,
     /// PENDING tasks recovered by a claim are not dispatched before this (reconcile grace).
     pub(crate) hold_until: Mutex<HashMap<ShardId, tokio::time::Instant>>,
-    /// Tasks handed to another node by `fetch` and not dispatched yet: reservation expiry.
-    pub(crate) remote_offers: Mutex<HashMap<String, tokio::time::Instant>>,
+    /// Offered tasks (local matching or another node's `fetch`) not dispatched yet, with the
+    /// time their offer lapses.
+    pub(crate) offers: Mutex<HashMap<String, tokio::time::Instant>>,
     /// Woken whenever runnable tasks are added to the pending index (remote fetchers).
     pub(crate) runnable: Notify,
     /// Queue configs (partition counts), cached for `QUEUE_CONFIG_TTL`.
@@ -303,7 +304,7 @@ impl Engine {
             stranded: Mutex::new(std::collections::HashSet::new()),
             hold_until: Mutex::new(HashMap::new()),
             queues: Mutex::new(HashMap::new()),
-            remote_offers: Mutex::new(HashMap::new()),
+            offers: Mutex::new(HashMap::new()),
             runnable: Notify::new(),
         });
         let engine = Engine { inner };

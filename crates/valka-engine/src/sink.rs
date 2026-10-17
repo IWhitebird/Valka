@@ -20,7 +20,8 @@ pub struct DispatchableTask {
 pub enum OfferOutcome {
     /// Handed to a waiting worker (dispatch will follow).
     Matched,
-    /// Parked in the matching buffer; dispatch will follow when a worker frees up.
+    /// Parked in the matching buffer; dispatch will follow when a worker frees up. An
+    /// offer not dispatched within `OFFER_TTL` lapses back to the pending index.
     Buffered,
     /// Buffer full. The engine keeps the task in its pending index for the feeder.
     Rejected,

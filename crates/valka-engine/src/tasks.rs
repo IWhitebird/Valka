@@ -425,7 +425,7 @@ impl Engine {
             },
             |_| (),
         )?;
-        self.inner.remote_offers.lock().remove(task_id);
+        self.inner.offers.lock().remove(task_id);
         self.inner.timers.lock().schedule(
             info.lease_until,
             TimerKind::LeaseExpiry {

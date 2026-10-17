@@ -431,10 +431,17 @@ async fn test_reconnecting_worker_keeps_current_runs_and_cancels_stale_ones() {
 }
 
 /// Fails the first `fail` reattaches (the owner unreachable while its shard moves), then
-/// answers like the local engine.
+/// answers like the local engine. With `fail_dispatches`, dispatches fail the same way.
 struct FlakyReattach {
     inner: valka_dispatcher::LocalRouter,
     fail: std::sync::atomic::AtomicU32,
+    fail_dispatches: std::sync::atomic::AtomicU32,
+}
+
+fn take_failure(n: &std::sync::atomic::AtomicU32) -> bool {
+    use std::sync::atomic::Ordering;
+    n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
 }
 
 #[async_trait::async_trait]
@@ -444,6 +451,11 @@ impl valka_dispatcher::TaskRouter for FlakyReattach {
         task_id: &str,
         worker_id: &str,
     ) -> Result<valka_engine::DispatchInfo, valka_core::ServerError> {
+        if take_failure(&self.fail_dispatches) {
+            return Err(valka_core::ServerError::Unavailable(
+                "owner briefly not serving".into(),
+            ));
+        }
         self.inner.dispatch(task_id, worker_id).await
     }
     async fn return_run(&self, task_id: &str, run_id: &str) {
@@ -488,12 +500,7 @@ impl valka_dispatcher::TaskRouter for FlakyReattach {
         attempt: i32,
         worker_id: &str,
     ) -> Result<valka_engine::ReattachOutcome, valka_core::ServerError> {
-        use std::sync::atomic::Ordering;
-        if self
-            .fail
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
+        if take_failure(&self.fail) {
             return Err(valka_core::ServerError::Unavailable(
                 "shard is moving".into(),
             ));
@@ -519,6 +526,7 @@ async fn test_reattach_is_retried_while_the_owner_is_unreachable() {
         .set_router(std::sync::Arc::new(FlakyReattach {
             inner: valka_dispatcher::LocalRouter(node.engine.clone()),
             fail: std::sync::atomic::AtomicU32::new(4),
+            fail_dispatches: std::sync::atomic::AtomicU32::new(0),
         }));
 
     let (wid, _rx) = node.register_worker(&["q"], 4).await;
@@ -566,4 +574,38 @@ async fn test_reattach_is_retried_while_the_owner_is_unreachable() {
         TaskStatus::Running
     );
     assert_eq!(node.engine.run_location(&lost.id).unwrap().worker_id, wid.0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_a_failed_dispatch_hands_the_task_back_at_once() {
+    // Found by the chaos rig: a dispatch refused while the owner was briefly not serving
+    // left the task offered (PENDING, out of the pending index) instead of runnable.
+    let node = TestNode::new().await;
+    node.dispatcher
+        .set_router(std::sync::Arc::new(FlakyReattach {
+            inner: valka_dispatcher::LocalRouter(node.engine.clone()),
+            fail: std::sync::atomic::AtomicU32::new(0),
+            fail_dispatches: std::sync::atomic::AtomicU32::new(1),
+        }));
+    let (wid, mut rx) = node.register_worker(&["q"], 1).await;
+    let (d, w) = (node.dispatcher.clone(), wid.clone());
+    tokio::spawn(async move { d.run_worker_match_loop(w, vec!["q".to_string()]).await });
+    settle().await;
+    let task = node.create("q", "t").await;
+    // The first dispatch fails; the task goes back and the next offer reaches the worker,
+    // long before the offer's 30 s lapse would have rescued it.
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("assignment after the failed dispatch")
+        .unwrap();
+    match msg.response {
+        Some(valka_proto::worker_response::Response::TaskAssignment(a)) => {
+            assert_eq!(a.task_id, task.id)
+        }
+        other => panic!("expected an assignment, got {other:?}"),
+    }
+    assert_eq!(
+        node.engine.get_task(&task.id).unwrap().status,
+        TaskStatus::Running
+    );
 }

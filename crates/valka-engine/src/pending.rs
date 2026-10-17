@@ -11,8 +11,11 @@ use crate::state::Transition;
 use crate::timers::TimerKind;
 use crate::write_path::{dispatchable, pending_key};
 
-/// How long a task handed to another node by `fetch` stays reserved for it.
-pub const REMOTE_OFFER_TTL: Duration = Duration::from_secs(30);
+/// How long an offered task (taken from the pending index for this node's matching layer,
+/// or reserved for another node by `fetch`) may stay undispatched before it goes back to
+/// the pending index. A safety net: whatever loses an offer (a fetcher that died, a
+/// dispatch that failed) cannot strand the task.
+pub const OFFER_TTL: Duration = Duration::from_secs(30);
 
 impl Engine {
     pub fn queues(&self) -> Vec<String> {
@@ -67,7 +70,17 @@ impl Engine {
             t.offered = true;
             out.push(dispatchable(t, t.attempt_count + 1));
         }
+        self.note_offered(out.iter().map(|t| t.task_id.clone()));
         out
+    }
+
+    /// Start the `OFFER_TTL` clock of tasks just marked offered.
+    fn note_offered(&self, task_ids: impl IntoIterator<Item = String>) {
+        let lapse = tokio::time::Instant::now() + OFFER_TTL;
+        let mut offers = self.inner.offers.lock();
+        for id in task_ids {
+            offers.insert(id, lapse);
+        }
     }
 
     /// The matching layer dropped a task it had been offered; make it runnable again.
@@ -87,7 +100,7 @@ impl Engine {
                 None
             }
         };
-        self.inner.remote_offers.lock().remove(task_id);
+        self.inner.offers.lock().remove(task_id);
         if let Some(entry) = key {
             self.add_runnable([entry]);
         }
@@ -114,7 +127,7 @@ impl Engine {
     /// for one to appear (long poll). The tasks stay PENDING, reserved for the caller in
     /// RAM only: it dispatches each to one of its workers with
     /// [`Engine::dispatch_to`], or gives it back with [`Engine::unoffer`]; a reservation
-    /// not used within `REMOTE_OFFER_TTL` lapses.
+    /// not used within `OFFER_TTL` lapses.
     pub async fn fetch(&self, queue: &str, max: usize, wait: Duration) -> Vec<DispatchableTask> {
         let deadline = tokio::time::Instant::now() + wait;
         loop {
@@ -127,11 +140,6 @@ impl Engine {
                 Vec::new()
             };
             if !tasks.is_empty() || tokio::time::Instant::now() >= deadline {
-                let lapse = tokio::time::Instant::now() + REMOTE_OFFER_TTL;
-                let mut offers = self.inner.remote_offers.lock();
-                for t in &tasks {
-                    offers.insert(t.task_id.clone(), lapse);
-                }
                 return tasks;
             }
             tokio::select! {
@@ -141,11 +149,11 @@ impl Engine {
         }
     }
 
-    /// Reservations handed out by `fetch` and never used: make the tasks runnable again.
-    pub(crate) fn lapse_remote_offers(&self) {
+    /// Offers never dispatched within `OFFER_TTL`: make the tasks runnable again.
+    pub(crate) fn lapse_offers(&self) {
         let now = tokio::time::Instant::now();
         let lapsed: Vec<String> = {
-            let mut offers = self.inner.remote_offers.lock();
+            let mut offers = self.inner.offers.lock();
             let lapsed: Vec<String> = offers
                 .iter()
                 .filter(|(_, at)| **at <= now)
@@ -157,7 +165,7 @@ impl Engine {
             lapsed
         };
         for id in lapsed {
-            debug!(task_id = %id, "remote reservation lapsed");
+            debug!(task_id = %id, "offer lapsed undispatched");
             self.unoffer(&id);
         }
     }
@@ -221,7 +229,7 @@ impl Engine {
         let Some(d) = dispatchable else { return };
         let sink = self.inner.sink.read().clone();
         match sink.offer(d) {
-            OfferOutcome::Matched | OfferOutcome::Buffered => {}
+            OfferOutcome::Matched | OfferOutcome::Buffered => self.note_offered([task_id.into()]),
             OfferOutcome::Rejected => {
                 if let Some(t) = self.inner.shards[shard.index()]
                     .lock()

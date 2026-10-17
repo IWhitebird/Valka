@@ -461,6 +461,11 @@ task hands it out in two ways:
    node's worker then dispatches it through the owner, which writes `TaskDispatched` with
    the worker and the worker's node.
 
+Either way a handed-out task is marked *offered* and leaves the pending index until its
+dispatch is recorded. A refused dispatch hands it straight back, and any offer not
+dispatched within 30 s (`OFFER_TTL`) lapses back to the index, so a lost hand-off can delay
+a task but never strand it.
+
 Tasks nobody is waiting for stay in the owner's pending index; nothing is pushed blindly.
 
 ### 9.3 Reattach after a reconnect
@@ -554,7 +559,7 @@ number of nodes.
 | Engine and WAL | `crates/valka-engine/src/tests.rs`, `crates/valka-wal` | crash/replay property test, timers, the writer under faults |
 | Integration | `crates/valka-tests` | REST, gRPC and the Rust SDK end to end; 3-node clusters over real localhost gRPC (routing, cross-node workers, reattach, admin, mTLS) |
 | Real S3 | `--features minio` | conditional-write semantics, storage self-test, two-node takeover |
-| Chaos | `scripts/chaos.sh` + `examples/rs/chaos.rs` | a 3-node docker compose cluster with random `kill -9`, freezes and restarts under load; checks that every acknowledged task exists and finishes and no idempotency key made two tasks. It found 1 bug: a drain stopped renewing its lease before handing its shards over (PHASE2.md §19b) |
+| Chaos | `scripts/chaos.sh` + `examples/rs/chaos.rs` | a 3-node docker compose cluster with random `kill -9`, freezes and restarts under load; checks that every acknowledged task exists and finishes and no idempotency key made two tasks. It found 2 bugs: a drain stopped renewing its lease before handing its shards over, and a task whose local dispatch failed stayed "offered" forever instead of runnable (PHASE2.md §19b) |
 
 ## 14. Compared with Cloudflare Durable Objects
 

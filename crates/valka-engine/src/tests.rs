@@ -1340,6 +1340,33 @@ async fn results_that_cannot_be_made_durable_are_retried() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_local_offer_that_is_never_dispatched_lapses_back_to_pending() {
+    // Found by the chaos rig: the owner's own feeder handed a task to its matching layer,
+    // the dispatch failed (the node was briefly not serving), and the task stayed
+    // "offered" forever: PENDING, out of the pending index, never run.
+    let store = Store::memory();
+    let e = open(&store).await;
+    let sink = Arc::new(RecordingSink::default());
+    e.set_sink(sink.clone());
+    let t = e.create_task(create("q")).await.unwrap();
+    settle().await;
+    assert_eq!(sink.offers.lock().len(), 1, "offered to local matching");
+    assert_eq!(e.pending_count("q"), 0);
+    // No dispatch ever comes. Stop accepting so the lapse is visible in the index.
+    sink.reject.store(true, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::advance(crate::pending::OFFER_TTL + Duration::from_secs(1)).await;
+    settle().await;
+    assert_eq!(
+        e.pending_count("q"),
+        1,
+        "the lost offer lapsed back to PENDING"
+    );
+    let again = e.take_pending("q", 10);
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].task_id, t.id);
+}
+
+#[tokio::test(start_paused = true)]
 async fn fetch_reserves_tasks_for_another_node_and_unused_reservations_lapse() {
     let store = Store::memory();
     let e = open(&store).await;
@@ -1360,7 +1387,7 @@ async fn fetch_reserves_tasks_for_another_node_and_unused_reservations_lapse() {
         "node-b"
     );
     assert_eq!(d.attempt, 1);
-    tokio::time::advance(crate::pending::REMOTE_OFFER_TTL + Duration::from_secs(1)).await;
+    tokio::time::advance(crate::pending::OFFER_TTL + Duration::from_secs(1)).await;
     settle().await;
     assert_eq!(e.pending_count("q"), 1, "the unused reservation lapsed");
     assert_eq!(e.get_task(&b.id).unwrap().status, TaskStatus::Pending);

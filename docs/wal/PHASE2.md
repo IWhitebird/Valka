@@ -394,7 +394,7 @@ worker w7 ─ Session ─ node W                          node O (owns a partiti
                       │ w7 idle on queue Q; O owns some of Q's partitions
                       │── Fetch{Q, wait 2 s} ───────► O: a runnable task T in Q's partitions?
                       │                                  reserve T for W (RAM only, lapses
-                      │                                  after REMOTE_OFFER_TTL = 30 s)
+                      │                                  after OFFER_TTL = 30 s)
                       ◄── T (spec, checkpoints) ─────
                       │ offer T to a waiting local worker; w7 takes it, run id minted by W
                       │── Dispatch{T, run, w7, node W} ► O records TaskDispatched{w7, node W}
@@ -811,6 +811,15 @@ The model's findings (§19) are all implemented, each with a regression test
   signals went there), and a lost dispatch was not adopted, so the task would run twice
   once the claim's grace ended. The dispatcher now retries in the background (backoff up to
   5 s, for 60 s) while the worker still runs the task.
+- **Found by the chaos rig: an offer whose dispatch fails must go back.** A task the owner's
+  own feeder handed to local matching is marked offered and leaves the pending index. If the
+  worker's dispatch then failed (here: the owner briefly not serving after a slow lease
+  renewal), the dispatcher dropped it, assuming a reservation would lapse; only remote
+  fetches had one. Three acknowledged tasks stayed PENDING forever (none lost, none run).
+  Now a refused dispatch hands the task back at once (`unoffer`), and every offer, local or
+  remote, lapses after `OFFER_TTL` (30 s) as a safety net. Regression tests:
+  `a_local_offer_that_is_never_dispatched_lapses_back_to_pending`,
+  `test_a_failed_dispatch_hands_the_task_back_at_once`.
 
 ## 20. Open questions
 

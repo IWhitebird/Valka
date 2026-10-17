@@ -44,7 +44,7 @@ impl Engine {
                 _ = tick.tick() => {
                     self.fire_due_timers();
                     self.flush_lease_records();
-                    self.lapse_remote_offers();
+                    self.lapse_offers();
                 }
             }
         }
