@@ -3,7 +3,7 @@
 //! ```text
 //! append() ──mpsc──► collector ──(segment, acks)──mpsc──► committer ──► resolve acks
 //!                      │ encodes + spawns PUT                │ awaits PUTs in seq order
-//!                      │ (bounded by max_inflight)           │ verifies ownership
+//!                      │ (bounded by max_inflight)           │ checks the node's lease
 //! ```
 //!
 //! Acks are resolved strictly in segment order, so "durable LSN" is always a prefix.
@@ -18,8 +18,8 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, warn};
 
 use crate::error::WalError;
+use crate::lease::FenceCheck;
 use crate::lsn::{Lsn, keys};
-use crate::ownership::{OwnershipCheck, OwnershipVerdict};
 use crate::record::Envelope;
 use crate::segment;
 use crate::store::Store;
@@ -75,7 +75,6 @@ struct InFlight {
     lsn: Lsn,
     record_count: u64,
     bytes: u64,
-    shards: Vec<valka_core::ShardId>,
     acks: Vec<oneshot::Sender<Result<Lsn, WalError>>>,
     put: JoinHandle<Result<(), WalError>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
@@ -94,7 +93,7 @@ pub struct WalWriter {
     tx: mpsc::UnboundedSender<Pending>,
     durable: watch::Receiver<Lsn>,
     next_lsn: Arc<AtomicU64>,
-    epoch: u32,
+    inc: u32,
     /// Set when the committer gave up on a segment; the engine must restart.
     poisoned: Arc<watch::Sender<Option<String>>>,
     backlog: Arc<Mutex<Backlog>>,
@@ -102,18 +101,18 @@ pub struct WalWriter {
 }
 
 impl WalWriter {
-    /// Start the writer. `start_lsn` is the first LSN this writer will use (recovery passes
-    /// `last_seen.next()`; a fresh node passes `Lsn::new(epoch, 1)`).
+    /// Start the writer for incarnation `start_lsn.inc`, numbering segments from
+    /// `start_lsn.seq` (1 for a fresh incarnation). `fence` runs after every segment PUT.
     pub fn start(
         store: Store,
         node_id: String,
         start_lsn: Lsn,
         cfg: WalWriterConfig,
-        ownership: Arc<dyn OwnershipCheck>,
+        fence: Arc<dyn FenceCheck>,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel::<Pending>();
         let (durable_tx, durable_rx) =
-            watch::channel(Lsn::new(start_lsn.epoch, start_lsn.seq.saturating_sub(1)));
+            watch::channel(Lsn::new(start_lsn.inc, start_lsn.seq.saturating_sub(1)));
         let (flight_tx, flight_rx) = mpsc::channel::<InFlight>(cfg.max_inflight * 2 + 1);
         let next_lsn = Arc::new(AtomicU64::new(start_lsn.seq));
         let poisoned = Arc::new(watch::Sender::new(None));
@@ -123,7 +122,7 @@ impl WalWriter {
             flight_tx,
             store.clone(),
             node_id,
-            start_lsn.epoch,
+            start_lsn.inc,
             next_lsn.clone(),
             cfg.clone(),
         ));
@@ -132,7 +131,8 @@ impl WalWriter {
         tokio::spawn(committer(
             flight_rx,
             durable_tx,
-            ownership,
+            fence,
+            cfg.put_retries,
             poisoned.clone(),
             backlog.clone(),
             bytes_committed.clone(),
@@ -142,7 +142,7 @@ impl WalWriter {
             tx,
             durable: durable_rx,
             next_lsn,
-            epoch: start_lsn.epoch,
+            inc: start_lsn.inc,
             poisoned,
             backlog,
             bytes_committed,
@@ -208,11 +208,11 @@ impl WalWriter {
 
     /// The LSN the *next* segment will get. Used to stamp snapshots exactly.
     pub fn next_lsn(&self) -> Lsn {
-        Lsn::new(self.epoch, self.next_lsn.load(Ordering::SeqCst))
+        Lsn::new(self.inc, self.next_lsn.load(Ordering::SeqCst))
     }
 
-    pub fn epoch(&self) -> u32 {
-        self.epoch
+    pub fn inc(&self) -> u32 {
+        self.inc
     }
 
     pub fn poisoned(&self) -> Option<String> {
@@ -235,7 +235,7 @@ async fn collector(
     flight_tx: mpsc::Sender<InFlight>,
     store: Store,
     node_id: String,
-    epoch: u32,
+    inc: u32,
     next_lsn: Arc<AtomicU64>,
     cfg: WalWriterConfig,
 ) {
@@ -274,7 +274,7 @@ async fn collector(
                     flush(
                         &store,
                         &node_id,
-                        epoch,
+                        inc,
                         &next_lsn,
                         &cfg,
                         &semaphore,
@@ -295,7 +295,7 @@ async fn collector(
         flush(
             &store,
             &node_id,
-            epoch,
+            inc,
             &next_lsn,
             &cfg,
             &semaphore,
@@ -328,7 +328,7 @@ fn approx_size(e: &Envelope) -> usize {
 async fn flush(
     store: &Store,
     node_id: &str,
-    epoch: u32,
+    inc: u32,
     next_lsn: &AtomicU64,
     cfg: &WalWriterConfig,
     semaphore: &Arc<Semaphore>,
@@ -337,16 +337,13 @@ async fn flush(
     acks: Vec<oneshot::Sender<Result<Lsn, WalError>>>,
 ) {
     // Empty batches (sync()) still get a segment so the durable LSN advances and the
-    // ownership check runs. They are tiny.
+    // lease check runs. They are tiny.
     let permit = match semaphore.clone().acquire_owned().await {
         Ok(p) => p,
         Err(_) => return,
     };
     let seq = next_lsn.fetch_add(1, Ordering::SeqCst);
-    let lsn = Lsn::new(epoch, seq);
-    let mut shards: Vec<valka_core::ShardId> = records.iter().map(|r| r.shard).collect();
-    shards.sort_unstable();
-    shards.dedup();
+    let lsn = Lsn::new(inc, seq);
     let record_count = records.len() as u64;
 
     let bytes = match segment::encode(lsn, node_id, &records, cfg.compress) {
@@ -369,7 +366,6 @@ async fn flush(
             lsn,
             record_count,
             bytes: size,
-            shards,
             acks,
             put,
             _permit: permit,
@@ -382,7 +378,7 @@ async fn flush(
 }
 
 /// Segments are written create-if-absent: a segment position is written exactly once, so
-/// a late PUT from a fenced-out writer can never overwrite a sealed position (phase 2).
+/// a late PUT from a fenced-out writer can never overwrite a sealed position.
 /// `AlreadyExists` after a retry is ours only if the stored bytes are ours: an earlier
 /// attempt may have landed with its response lost, or someone else may have taken the
 /// position meanwhile.
@@ -423,6 +419,29 @@ async fn put_with_retry(
     }
 }
 
+/// The lease check after a PUT. Transport errors are retried; a fenced verdict is final.
+async fn verify_with_retry(fence: &dyn FenceCheck, lsn: Lsn, retries: u32) -> Result<(), WalError> {
+    let mut attempt = 0u32;
+    let mut delay = Duration::from_millis(20);
+    loop {
+        match fence.verify().await {
+            Ok(()) => return Ok(()),
+            Err(e @ WalError::Fenced(_)) => return Err(e),
+            Err(e) if attempt >= retries => {
+                return Err(WalError::NotDurable(format!(
+                    "lease check after {lsn}: {e}"
+                )));
+            }
+            Err(e) => {
+                attempt += 1;
+                warn!(%lsn, attempt, error = %e, "lease check failed, retrying");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(2));
+            }
+        }
+    }
+}
+
 fn settle_backlog(backlog: &Mutex<Backlog>, records: u64) {
     let mut b = backlog.lock();
     b.records = b.records.saturating_sub(records);
@@ -434,7 +453,8 @@ fn settle_backlog(backlog: &Mutex<Backlog>, records: u64) {
 async fn committer(
     mut rx: mpsc::Receiver<InFlight>,
     durable_tx: watch::Sender<Lsn>,
-    ownership: Arc<dyn OwnershipCheck>,
+    fence: Arc<dyn FenceCheck>,
+    retries: u32,
     poisoned: Arc<watch::Sender<Option<String>>>,
     backlog: Arc<Mutex<Backlog>>,
     bytes_committed: Arc<AtomicU64>,
@@ -447,14 +467,7 @@ async fn committer(
         };
 
         let result = match result {
-            Ok(()) => match ownership.verify(&f.shards).await {
-                Ok(OwnershipVerdict::Unchanged) => Ok(()),
-                Ok(OwnershipVerdict::Lost(lost)) => {
-                    warn!(?lost, lsn = %f.lsn, "ownership lost for shards in segment");
-                    Err(WalError::OwnershipLost)
-                }
-                Err(e) => Err(e),
-            },
+            Ok(()) => verify_with_retry(fence.as_ref(), f.lsn, retries).await,
             Err(e) => Err(e),
         };
 
@@ -493,14 +506,14 @@ async fn committer(
 mod tests {
     use super::*;
     use crate::fault::faulty_memory_store;
-    use crate::ownership::SingleNodeOwnership;
+    use crate::lease::NoFence;
     use crate::reader;
     use crate::record::WalRecord;
     use valka_core::ShardId;
 
     fn rec(i: u32) -> Envelope {
         Envelope::new(
-            ShardId(i as u16 % 4096),
+            ShardId(i as u16 % 256),
             WalRecord::TaskPromoted {
                 task_id: format!("t{i}"),
             },
@@ -563,7 +576,7 @@ mod tests {
             "n".into(),
             Lsn::new(1, 1),
             cfg(),
-            Arc::new(SingleNodeOwnership),
+            Arc::new(NoFence),
         );
         let d1 = w.append(vec![rec(1), rec(2)]);
         let d2 = w.append(vec![rec(3)]);
@@ -572,7 +585,7 @@ mod tests {
         assert_eq!(l1, l2, "same group commit");
         assert_eq!(w.durable_lsn(), l1);
 
-        let all = reader::read_all(&store, "n", None).await.unwrap();
+        let all = reader::read_all(&store, "n", 1).await.unwrap();
         let ids: Vec<_> = all
             .iter()
             .map(|(_, e)| e.record.task_id().unwrap().to_string())
@@ -593,7 +606,7 @@ mod tests {
             "n".into(),
             Lsn::new(1, 1),
             c,
-            Arc::new(SingleNodeOwnership),
+            Arc::new(NoFence),
         );
         let batch: Vec<Envelope> = (0..20).map(rec).collect();
         let lsn = tokio::time::timeout(Duration::from_secs(2), w.append(batch).wait())
@@ -612,7 +625,7 @@ mod tests {
             "n".into(),
             Lsn::new(1, 1),
             cfg(),
-            Arc::new(SingleNodeOwnership),
+            Arc::new(NoFence),
         );
         let mut waits = Vec::new();
         for i in 0..50u32 {
@@ -628,7 +641,7 @@ mod tests {
             last = l;
         }
         faults.set_fail_rate(0);
-        let all = reader::read_all(&store, "n", None).await.unwrap();
+        let all = reader::read_all(&store, "n", 1).await.unwrap();
         assert_eq!(all.len(), 50);
         // segments are contiguous
         let mut seqs: Vec<u64> = all.iter().map(|(l, _)| l.seq).collect();
@@ -646,7 +659,7 @@ mod tests {
             "n".into(),
             Lsn::new(1, 1),
             cfg(),
-            Arc::new(SingleNodeOwnership),
+            Arc::new(NoFence),
         );
         assert_eq!(w.unflushed_records(), 0);
         assert!(w.oldest_unacked().is_none());
@@ -674,7 +687,7 @@ mod tests {
             "n".into(),
             Lsn::new(1, 1),
             c,
-            Arc::new(SingleNodeOwnership),
+            Arc::new(NoFence),
         );
         let mut poison = w.poison_watch();
         assert!(poison.borrow().is_none());
@@ -687,12 +700,7 @@ mod tests {
         // subsequent appends fail fast
         assert!(w.append(vec![rec(2)]).wait().await.is_err());
         faults.set_puts_down(false);
-        assert!(
-            reader::read_all(&store, "n", None)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(reader::read_all(&store, "n", 1).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -704,13 +712,13 @@ mod tests {
             "n".into(),
             Lsn::new(1, 1),
             cfg(),
-            Arc::new(SingleNodeOwnership),
+            Arc::new(NoFence),
         );
         for i in 0..20u32 {
             w.append(vec![rec(i)]).wait().await.unwrap();
         }
         faults.set_lost_put_ack_rate(0);
-        let all = reader::read_all(&store, "n", None).await.unwrap();
+        let all = reader::read_all(&store, "n", 1).await.unwrap();
         assert_eq!(
             all.len(),
             20,

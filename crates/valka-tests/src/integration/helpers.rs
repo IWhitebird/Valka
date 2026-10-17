@@ -37,8 +37,7 @@ impl TestNode {
     /// Build (or rebuild after a simulated crash) a node on an existing store.
     pub async fn on_store(store: Store, node_id: &str) -> Self {
         let matching = MatchingService::new(MatchingConfig::default());
-        let mut cfg = EngineConfig::for_tests(node_id);
-        cfg.trust_self = false; // exercise the real assignment/ownership path
+        let cfg = EngineConfig::for_tests(node_id);
         let engine = Engine::open_with(
             store.clone(),
             cfg,

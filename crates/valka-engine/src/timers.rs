@@ -13,6 +13,8 @@ pub enum TimerKind {
     LeaseExpiry { task_id: String, run_id: String },
     /// Periodic retention sweep for terminal tasks.
     Evict,
+    /// A claimed shard's reconcile grace is over: index its recovered PENDING tasks.
+    Unhold { shard: u16 },
 }
 
 #[derive(Debug, Default)]

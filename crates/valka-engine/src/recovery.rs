@@ -1,40 +1,44 @@
-//! Post-replay index rebuild and the snapshot / truncation round.
+//! Per-shard index rebuild after a claim, and the snapshot / truncation round.
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use valka_core::{ShardId, TaskStatus};
-use valka_wal::{Lsn, reader, snapshot};
+use valka_wal::snapshot::{self, LogPtr, SnapshotKey};
+use valka_wal::{Lsn, reader};
 
 use crate::engine::Engine;
-use crate::state::{RunStatus, ShardSnapshot, ShardState};
+use crate::state::{RunStatus, ShardPhase, ShardSnapshot, ShardState};
 use crate::timers::TimerKind;
 use crate::write_path::pending_key;
 
 impl Engine {
-    /// After recovery: pending index, timers, retention.
-    pub(crate) fn rebuild_indexes(&self) {
+    /// A shard was just claimed: index its runnable tasks, arm its timers, give its
+    /// RUNNING tasks a grace lease (their workers must re-handshake), apply retention.
+    pub(crate) fn rebuild_shard_indexes(&self, shard: ShardId) {
         let now = self.inner.clock.now();
         let grace = ChronoDuration::seconds(self.inner.cfg.scheduler.recovery_grace_secs);
         let retention = ChronoDuration::seconds(self.inner.cfg.wal.completed_retention_secs as i64);
-        let mut pending = self.inner.pending.lock();
-        let mut timers = self.inner.timers.lock();
-        let mut running = 0usize;
-        let mut runnable = 0usize;
-        let mut evicted = 0usize;
-        for m in &self.inner.shards {
-            let mut st = m.lock();
-            evicted += st.evict_terminal_before(now - retention);
+        let held = self
+            .inner
+            .hold_until
+            .lock()
+            .get(&shard)
+            .is_some_and(|t| *t > tokio::time::Instant::now());
+        let mut runnable = Vec::new();
+        {
+            let mut timers = self.inner.timers.lock();
+            let mut st = self.inner.shards[shard.index()].lock();
+            if st.phase != ShardPhase::Serving {
+                return;
+            }
+            st.evict_terminal_before(now - retention);
             for t in st.tasks.values_mut() {
                 t.offered = false;
                 match t.status {
                     TaskStatus::Pending if t.due => {
-                        pending
-                            .entry(t.spec.queue_name.clone())
-                            .or_default()
-                            .insert(pending_key(t));
-                        runnable += 1;
+                        runnable.push((t.spec.queue_name.clone(), pending_key(t)));
                     }
                     TaskStatus::Pending | TaskStatus::Retry => {
                         let at = t.next_attempt_at.unwrap_or(now);
@@ -58,15 +62,46 @@ impl Engine {
                                     run_id: run.id.clone(),
                                 },
                             );
-                            running += 1;
                         }
                     }
                     _ => {}
                 }
             }
+            if held {
+                let at = now
+                    + ChronoDuration::milliseconds(
+                        self.inner.cfg.cluster.reconcile_grace_ms as i64,
+                    );
+                timers.schedule(at, TimerKind::Unhold { shard: shard.0 });
+            }
         }
-        timers.schedule(now + ChronoDuration::seconds(60), TimerKind::Evict);
-        info!(runnable, running, evicted, "indexes rebuilt");
+        if !held {
+            let mut pending = self.inner.pending.lock();
+            for (q, k) in runnable {
+                pending.entry(q).or_default().insert(k);
+            }
+        }
+        self.inner.pending_wake.notify_one();
+    }
+
+    /// The reconcile grace of a claimed shard ended: its recovered PENDING tasks may run.
+    pub(crate) fn unhold_shard(&self, shard: ShardId) {
+        self.inner.hold_until.lock().remove(&shard);
+        let runnable: Vec<(String, crate::engine::PendingKey)> = {
+            let st = self.inner.shards[shard.index()].lock();
+            if !st.serving() {
+                return;
+            }
+            st.tasks
+                .values()
+                .filter(|t| t.is_runnable())
+                .map(|t| (t.spec.queue_name.clone(), pending_key(t)))
+                .collect()
+        };
+        let mut pending = self.inner.pending.lock();
+        for (q, k) in runnable {
+            pending.entry(q).or_default().insert(k);
+        }
         drop(pending);
         self.inner.pending_wake.notify_one();
     }
@@ -80,6 +115,9 @@ impl Engine {
             tokio::select! {
                 _ = shutdown.changed() => { if *shutdown.borrow() { return; } }
                 _ = tokio::time::sleep(tick) => {}
+            }
+            if self.poisoned().is_some() {
+                return;
             }
             if self.over_log_budget() {
                 self.snapshot_dirty_shards(true).await;
@@ -101,8 +139,9 @@ impl Engine {
         budget > 0 && since >= budget
     }
 
-    /// Snapshot every shard with uncovered records (or, when `force`, every dirty shard
-    /// regardless of the record threshold), then prune snapshots and truncate segments.
+    /// Snapshot every serving shard with uncovered records (or, when `force`, every dirty
+    /// shard regardless of the record threshold), then truncate this incarnation's log
+    /// below the oldest record no snapshot covers.
     pub(crate) async fn snapshot_dirty_shards(&self, force: bool) {
         if force {
             self.inner
@@ -110,12 +149,14 @@ impl Engine {
                 .store(self.inner.writer.bytes_committed(), Ordering::SeqCst);
         }
         let threshold = self.inner.cfg.wal.snapshot_after_records;
+        let me = self.node_id().to_string();
+        let inc = self.incarnation();
         let mut written = 0usize;
         let mut batch = Vec::with_capacity(SNAPSHOT_BATCH);
         for (i, m) in self.inner.shards.iter().enumerate() {
             {
                 let mut st = m.lock();
-                if st.records_since_snapshot == 0 {
+                if st.phase != ShardPhase::Serving || st.records_since_snapshot == 0 {
                     continue;
                 }
                 if !force
@@ -127,21 +168,25 @@ impl Engine {
                     // Not enough records yet and nothing durable to cover: wait.
                     continue;
                 }
-                let lsn = self.inner.writer.next_lsn();
+                let key = SnapshotKey {
+                    shard: ShardId(i as u16),
+                    generation: st.generation,
+                    seq: st.shard_seq,
+                    ptr: LogPtr::At {
+                        node: me.clone(),
+                        inc,
+                        seq: self.inner.writer.next_lsn().seq,
+                    },
+                };
                 let prev = Bookkeeping::of(&st);
                 let taken_at = self.inner.clock.now();
                 let snap = st.to_snapshot(taken_at);
                 st.records_since_snapshot = 0;
                 st.snapshot_seq = st.shard_seq;
-                st.snapshot_lsn = lsn;
+                st.snapshot_key = Some(key.clone());
                 st.dirty_since_lsn = None;
                 st.snapshot_at = Some(taken_at);
-                batch.push(Captured {
-                    shard: ShardId(i as u16),
-                    lsn,
-                    snap,
-                    prev,
-                });
+                batch.push(Captured { key, snap, prev });
             }
             if batch.len() == SNAPSHOT_BATCH {
                 written += self.write_snapshot_batch(std::mem::take(&mut batch)).await;
@@ -154,20 +199,41 @@ impl Engine {
             return;
         }
         *self.inner.last_snapshot_round.lock() = Some(self.inner.clock.now());
-        // Truncate: segments below every dirty shard's first uncovered record, and below
-        // the durable watermark, are covered by snapshots.
+        self.truncate_covered_log().await;
+        debug!(snapshots = written, "snapshot round complete");
+    }
+
+    /// Delete this incarnation's segments below the oldest record no snapshot covers.
+    /// The lease's truncation watermark is raised first, so a splitter never mistakes the
+    /// hole for the end of the log.
+    async fn truncate_covered_log(&self) {
         let durable = self.inner.writer.durable_lsn();
-        let mut bound = Lsn::new(durable.epoch, durable.seq + 1);
+        let mut bound = Lsn::new(durable.inc, durable.seq + 1);
         for m in &self.inner.shards {
-            if let Some(d) = m.lock().dirty_since_lsn {
+            let st = m.lock();
+            if st.phase != ShardPhase::Unowned
+                && let Some(d) = st.dirty_since_lsn
+            {
                 bound = bound.min(d);
             }
         }
-        match reader::truncate_before(&self.inner.store, &self.inner.cfg.node_id, bound).await {
-            Ok(n) if n > 0 => {
-                info!(snapshots = written, truncated = n, %bound, "snapshot round complete")
-            }
-            Ok(_) => debug!(snapshots = written, "snapshot round complete"),
+        if bound.inc != self.incarnation() || bound.seq <= self.inner.lease.record().trunc {
+            return;
+        }
+        if let Err(e) = self.inner.lease.raise_trunc(bound.seq).await {
+            warn!(error = %e, "raising the truncation watermark failed; keeping the log");
+            return;
+        }
+        match reader::truncate_before(
+            &self.inner.store,
+            self.node_id(),
+            self.incarnation(),
+            bound.seq,
+        )
+        .await
+        {
+            Ok(n) if n > 0 => info!(truncated = n, %bound, "log truncated"),
+            Ok(_) => {}
             Err(e) => warn!(error = %e, "segment truncation failed"),
         }
     }
@@ -185,21 +251,21 @@ impl Engine {
         }
         let mut written = 0;
         for c in batch {
-            match snapshot::write(&self.inner.store, c.shard, c.lsn, &c.snap).await {
-                Ok(()) => {
+            match snapshot::write(&self.inner.store, &c.key, &c.snap).await {
+                Ok(_) => {
                     written += 1;
                     if let Err(e) = snapshot::prune(
                         &self.inner.store,
-                        c.shard,
+                        c.key.shard,
                         self.inner.cfg.wal.snapshots_to_keep.max(1),
                     )
                     .await
                     {
-                        warn!(shard = %c.shard, error = %e, "snapshot prune failed");
+                        warn!(shard = %c.key.shard, error = %e, "snapshot prune failed");
                     }
                 }
                 Err(e) => {
-                    error!(shard = %c.shard, error = %e, "snapshot write failed; keeping WAL");
+                    error!(shard = %c.key.shard, error = %e, "snapshot write failed; keeping WAL");
                     self.restore_bookkeeping(&c);
                 }
             }
@@ -208,11 +274,18 @@ impl Engine {
     }
 
     fn restore_bookkeeping(&self, c: &Captured) {
-        let mut st = self.inner.shards[c.shard.0 as usize].lock();
+        let mut st = self.inner.shards[c.key.shard.index()].lock();
+        if st.phase == ShardPhase::Unowned {
+            return;
+        }
         st.records_since_snapshot += c.prev.records_since_snapshot;
         st.snapshot_seq = c.prev.snapshot_seq;
-        st.snapshot_lsn = c.prev.snapshot_lsn;
-        st.dirty_since_lsn = c.prev.dirty_since_lsn.or(Some(c.lsn));
+        st.snapshot_key = c.prev.snapshot_key.clone();
+        let captured_at = match &c.key.ptr {
+            LogPtr::At { inc, seq, .. } => Lsn::new(*inc, *seq),
+            _ => Lsn::ZERO,
+        };
+        st.dirty_since_lsn = c.prev.dirty_since_lsn.or(Some(captured_at));
         st.snapshot_at = c.prev.snapshot_at;
     }
 }
@@ -220,8 +293,7 @@ impl Engine {
 const SNAPSHOT_BATCH: usize = 64;
 
 struct Captured {
-    shard: ShardId,
-    lsn: Lsn,
+    key: SnapshotKey,
     snap: ShardSnapshot,
     prev: Bookkeeping,
 }
@@ -229,7 +301,7 @@ struct Captured {
 struct Bookkeeping {
     records_since_snapshot: u64,
     snapshot_seq: u64,
-    snapshot_lsn: Lsn,
+    snapshot_key: Option<SnapshotKey>,
     dirty_since_lsn: Option<Lsn>,
     snapshot_at: Option<DateTime<Utc>>,
 }
@@ -239,7 +311,7 @@ impl Bookkeeping {
         Self {
             records_since_snapshot: st.records_since_snapshot,
             snapshot_seq: st.snapshot_seq,
-            snapshot_lsn: st.snapshot_lsn,
+            snapshot_key: st.snapshot_key.clone(),
             dirty_since_lsn: st.dirty_since_lsn,
             snapshot_at: st.snapshot_at,
         }

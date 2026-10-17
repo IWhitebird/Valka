@@ -4,7 +4,7 @@
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::time::Duration;
 use tracing::{debug, warn};
-use valka_core::{ServerError, TaskStatus, shard_of_task_id};
+use valka_core::{ServerError, TaskStatus};
 use valka_wal::{Envelope, WalRecord};
 
 use crate::engine::{Engine, LeaseDirty};
@@ -12,6 +12,7 @@ use crate::sink::OfferOutcome;
 use crate::state::RunStatus;
 use crate::timers::TimerKind;
 use crate::write_path::decide_outcome;
+use valka_core::ShardId;
 
 impl Engine {
     pub(crate) fn spawn_loops(&self) {
@@ -21,6 +22,14 @@ impl Engine {
         tokio::spawn(async move { me.feeder().await });
         let me = self.clone();
         tokio::spawn(async move { me.snapshotter().await });
+        let me = self.clone();
+        tokio::spawn(async move { me.control_loop().await });
+        tokio::spawn(
+            self.inner
+                .lease
+                .clone()
+                .run(self.inner.shutdown.subscribe()),
+        );
     }
 
     async fn ticker(self) {
@@ -49,12 +58,16 @@ impl Engine {
                 TimerKind::LeaseExpiry { task_id, run_id } => {
                     self.expire_lease(&task_id, &run_id, now)
                 }
+                TimerKind::Unhold { shard } => self.unhold_shard(ShardId(shard)),
                 TimerKind::Evict => {
                     let retention =
                         ChronoDuration::seconds(self.inner.cfg.wal.completed_retention_secs as i64);
                     let mut n = 0;
                     for m in &self.inner.shards {
-                        n += m.lock().evict_terminal_before(now - retention);
+                        let mut st = m.lock();
+                        if st.serving() {
+                            n += st.evict_terminal_before(now - retention);
+                        }
                     }
                     if n > 0 {
                         debug!(evicted = n, "retention sweep");
@@ -69,7 +82,7 @@ impl Engine {
     }
 
     fn promote(&self, task_id: &str, now: DateTime<Utc>) {
-        let Some(shard) = shard_of_task_id(task_id) else {
+        let Some(shard) = self.shard_of(task_id) else {
             return;
         };
         let res = self.mutate(
@@ -119,7 +132,7 @@ impl Engine {
     }
 
     fn expire_lease(&self, task_id: &str, run_id: &str, now: DateTime<Utc>) {
-        let Some(shard) = shard_of_task_id(task_id) else {
+        let Some(shard) = self.shard_of(task_id) else {
             return;
         };
         let sched = self.inner.cfg.scheduler.clone();
@@ -184,13 +197,37 @@ impl Engine {
     }
 
     pub(crate) fn flush_lease_records(&self) {
-        let dirty: LeaseDirty = std::mem::take(&mut *self.inner.lease_dirty.lock());
+        self.flush_lease_records_for(None);
+    }
+
+    /// Write coalesced heartbeat records: all of them, or only one shard's.
+    pub(crate) fn flush_lease_records_for(&self, only: Option<ShardId>) {
+        let dirty: LeaseDirty = {
+            let mut d = self.inner.lease_dirty.lock();
+            match only {
+                None => std::mem::take(&mut *d),
+                Some(s) => {
+                    let (mine, rest): (LeaseDirty, LeaseDirty) = std::mem::take(&mut *d)
+                        .into_iter()
+                        .partition(|(_, v)| v.0 == s);
+                    *d = rest;
+                    mine
+                }
+            }
+        };
         if dirty.is_empty() {
             return;
         }
         let mut envs = Vec::with_capacity(dirty.len());
         for (task_id, (shard, run_id, lease_until)) in dirty {
-            let mut st = self.inner.shards[shard.0 as usize].lock();
+            let mut st = self.inner.shards[shard.index()].lock();
+            // Serving, or releasing (whose final snapshot must include it).
+            if !matches!(
+                st.phase,
+                crate::state::ShardPhase::Serving | crate::state::ShardPhase::Releasing
+            ) {
+                continue;
+            }
             let mut env = Envelope::with_ts(
                 shard,
                 self.inner.clock.now(),
@@ -200,6 +237,7 @@ impl Engine {
                     lease_until,
                 },
             );
+            env.generation = st.generation;
             let was_clean = st.records_since_snapshot == 0;
             st.apply(&mut env);
             if was_clean {
@@ -207,7 +245,9 @@ impl Engine {
             }
             envs.push(env);
         }
-        drop(self.inner.writer.append(envs));
+        if !envs.is_empty() {
+            drop(self.inner.writer.append(envs));
+        }
     }
 
     async fn feeder(self) {

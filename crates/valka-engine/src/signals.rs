@@ -1,7 +1,7 @@
 //! Task signals: create, deliver, acknowledge, reset, list.
 
 use serde_json::Value;
-use valka_core::{ServerError, shard_of_task_id};
+use valka_core::ServerError;
 use valka_wal::WalRecord;
 
 use crate::engine::Engine;
@@ -16,7 +16,7 @@ impl Engine {
         payload: Option<Value>,
     ) -> Result<SignalView, ServerError> {
         let shard = self.shard_for(task_id)?;
-        let signal_id = valka_core::shard::embed_shard(uuid::Uuid::now_v7(), shard).to_string();
+        let signal_id = valka_core::new_id_in_shard(shard).to_string();
         let (durable, _, _, view) = self.mutate(
             shard,
             |st| {
@@ -74,7 +74,7 @@ impl Engine {
         make: impl Fn(String) -> WalRecord,
         expect: SignalStatus,
     ) {
-        let Some(shard) = shard_of_task_id(signal_id) else {
+        let Some(shard) = self.shard_of(signal_id) else {
             return;
         };
         let res = self.mutate(
@@ -101,7 +101,7 @@ impl Engine {
 
     /// Worker disconnected: delivered-but-unacked signals go back to PENDING.
     pub fn reset_signals(&self, task_id: &str) {
-        let Some(shard) = shard_of_task_id(task_id) else {
+        let Some(shard) = self.shard_of(task_id) else {
             return;
         };
         let res = self.mutate(
@@ -129,10 +129,10 @@ impl Engine {
     }
 
     pub fn list_signals(&self, task_id: &str, status: Option<SignalStatus>) -> Vec<SignalView> {
-        let Some(shard) = shard_of_task_id(task_id) else {
+        let Some(shard) = self.shard_of(task_id) else {
             return Vec::new();
         };
-        let st = self.inner.shards[shard.0 as usize].lock();
+        let st = self.inner.shards[shard.index()].lock();
         let mut v: Vec<SignalView> = st
             .signals
             .values()

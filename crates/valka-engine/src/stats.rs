@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::BTreeMap;
-use valka_core::{NUM_SHARDS, ShardId, TaskStatus};
+use valka_core::{ShardId, TaskStatus};
 
 use crate::engine::Engine;
 use crate::state::ShardState;
@@ -37,7 +37,8 @@ impl TaskCounts {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct WalStats {
-    pub epoch: u32,
+    /// This process's incarnation.
+    pub inc: u32,
     pub durable_lsn: String,
     pub next_lsn: String,
     pub unflushed_records: u64,
@@ -57,7 +58,11 @@ pub struct SnapshotStats {
 pub struct NodeStats {
     pub node_id: String,
     pub started_at: DateTime<Utc>,
+    pub num_shards: u32,
     pub shards_owned: usize,
+    /// Renewed its lease recently enough to serve.
+    pub serving: bool,
+    pub lease_age_ms: u64,
     pub shards_with_tasks: usize,
     pub tasks: TaskCounts,
     pub queues: Vec<String>,
@@ -69,7 +74,10 @@ pub struct NodeStats {
 pub struct ShardStats {
     pub shard: u16,
     pub owner: Option<String>,
-    pub epoch: u32,
+    /// Ownership generation (0 when this node does not hold the shard).
+    #[serde(rename = "gen")]
+    pub generation: u64,
+    pub phase: &'static str,
     pub tasks: usize,
     pub pending: usize,
     pub running: usize,
@@ -78,7 +86,7 @@ pub struct ShardStats {
     pub dead_letters: usize,
     pub shard_seq: u64,
     pub snapshot_seq: u64,
-    pub snapshot_lsn: Option<String>,
+    pub snapshot_key: Option<String>,
     pub snapshot_at: Option<DateTime<Utc>>,
     pub records_since_snapshot: u64,
     pub dirty_since_lsn: Option<String>,
@@ -102,6 +110,9 @@ impl Engine {
         let mut shards_with_snapshot = 0;
         for m in &self.inner.shards {
             let st = m.lock();
+            if !st.serving() {
+                continue;
+            }
             if !st.tasks.is_empty() {
                 shards_with_tasks += 1;
             }
@@ -123,12 +134,15 @@ impl Engine {
         NodeStats {
             node_id: self.inner.cfg.node_id.clone(),
             started_at: self.inner.started_at,
-            shards_owned: ShardId::all().filter(|s| self.owns(*s)).count(),
+            num_shards: self.inner.num_shards,
+            shards_owned: self.owned_shards().len(),
+            serving: self.is_serving(),
+            lease_age_ms: self.inner.lease.lease_age().as_millis() as u64,
             shards_with_tasks,
             tasks,
             queues: queues.into_iter().collect(),
             wal: WalStats {
-                epoch: w.epoch(),
+                inc: w.inc(),
                 durable_lsn: w.durable_lsn().to_string(),
                 next_lsn: w.next_lsn().to_string(),
                 unflushed_records: w.unflushed_records(),
@@ -144,7 +158,7 @@ impl Engine {
         }
     }
 
-    /// One row per shard. ~4096 rows; cheap (one lock per shard, counts only).
+    /// One row per shard (`num_shards` rows); cheap (one lock per shard, counts only).
     pub fn shard_stats(&self) -> Vec<ShardStats> {
         self.inner
             .shards
@@ -155,10 +169,10 @@ impl Engine {
     }
 
     pub fn shard_detail(&self, shard: ShardId) -> Option<ShardDetail> {
-        if shard.0 >= NUM_SHARDS {
+        if shard.0 as u32 >= self.inner.num_shards {
             return None;
         }
-        let st = self.inner.shards[shard.0 as usize].lock();
+        let st = self.inner.shards[shard.index()].lock();
         let mut queues: BTreeMap<String, TaskCounts> = BTreeMap::new();
         for t in st.tasks.values() {
             queues
@@ -173,7 +187,7 @@ impl Engine {
     }
 
     fn shard_row(&self, shard: ShardId, st: &ShardState) -> ShardStats {
-        let owned = self.owns(shard);
+        let owned = st.serving();
         let mut pending = 0;
         let mut running = 0;
         let mut retry = 0;
@@ -188,7 +202,8 @@ impl Engine {
         ShardStats {
             shard: shard.0,
             owner: owned.then(|| self.inner.cfg.node_id.clone()),
-            epoch: self.inner.writer.epoch(),
+            generation: st.generation,
+            phase: st.phase.as_str(),
             tasks: st.tasks.len(),
             pending,
             running,
@@ -197,7 +212,7 @@ impl Engine {
             dead_letters: st.dead_letters.len(),
             shard_seq: st.shard_seq,
             snapshot_seq: st.snapshot_seq,
-            snapshot_lsn: (st.snapshot_seq > 0).then(|| st.snapshot_lsn.to_string()),
+            snapshot_key: st.snapshot_key.as_ref().map(|k| k.key()),
             snapshot_at: st.snapshot_at,
             records_since_snapshot: st.records_since_snapshot,
             dirty_since_lsn: st.dirty_since_lsn.map(|l| l.to_string()),

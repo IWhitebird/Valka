@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use valka_core::{ShardId, TaskStatus};
-use valka_wal::{Lsn, TaskSpec};
+use valka_wal::{Lsn, SnapshotKey, TaskSpec};
 
 use crate::view::{CheckpointView, DeadLetterView, RunView, SignalView, TaskView};
 
@@ -279,6 +279,9 @@ pub struct Transition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardSnapshot {
     pub shard: ShardId,
+    /// Ownership generation the state belongs to (also in the snapshot key).
+    #[serde(default, rename = "gen")]
+    pub generation: u64,
     pub shard_seq: u64,
     #[serde(default)]
     pub taken_at: Option<DateTime<Utc>>,
@@ -287,10 +290,38 @@ pub struct ShardSnapshot {
     pub dead_letters: Vec<DeadLetterEntry>,
 }
 
+/// Where a shard is in its ownership lifecycle on this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShardPhase {
+    /// Not ours. Holds no state.
+    Unowned,
+    /// Being claimed: owner record CAS'd, state loading. Not serving yet.
+    Loading,
+    /// Ours: commands are accepted.
+    Serving,
+    /// Being handed over: commands are refused while the final snapshot is written.
+    Releasing,
+}
+
+impl ShardPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ShardPhase::Unowned => "unowned",
+            ShardPhase::Loading => "loading",
+            ShardPhase::Serving => "serving",
+            ShardPhase::Releasing => "releasing",
+        }
+    }
+}
+
 /// The in-RAM state of one shard.
 #[derive(Debug)]
 pub struct ShardState {
     pub shard: ShardId,
+    pub phase: ShardPhase,
+    /// Ownership generation this node serves the shard at. Stamped on every record.
+    pub generation: u64,
     /// Last applied per-shard sequence number.
     pub shard_seq: u64,
     pub tasks: HashMap<String, TaskState>,
@@ -302,8 +333,8 @@ pub struct ShardState {
     pub records_since_snapshot: u64,
     /// `shard_seq` covered by the newest snapshot in the bucket.
     pub snapshot_seq: u64,
-    /// Writer LSN recorded with the newest snapshot (for segment truncation).
-    pub snapshot_lsn: Lsn,
+    /// The newest snapshot this node wrote or loaded for the shard.
+    pub snapshot_key: Option<SnapshotKey>,
     /// LSN of the segment holding this shard's oldest record not yet covered by a
     /// snapshot. Segments below the minimum over all dirty shards can be truncated.
     pub dirty_since_lsn: Option<Lsn>,
@@ -315,6 +346,8 @@ impl ShardState {
     pub fn new(shard: ShardId) -> Self {
         Self {
             shard,
+            phase: ShardPhase::Unowned,
+            generation: 0,
             shard_seq: 0,
             tasks: HashMap::new(),
             signals: HashMap::new(),
@@ -322,17 +355,19 @@ impl ShardState {
             dead_letters: BTreeMap::new(),
             records_since_snapshot: 0,
             snapshot_seq: 0,
-            snapshot_lsn: Lsn::ZERO,
+            snapshot_key: None,
             dirty_since_lsn: None,
             snapshot_at: None,
         }
     }
 
-    pub fn from_snapshot(snap: ShardSnapshot, lsn: Lsn) -> Self {
+    /// Rebuild from a snapshot. The phase is `Unowned` until the caller installs it.
+    pub fn from_snapshot(snap: ShardSnapshot, key: Option<SnapshotKey>) -> Self {
         let mut s = Self::new(snap.shard);
+        s.generation = snap.generation;
         s.shard_seq = snap.shard_seq;
         s.snapshot_seq = snap.shard_seq;
-        s.snapshot_lsn = lsn;
+        s.snapshot_key = key;
         s.snapshot_at = snap.taken_at;
         for t in snap.tasks {
             if let Some(k) = &t.spec.idempotency_key {
@@ -352,12 +387,18 @@ impl ShardState {
     pub fn to_snapshot(&self, taken_at: DateTime<Utc>) -> ShardSnapshot {
         ShardSnapshot {
             shard: self.shard,
+            generation: self.generation,
             shard_seq: self.shard_seq,
             taken_at: Some(taken_at),
             tasks: self.tasks.values().cloned().collect(),
             signals: self.signals.values().cloned().collect(),
             dead_letters: self.dead_letters.values().cloned().collect(),
         }
+    }
+
+    /// Accepting commands.
+    pub fn serving(&self) -> bool {
+        self.phase == ShardPhase::Serving
     }
 
     pub fn is_empty(&self) -> bool {
@@ -373,9 +414,6 @@ impl ShardState {
         )
     }
 
-    /// Apply a record. Assigns `shard_seq` when the envelope carries none (runtime path);
-    /// during replay the envelope's own `shard_seq` is trusted and records at or below the
-    /// current sequence are skipped.
     /// Drop terminal tasks older than `cutoff`. Not a WAL operation: it is a cache
     /// eviction re-applied identically after recovery.
     pub fn evict_terminal_before(&mut self, cutoff: DateTime<Utc>) -> usize {

@@ -141,7 +141,7 @@ async fn e2e_sdk_worker_runs_tasks_end_to_end() {
 
     // Everything the client was acked for is in the WAL.
     server.node.engine.sync().await.unwrap();
-    let recs = valka_wal::reader::read_all(&server.node.store, "e2e", None)
+    let recs = valka_wal::reader::read_node(&server.node.store, "e2e")
         .await
         .unwrap();
     let created = recs

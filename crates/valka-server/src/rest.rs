@@ -92,6 +92,7 @@ pub struct AppState {
     pub(crate) dispatcher: DispatcherService,
     pub(crate) logs: Arc<LogIngester>,
     pub(crate) metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    #[allow(dead_code)] // the gossip ring goes away with request routing (PHASE2 M5)
     pub(crate) cluster: Arc<ClusterManager>,
     pub(crate) node_info: NodeInfo,
     pub(crate) storage_cache: Arc<StorageCache>,
@@ -178,7 +179,7 @@ pub async fn serve_rest(
         node_info,
     );
 
-    let index_path = format!("{}/index.html", &web_dir);
+    let index_path = format!("{web_dir}/index.html");
     let spa_fallback = ServeDir::new(&web_dir).not_found_service(ServeFile::new(index_path));
     let app = api_routes.fallback_service(spa_fallback);
 

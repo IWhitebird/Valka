@@ -17,9 +17,9 @@ tracing = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
 xxhash-rust = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-rand = { workspace = true }
 object_store = { workspace = true }
 bytes = { workspace = true }

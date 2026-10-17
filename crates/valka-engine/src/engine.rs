@@ -1,7 +1,6 @@
-//! The engine: command API, recovery, and background loops.
+//! The engine: command API, node start, and background loops.
 
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -9,15 +8,15 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 use tokio::sync::{Notify, broadcast, watch};
-use tracing::info;
-use valka_core::{SchedulerConfig, ServerError, ShardId, TaskStatus, WalConfig};
-use valka_wal::lsn::keys;
-use valka_wal::ownership::{Ownership, OwnershipCheck};
-use valka_wal::{FailureOutcome, Lsn, Store, WalWriter, WalWriterConfig, reader, snapshot};
+use tracing::{info, warn};
+use valka_core::{ClusterConfig, SchedulerConfig, ServerError, ShardId, TaskStatus, WalConfig};
+use valka_wal::lease::{LeaseConfig, LeaseKeeper, NodeAdvert};
+use valka_wal::{ClusterMeta, FailureOutcome, Lsn, Store, WalWriter, WalWriterConfig, meta};
 
 use crate::clock::{Clock, TokioClock};
+use crate::cluster::Membership;
 use crate::sink::{DispatchableTask, NoopSink, TaskSink};
-use crate::state::{ShardSnapshot, ShardState};
+use crate::state::{ShardPhase, ShardState};
 use crate::timers::TimerWheel;
 use crate::view::CheckpointView;
 
@@ -26,11 +25,12 @@ pub struct EngineConfig {
     pub node_id: String,
     pub wal: WalConfig,
     pub scheduler: SchedulerConfig,
+    pub cluster: ClusterConfig,
+    /// Addresses advertised in this node's lease.
+    pub advert: NodeAdvert,
     /// Feeder cadence (from `MatchingConfig`).
     pub feeder_interval: Duration,
     pub feeder_batch_size: usize,
-    /// Skip the bucket-backed ownership protocol (tests with `SingleNodeOwnership`).
-    pub trust_self: bool,
 }
 
 impl EngineConfig {
@@ -46,9 +46,16 @@ impl EngineConfig {
                 timer_tick_ms: 10,
                 ..Default::default()
             },
+            cluster: ClusterConfig {
+                num_shards: 256,
+                ..ClusterConfig::for_tests()
+            },
+            advert: NodeAdvert {
+                version: "test".into(),
+                ..Default::default()
+            },
             feeder_interval: Duration::from_millis(10),
             feeder_batch_size: 100,
-            trust_self: true,
         }
     }
 }
@@ -116,13 +123,14 @@ pub enum ResultOutcome {
 pub(crate) type PendingKey = (i32, i64, String);
 /// task_id -> (shard, run_id, lease_until) awaiting a coalesced `LeaseExtended` record.
 pub(crate) type LeaseDirty = HashMap<String, (ShardId, String, DateTime<Utc>)>;
-pub(crate) type LoadedSnapshot = Result<Option<(ShardId, Lsn, ShardSnapshot)>, ServerError>;
 
 pub(crate) struct Inner {
     pub(crate) shards: Vec<Mutex<ShardState>>,
+    pub(crate) num_shards: u32,
+    pub(crate) meta: ClusterMeta,
     pub(crate) writer: WalWriter,
+    pub(crate) lease: Arc<LeaseKeeper>,
     pub(crate) store: Store,
-    pub(crate) ownership: Option<Arc<Ownership>>,
     pub(crate) cfg: EngineConfig,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) timers: Mutex<TimerWheel>,
@@ -132,10 +140,19 @@ pub(crate) struct Inner {
     pub(crate) sink: RwLock<Arc<dyn TaskSink>>,
     pub(crate) pending_wake: Notify,
     pub(crate) shutdown: watch::Sender<bool>,
+    /// Set once when this node must exit: the WAL writer failed or the lease was lost.
+    pub(crate) poison: watch::Sender<Option<String>>,
     pub(crate) started_at: DateTime<Utc>,
     pub(crate) last_snapshot_round: Mutex<Option<DateTime<Utc>>>,
     /// Writer bytes committed when the last full snapshot round started.
     pub(crate) log_mark: AtomicU64,
+    pub(crate) membership: Membership,
+    /// Serialises claim and release rounds.
+    pub(crate) moves: tokio::sync::Mutex<()>,
+    /// When each shard last moved to or from this node (for `min_residency`).
+    pub(crate) moved_at: Mutex<HashMap<ShardId, tokio::time::Instant>>,
+    /// PENDING tasks recovered by a claim are not dispatched before this (reconcile grace).
+    pub(crate) hold_until: Mutex<HashMap<ShardId, tokio::time::Instant>>,
 }
 
 #[derive(Clone)]
@@ -144,8 +161,9 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Open (or create) the engine against a bucket: claim ownership, load snapshots,
-    /// replay the WAL, start background loops.
+    /// Start a node on a bucket: take the lease (fencing the previous run of this node id),
+    /// split the logs it left behind, claim the shards placement gives it, and start the
+    /// background loops.
     pub async fn open(store: Store, cfg: EngineConfig) -> Result<Self, ServerError> {
         Self::open_with(store, cfg, TokioClock::new(), Arc::new(NoopSink)).await
     }
@@ -157,106 +175,58 @@ impl Engine {
         sink: Arc<dyn TaskSink>,
     ) -> Result<Self, ServerError> {
         let node_id = cfg.node_id.clone();
-        let (ownership, epoch): (Option<Arc<Ownership>>, u32) = if cfg.trust_self {
-            let last = reader::list_segments(&store, &node_id, None)
-                .await?
-                .last()
-                .map(|(l, _)| l.epoch)
-                .unwrap_or(0);
-            (None, last + 1)
-        } else {
-            let o = Ownership::claim_all(store.clone(), &node_id).await?;
-            let e = o.epoch();
-            (Some(o), e)
-        };
-
-        // 1. Snapshots: one LIST, then parallel GETs of the newest per shard.
-        let started = std::time::Instant::now();
-        let mut shards: Vec<ShardState> = ShardId::all().map(ShardState::new).collect();
-        let all_snaps = store.list("snapshots/").await?;
-        let snapshotted: BTreeSet<ShardId> = all_snaps
-            .iter()
-            .filter(|(key, _)| keys::snapshot_lsn(key).is_some())
-            .filter_map(|(key, _)| {
-                key.strip_prefix("snapshots/")
-                    .and_then(|r| r.split('/').next())
-                    .and_then(|s| s.parse::<u16>().ok())
-                    .map(ShardId)
-            })
-            .collect();
-        let loaded: Vec<LoadedSnapshot> = futures::stream::iter(snapshotted)
-            .map(|shard| {
-                let store = store.clone();
-                async move {
-                    Ok(snapshot::load_latest::<ShardSnapshot>(&store, shard)
-                        .await?
-                        .map(|(lsn, snap)| (shard, lsn, snap)))
-                }
-            })
-            .buffer_unordered(64)
-            .collect()
-            .await;
-        let mut snapshot_count = 0;
-        for r in loaded {
-            if let Some((shard, lsn, snap)) = r? {
-                shards[shard.0 as usize] = ShardState::from_snapshot(snap, lsn);
-                snapshot_count += 1;
+        if !valka_wal::valid_node_id(&node_id) {
+            return Err(ServerError::InvalidArgument(format!(
+                "node id `{node_id}`: use 1-64 characters from [A-Za-z0-9_-]"
+            )));
+        }
+        let meta = meta::ensure(&store, cfg.cluster.num_shards).await?;
+        if cfg.cluster.enabled {
+            if matches!(store.backend_label(), "local" | "memory") {
+                return Err(ServerError::InvalidArgument(format!(
+                    "cluster.enabled needs an S3-compatible bucket; the `{}` backend only \
+                     works inside one process",
+                    store.backend_label()
+                )));
             }
+            if cfg.cluster.token.as_deref().is_none_or(str::is_empty) {
+                return Err(ServerError::InvalidArgument(
+                    "cluster.enabled requires cluster.token".into(),
+                ));
+            }
+            meta::self_test(&store, &node_id).await?;
         }
 
-        // 2. Replay every segment in order, applying only records past each shard's
-        //    snapshot sequence.
-        let mut replayed = 0u64;
-        let mut skipped = 0u64;
-        let mut last_lsn: Option<Lsn> = None;
-        let segments = reader::list_segments(&store, &node_id, None).await?;
-        for (lsn, key) in segments {
-            for mut env in reader::read_segment(&store, &key).await? {
-                let st = &mut shards[env.shard.0 as usize];
-                if env.shard_seq <= st.shard_seq {
-                    skipped += 1;
-                    continue;
-                }
-                if st.dirty_since_lsn.is_none() {
-                    st.dirty_since_lsn = Some(lsn);
-                }
-                st.apply(&mut env);
-                replayed += 1;
-            }
-            last_lsn = Some(lsn);
-        }
-        info!(
-            node = %node_id,
-            epoch,
-            snapshots = snapshot_count,
-            replayed,
-            skipped,
-            last_lsn = ?last_lsn,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "recovery complete"
-        );
-
-        // 3. Writer starts a fresh epoch.
-        let check: Arc<dyn OwnershipCheck> = match &ownership {
-            Some(o) => o.clone(),
-            None => Arc::new(valka_wal::SingleNodeOwnership),
-        };
+        let (lease, _prev) = LeaseKeeper::start(
+            store.clone(),
+            &node_id,
+            cfg.advert.clone(),
+            LeaseConfig::from_core(&cfg.cluster),
+        )
+        .await?;
+        let inc = lease.inc();
         let writer = WalWriter::start(
             store.clone(),
             node_id.clone(),
-            Lsn::new(epoch, 1),
+            Lsn::new(inc, 1),
             WalWriterConfig::from_core(&cfg.wal),
-            check,
+            lease.clone(),
         );
 
+        let num_shards = meta.num_shards;
         let (events, _) = broadcast::channel(4096);
         let (shutdown, _) = watch::channel(false);
         let clock_now = clock.now();
+        let membership = Membership::new(&node_id, &cfg.cluster);
         let inner = Arc::new(Inner {
-            shards: shards.into_iter().map(Mutex::new).collect(),
+            shards: ShardId::all(num_shards)
+                .map(|s| Mutex::new(ShardState::new(s)))
+                .collect(),
+            num_shards,
+            meta,
             writer,
+            lease,
             store,
-            ownership,
             cfg,
             clock,
             timers: Mutex::new(TimerWheel::default()),
@@ -266,13 +236,36 @@ impl Engine {
             sink: RwLock::new(sink),
             pending_wake: Notify::new(),
             shutdown,
+            poison: watch::Sender::new(None),
             started_at: clock_now,
             last_snapshot_round: Mutex::new(None),
             log_mark: AtomicU64::new(0),
+            membership,
+            moves: tokio::sync::Mutex::new(()),
+            moved_at: Mutex::new(HashMap::new()),
+            hold_until: Mutex::new(HashMap::new()),
         });
         let engine = Engine { inner };
-        engine.rebuild_indexes();
+        engine.forward_poison();
+        let started = std::time::Instant::now();
+
+        // The logs this node id left behind: split them so their shards can be claimed.
+        for u in engine.inner.lease.record().unsplit {
+            engine.split_incarnation(&node_id, u.inc, u.trunc).await?;
+            engine.inner.lease.drop_unsplit(u.inc).await?;
+        }
         engine.spawn_loops();
+        // First placement round now, so a node that can serve does before `open` returns.
+        engine.refresh_membership().await;
+        let claimed = engine.placement_round().await;
+        info!(
+            node = %node_id,
+            inc,
+            num_shards,
+            claimed,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "node started"
+        );
         Ok(engine)
     }
 
@@ -290,6 +283,19 @@ impl Engine {
         &self.inner.cfg.node_id
     }
 
+    /// This process's incarnation.
+    pub fn incarnation(&self) -> u32 {
+        self.inner.lease.inc()
+    }
+
+    pub fn num_shards(&self) -> u32 {
+        self.inner.num_shards
+    }
+
+    pub fn cluster_meta(&self) -> &ClusterMeta {
+        &self.inner.meta
+    }
+
     pub fn store(&self) -> &Store {
         &self.inner.store
     }
@@ -298,38 +304,133 @@ impl Engine {
         &self.inner.clock
     }
 
+    pub fn config(&self) -> &EngineConfig {
+        &self.inner.cfg
+    }
+
     pub fn durable_lsn(&self) -> Lsn {
         self.inner.writer.durable_lsn()
     }
 
-    /// The WAL writer could not commit; the node must restart to reconverge.
+    /// Why this node must exit (WAL writer failed, or lease lost), once it must.
     pub fn poisoned(&self) -> Option<String> {
-        self.inner.writer.poisoned()
+        self.inner.poison.borrow().clone()
     }
 
     pub fn poison_watch(&self) -> watch::Receiver<Option<String>> {
-        self.inner.writer.poison_watch()
+        self.inner.poison.subscribe()
     }
 
+    /// Renewed recently enough that nobody can have taken over this node's shards.
+    pub fn is_serving(&self) -> bool {
+        self.inner.lease.is_serving() && self.poisoned().is_none()
+    }
+
+    /// This node currently serves `shard`.
     pub fn owns(&self, shard: ShardId) -> bool {
-        match &self.inner.ownership {
-            Some(o) => o.owns(shard),
-            None => true,
-        }
+        self.inner
+            .shards
+            .get(shard.index())
+            .is_some_and(|m| m.lock().serving())
+    }
+
+    pub fn shard_phase(&self, shard: ShardId) -> Option<ShardPhase> {
+        self.inner.shards.get(shard.index()).map(|m| m.lock().phase)
+    }
+
+    /// Shards this node serves.
+    pub fn owned_shards(&self) -> Vec<ShardId> {
+        self.inner
+            .shards
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.lock().serving())
+            .map(|(i, _)| ShardId(i as u16))
+            .collect()
+    }
+
+    fn forward_poison(&self) {
+        let poison = self.inner.poison.clone();
+        let mut writer = self.inner.writer.poison_watch();
+        let mut lease = self.inner.lease.fence_watch();
+        tokio::spawn(async move {
+            let why = tokio::select! {
+                r = writer.wait_for(|p| p.is_some()) => r.ok().and_then(|p| p.clone()),
+                r = lease.wait_for(|p| p.is_some()) => r.ok().and_then(|p| p.clone()),
+            };
+            if let Some(why) = why {
+                poison.send_replace(Some(why));
+            }
+        });
     }
 
     // ───────────────────────── lifecycle ─────────────────────────
 
-    /// Flush pending records, snapshot dirty shards, stop loops.
+    /// Flush pending records, snapshot dirty shards, stop loops, and mark the lease dead
+    /// so nobody waits out a lease timeout. The shards stay owned by this incarnation;
+    /// the next start of this node id (or any other node) splits what is left of its log
+    /// and claims them. Use [`Engine::drain`] to hand them over to live peers instead.
     pub async fn shutdown(&self) -> Result<(), ServerError> {
         let _ = self.inner.shutdown.send(true);
         self.flush_lease_records();
         self.inner.writer.sync().await?;
         self.snapshot_dirty_shards(true).await;
+        self.inner
+            .lease
+            .set_state(valka_wal::LeaseState::Dead)
+            .await?;
         Ok(())
     }
 
-    /// Force a snapshot round now (tests).
+    /// Stop on SIGTERM: hand shards over when live peers can take them, otherwise keep
+    /// them (a restart of this node reclaims them without replaying much).
+    pub async fn stop(&self) -> Result<(), ServerError> {
+        if self.live_peers().is_empty() {
+            self.shutdown().await
+        } else {
+            self.drain().await
+        }
+    }
+
+    /// Graceful exit: mark the lease draining, release every shard with a final snapshot
+    /// (so whoever takes them over replays nothing), then mark the lease dead.
+    pub async fn drain(&self) -> Result<(), ServerError> {
+        self.inner
+            .lease
+            .set_state(valka_wal::LeaseState::Draining)
+            .await?;
+        let _ = self.inner.shutdown.send(true);
+        self.flush_lease_records();
+        self.inner.writer.sync().await?;
+        let shards = self.owned_shards();
+        let released = self.release_shards(shards.clone(), usize::MAX).await;
+        if released < shards.len() {
+            warn!(
+                released,
+                owned = shards.len(),
+                "drain released only some shards"
+            );
+        }
+        // Everything this incarnation wrote is covered by final snapshots now.
+        let next = self.inner.writer.next_lsn().seq;
+        if released == shards.len() && self.inner.lease.raise_trunc(next).await.is_ok() {
+            let _ = valka_wal::reader::truncate_before(
+                &self.inner.store,
+                self.node_id(),
+                self.incarnation(),
+                next,
+            )
+            .await;
+        }
+        self.inner
+            .lease
+            .set_state(valka_wal::LeaseState::Dead)
+            .await?;
+        info!(released, "drained");
+        Ok(())
+    }
+
+    /// Force a snapshot round now (tests, admin).
     pub async fn snapshot_now(&self) {
         self.inner.writer.sync().await.ok();
         self.snapshot_dirty_shards(true).await;
@@ -338,6 +439,11 @@ impl Engine {
     /// Wait until everything appended so far is durable.
     pub async fn sync(&self) -> Result<Lsn, ServerError> {
         Ok(self.inner.writer.sync().await?)
+    }
+
+    /// Stop background loops without flushing (tests: simulate `kill -9`).
+    pub fn halt(&self) {
+        let _ = self.inner.shutdown.send(true);
     }
 }
 

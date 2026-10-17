@@ -2,7 +2,7 @@
 
 use chrono::Duration as ChronoDuration;
 use serde_json::Value;
-use valka_core::{ServerError, ShardId, TaskStatus, shard_of_task_id};
+use valka_core::{ServerError, ShardId, TaskStatus};
 use valka_wal::{TaskSpec, WalRecord};
 
 use crate::engine::{CreateTask, DispatchInfo, Engine, FailResult, ResultOutcome, RunResult};
@@ -18,8 +18,11 @@ impl Engine {
                 "queue_name and task_name are required".into(),
             ));
         }
-        let (uuid, shard) =
-            valka_core::new_task_uuid(&req.queue_name, req.idempotency_key.as_deref());
+        let (uuid, shard) = valka_core::new_task_uuid(
+            &req.queue_name,
+            req.idempotency_key.as_deref(),
+            self.inner.num_shards,
+        );
         let id = uuid.to_string();
         let now = self.inner.clock.now();
         let spec = TaskSpec {
@@ -54,8 +57,8 @@ impl Engine {
     }
 
     pub fn get_task(&self, task_id: &str) -> Option<TaskView> {
-        let shard = shard_of_task_id(task_id)?;
-        self.inner.shards[shard.0 as usize]
+        let shard = self.shard_of(task_id)?;
+        self.inner.shards[shard.index()]
             .lock()
             .tasks
             .get(task_id)
@@ -146,7 +149,7 @@ impl Engine {
     }
 
     pub async fn delete_task(&self, task_id: &str) -> Result<bool, ServerError> {
-        let Some(shard) = shard_of_task_id(task_id) else {
+        let Some(shard) = self.shard_of(task_id) else {
             return Ok(false);
         };
         let res = self.mutate(
@@ -180,7 +183,7 @@ impl Engine {
         let mut total = 0usize;
         let mut waits = Vec::new();
         let mut all_transitions = Vec::new();
-        for shard in ShardId::all() {
+        for shard in ShardId::all(self.inner.num_shards) {
             let res = self.mutate(
                 shard,
                 |st| {
@@ -210,7 +213,7 @@ impl Engine {
     pub fn dispatch(&self, task_id: &str, worker_id: &str) -> Result<DispatchInfo, ServerError> {
         let shard = self.shard_for(task_id)?;
         let now = self.inner.clock.now();
-        let run_id = valka_core::shard::embed_shard(uuid::Uuid::now_v7(), shard).to_string();
+        let run_id = valka_core::new_id_in_shard(shard).to_string();
         let node_id = self.inner.cfg.node_id.clone();
         let grace = self.inner.cfg.scheduler.lease_grace_secs;
         let (durable, transitions, info, _) = self.mutate(
@@ -368,8 +371,8 @@ impl Engine {
     }
 
     fn run_end(&self, task_id: &str, run_id: &str) -> Option<RunEnd> {
-        let shard = shard_of_task_id(task_id)?;
-        self.inner.shards[shard.0 as usize]
+        let shard = self.shard_of(task_id)?;
+        self.inner.shards[shard.index()]
             .lock()
             .tasks
             .get(task_id)?
@@ -384,10 +387,10 @@ impl Engine {
         let now = self.inner.clock.now();
         let lease = now + ChronoDuration::seconds(self.inner.cfg.scheduler.heartbeat_lease_secs);
         for task_id in task_ids {
-            let Some(shard) = shard_of_task_id(task_id) else {
+            let Some(shard) = self.shard_of(task_id) else {
                 continue;
             };
-            let mut st = self.inner.shards[shard.0 as usize].lock();
+            let mut st = self.inner.shards[shard.index()].lock();
             let Some(t) = st.tasks.get_mut(task_id) else {
                 continue;
             };
@@ -412,8 +415,8 @@ impl Engine {
     }
 
     pub fn runs_for_task(&self, task_id: &str) -> Option<Vec<RunView>> {
-        let shard = shard_of_task_id(task_id)?;
-        self.inner.shards[shard.0 as usize]
+        let shard = self.shard_of(task_id)?;
+        self.inner.shards[shard.index()]
             .lock()
             .tasks
             .get(task_id)

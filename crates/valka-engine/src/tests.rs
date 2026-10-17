@@ -60,6 +60,22 @@ async fn settle() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
+/// Every record node-a wrote that is still in the bucket.
+async fn node_records(store: &Store) -> Vec<(valka_wal::Lsn, valka_wal::Envelope)> {
+    reader::read_node(store, "node-a").await.unwrap()
+}
+
+/// Snapshots that hold at least one record (acquisition snapshots of empty shards do not).
+async fn snapshots_with_records(store: &Store) -> usize {
+    valka_wal::snapshot::list_all(store)
+        .await
+        .unwrap()
+        .values()
+        .flatten()
+        .filter(|k| k.seq > 0)
+        .count()
+}
+
 #[tokio::test(start_paused = true)]
 async fn create_get_list_and_idempotency() {
     let store = Store::memory();
@@ -99,7 +115,7 @@ async fn create_get_list_and_idempotency() {
 
     // Everything is in the bucket.
     e.sync().await.unwrap();
-    let recs = reader::read_all(&store, "node-a", None).await.unwrap();
+    let recs = node_records(&store).await;
     assert_eq!(recs.len(), 3);
 }
 
@@ -229,7 +245,7 @@ async fn lease_expiry_retries_and_heartbeat_extends() {
 
     // Heartbeat records were coalesced into the WAL.
     e.sync().await.unwrap();
-    let recs = reader::read_all(&store, "node-a", None).await.unwrap();
+    let recs = node_records(&store).await;
     assert!(
         recs.iter()
             .any(|(_, r)| r.record.kind() == "lease_extended")
@@ -364,8 +380,14 @@ async fn crash_and_recover_without_snapshot() {
     assert_eq!(e2.pending_count("q"), 1);
     // Recovered RUNNING task got a grace lease and can still be completed by its worker.
     e2.complete_run(&running_id, &run_id, None).await.unwrap();
-    // The new epoch is higher than the old one.
-    assert_eq!(e2.durable_lsn().epoch, 2);
+    // The new incarnation is higher than the old one, and the old log was split away.
+    assert_eq!(e2.incarnation(), 2);
+    assert!(
+        reader::list_segments(&store, "node-a", 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -397,7 +419,9 @@ async fn snapshot_truncates_wal_and_recovery_uses_it() {
         let d = e.dispatch(&ids[0], "w").unwrap();
         e.complete_run(&ids[0], &d.run_id, None).await.unwrap();
         e.snapshot_now().await;
-        let segs = reader::list_segments(&store, "node-a", None).await.unwrap();
+        let segs = reader::list_segments(&store, "node-a", e.incarnation())
+            .await
+            .unwrap();
         assert!(
             segs.len() <= 1,
             "all covered segments truncated, got {}",
@@ -423,8 +447,7 @@ async fn shutdown_flushes_and_snapshots() {
     let e = open(&store).await;
     let t = e.create_task(create("q")).await.unwrap();
     e.shutdown().await.unwrap();
-    let snaps = store.list("snapshots/").await.unwrap();
-    assert_eq!(snaps.len(), 1);
+    assert_eq!(snapshots_with_records(&store).await, 1);
     let e2 = open(&store).await;
     assert!(e2.get_task(&t.id).is_some());
 }
@@ -564,16 +587,15 @@ async fn crash_replay_property_under_faults() {
 #[tokio::test(start_paused = true)]
 async fn ownership_loss_poisons_writer_and_fails_acks() {
     // The zombie case: process A still runs while a replacement process for the same
-    // node id claims the assignment at a higher epoch. A's next commit must be refused:
-    // no ack, writer poisoned, later writes fail fast. B replays A's log and serves.
+    // node id takes its lease at a higher incarnation. A's next commit must be refused:
+    // no ack, writer poisoned, later writes fail fast. B splits A's log and serves.
     let store = Store::memory();
-    let mut cfg = EngineConfig::for_tests("a");
-    cfg.trust_self = false;
+    let cfg = EngineConfig::for_tests("a");
     let a = Engine::open(store.clone(), cfg.clone()).await.unwrap();
     let first = a.create_task(create("q")).await.unwrap();
 
     let b = Engine::open(store.clone(), cfg).await.unwrap();
-    assert_eq!(b.durable_lsn().epoch, 2);
+    assert_eq!(b.incarnation(), 2);
     assert_eq!(b.get_task(&first.id).unwrap().status, TaskStatus::Pending);
 
     let err = a.create_task(create("q")).await.unwrap_err();
@@ -613,13 +635,15 @@ async fn concurrent_creates_are_batched_and_all_durable() {
         assert_eq!(e.pending_count(&format!("q{q}")), 100);
     }
     e.sync().await.unwrap();
-    let segs = reader::list_segments(&store, "node-a", None).await.unwrap();
+    let segs = reader::list_segments(&store, "node-a", e.incarnation())
+        .await
+        .unwrap();
     assert!(
         segs.len() < 50,
         "group commit must batch: 500 records landed in {} segments",
         segs.len()
     );
-    let recs = reader::read_all(&store, "node-a", None).await.unwrap();
+    let recs = node_records(&store).await;
     assert_eq!(
         recs.iter()
             .filter(|(_, r)| r.record.kind() == "task_created")
@@ -692,7 +716,7 @@ async fn corrupt_segment_fails_recovery_cleanly() {
         e.create_task(create("q")).await.unwrap();
         e.sync().await.unwrap();
     }
-    let (_, key) = reader::list_segments(&store, "node-a", None)
+    let (_, key) = reader::list_node_segments(&store, "node-a")
         .await
         .unwrap()
         .pop()
@@ -767,7 +791,7 @@ async fn lost_put_ack_retry_hits_create_conflict_and_succeeds() {
     let t = e.create_task(create("q")).await.unwrap();
     faults.set_lost_put_ack_rate(0);
     e.sync().await.unwrap();
-    let recs = reader::read_all(&store, "node-a", None).await.unwrap();
+    let recs = node_records(&store).await;
     assert_eq!(
         recs.iter()
             .filter(|(_, r)| r.record.task_id() == Some(t.id.as_str()))
@@ -787,7 +811,9 @@ async fn node_and_shard_stats_reflect_state() {
 
     let s = e.stats();
     assert_eq!(s.node_id, "node-a");
-    assert_eq!(s.shards_owned, 4096);
+    assert_eq!(s.shards_owned, 256);
+    assert_eq!(s.num_shards, 256);
+    assert!(s.serving);
     assert_eq!(s.tasks.total, 2);
     assert_eq!(s.tasks.pending, 1);
     assert_eq!(s.tasks.running, 1);
@@ -800,7 +826,11 @@ async fn node_and_shard_stats_reflect_state() {
     assert_eq!(s.snapshots.shards_with_snapshot, 0);
 
     let rows = e.shard_stats();
-    assert_eq!(rows.len(), 4096);
+    assert_eq!(rows.len(), 256);
+    assert!(
+        rows.iter()
+            .all(|r| r.phase == "serving" && r.generation == 1)
+    );
     let with_tasks: Vec<_> = rows.iter().filter(|r| r.tasks > 0).collect();
     assert!(!with_tasks.is_empty() && with_tasks.len() <= 2);
     assert!(
@@ -809,11 +839,11 @@ async fn node_and_shard_stats_reflect_state() {
             .all(|r| r.owner.as_deref() == Some("node-a") && r.records_since_snapshot > 0)
     );
 
-    let shard_a = valka_core::shard_of_task_id(&a.id).unwrap();
+    let shard_a = e.shard_of(&a.id).unwrap();
     let d = e.shard_detail(shard_a).unwrap();
     assert_eq!(d.stats.shard, shard_a.0);
     assert_eq!(d.queues["q1"].running, 1);
-    assert!(e.shard_detail(valka_core::ShardId(4096)).is_none());
+    assert!(e.shard_detail(valka_core::ShardId(256)).is_none());
 
     e.snapshot_now().await;
     let s = e.stats();
@@ -822,19 +852,19 @@ async fn node_and_shard_stats_reflect_state() {
     let d = e.shard_detail(shard_a).unwrap();
     assert!(d.stats.snapshot_at.is_some());
     assert_eq!(d.stats.records_since_snapshot, 0);
-    assert!(d.stats.snapshot_lsn.is_some());
+    assert!(d.stats.snapshot_key.is_some());
 
-    // snapshot_at survives a restart via the snapshot payload
+    // After a crash the log is split into snapshots, and the claim snapshots each shard
+    // again: the recovered shard is clean, at the next generation.
     e.complete_run(&a.id, &run.run_id, None).await.unwrap();
     e.sync().await.unwrap();
     drop(e);
     let e2 = open(&store).await;
     let d = e2.shard_detail(shard_a).unwrap();
     assert!(d.stats.snapshot_at.is_some());
-    assert_eq!(
-        d.stats.records_since_snapshot, 1,
-        "the completion replayed on top of the snapshot"
-    );
+    assert_eq!(d.stats.generation, 2);
+    assert_eq!(d.stats.records_since_snapshot, 0);
+    assert_eq!(e2.get_task(&a.id).unwrap().status, TaskStatus::Completed);
     let _ = b;
 }
 
@@ -902,7 +932,7 @@ async fn checkpoints_carry_into_the_retry_dispatch() {
     assert_eq!(all[1].output, serde_json::json!([3]));
 
     e.sync().await.unwrap();
-    let recs = reader::read_all(&store, "node-a", None).await.unwrap();
+    let recs = node_records(&store).await;
     let written = recs
         .iter()
         .filter(|(_, r)| r.record.kind() == "task_checkpointed")
@@ -1062,8 +1092,9 @@ async fn snapshot_never_captures_records_that_failed_to_become_durable() {
     faults.set_puts_down(false);
 
     e.snapshot_now().await;
-    assert!(
-        store.list("snapshots/").await.unwrap().is_empty(),
+    assert_eq!(
+        snapshots_with_records(&store).await,
+        0,
         "a snapshot was written although the WAL could not be synced"
     );
     drop(e);
@@ -1089,9 +1120,11 @@ async fn snapshot_round_spanning_many_batches_covers_every_dirty_shard() {
             "tasks should span several snapshot batches, got {dirty}"
         );
         e.snapshot_now().await;
-        let snaps = store.list("snapshots/").await.unwrap().len();
+        let snaps = snapshots_with_records(&store).await;
         assert_eq!(snaps, dirty, "one snapshot per dirty shard");
-        let segs = reader::list_segments(&store, "node-a", None).await.unwrap();
+        let segs = reader::list_segments(&store, "node-a", e.incarnation())
+            .await
+            .unwrap();
         assert!(
             segs.len() <= 1,
             "covered segments truncated, got {}",
@@ -1125,15 +1158,17 @@ async fn log_budget_forces_a_snapshot_round_before_the_interval() {
         req.input = Some(serde_json::json!({"blob": incompressible(2048)}));
         e.create_task(req).await.unwrap();
     }
-    assert!(store.list("snapshots/").await.unwrap().is_empty());
+    assert_eq!(snapshots_with_records(&store).await, 0);
 
     tokio::time::advance(Duration::from_millis(1500)).await;
     settle().await;
     assert!(
-        !store.list("snapshots/").await.unwrap().is_empty(),
+        snapshots_with_records(&store).await > 0,
         "the budget, not the hour-long interval, triggered the round"
     );
-    let segs = reader::list_segments(&store, "node-a", None).await.unwrap();
+    let segs = reader::list_segments(&store, "node-a", e.incarnation())
+        .await
+        .unwrap();
     assert!(
         segs.len() <= 1,
         "covered segments truncated, got {}",
@@ -1157,7 +1192,7 @@ async fn zero_log_budget_leaves_rounds_to_the_interval() {
     }
     tokio::time::advance(Duration::from_secs(5)).await;
     settle().await;
-    assert!(store.list("snapshots/").await.unwrap().is_empty());
+    assert_eq!(snapshots_with_records(&store).await, 0);
 }
 
 fn completed(v: serde_json::Value) -> crate::RunResult {
@@ -1172,9 +1207,8 @@ fn failed(error: &str) -> crate::RunResult {
 }
 
 async fn records_of(store: &Store, kind: &str) -> usize {
-    reader::read_all(store, "node-a", None)
+    node_records(store)
         .await
-        .unwrap()
         .iter()
         .filter(|(_, r)| r.record.kind() == kind)
         .count()

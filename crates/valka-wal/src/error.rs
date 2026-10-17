@@ -17,11 +17,8 @@ pub enum WalError {
     #[error("write not durable after retries: {0}")]
     NotDurable(String),
 
-    #[error("shard ownership lost")]
-    OwnershipLost,
-
-    #[error("assignment conflict: {0}")]
-    AssignmentConflict(String),
+    #[error("fenced: {0}")]
+    Fenced(String),
 
     #[error("invalid configuration: {0}")]
     Config(String),
@@ -43,9 +40,7 @@ impl From<WalError> for valka_core::ServerError {
     fn from(e: WalError) -> Self {
         match e {
             WalError::NotDurable(m) => valka_core::ServerError::Unavailable(m),
-            WalError::OwnershipLost => {
-                valka_core::ServerError::Unavailable("ownership lost".into())
-            }
+            WalError::Fenced(m) => valka_core::ServerError::Unavailable(format!("fenced: {m}")),
             WalError::WriterClosed => valka_core::ServerError::Unavailable("writer closed".into()),
             other => valka_core::ServerError::Storage(other.to_string()),
         }

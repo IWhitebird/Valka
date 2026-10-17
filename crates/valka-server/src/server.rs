@@ -35,14 +35,32 @@ impl Node {
 
         let matching = MatchingService::new(config.matching.clone());
 
+        let c = &config.cluster;
         let engine_cfg = EngineConfig {
             node_id: node_id.0.clone(),
             wal: config.wal.clone(),
             scheduler: config.scheduler.clone(),
+            cluster: c.clone(),
+            advert: valka_wal::lease::NodeAdvert {
+                grpc_addr: Some(
+                    c.advertise_grpc_addr
+                        .clone()
+                        .unwrap_or_else(|| config.grpc_addr.clone()),
+                ),
+                http_addr: Some(
+                    c.advertise_http_addr
+                        .clone()
+                        .unwrap_or_else(|| config.http_addr.clone()),
+                ),
+                internal_addr: c.enabled.then(|| {
+                    c.advertise_internal_addr
+                        .clone()
+                        .unwrap_or_else(|| c.internal_addr.clone())
+                }),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
             feeder_interval: Duration::from_millis(config.matching.feeder_interval_ms.max(1)),
             feeder_batch_size: config.matching.feeder_batch_size.max(1),
-            // The memory backend is a single process by definition.
-            trust_self: config.storage.backend == "memory",
         };
         let engine = Engine::open_with(
             store.clone(),

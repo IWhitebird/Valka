@@ -1,7 +1,7 @@
 //! The runnable-task index and the hand-off to the matching layer.
 
 use std::collections::BTreeSet;
-use valka_core::{TaskStatus, shard_of_task_id};
+use valka_core::TaskStatus;
 
 use crate::engine::{Engine, PendingKey};
 use crate::sink::{DispatchableTask, OfferOutcome};
@@ -46,10 +46,10 @@ impl Engine {
         };
         let mut out = Vec::with_capacity(keys.len());
         for (_, _, task_id) in keys {
-            let Some(shard) = shard_of_task_id(&task_id) else {
+            let Some(shard) = self.shard_of(&task_id) else {
                 continue;
             };
-            let mut st = self.inner.shards[shard.0 as usize].lock();
+            let mut st = self.inner.shards[shard.index()].lock();
             let Some(t) = st.tasks.get_mut(&task_id) else {
                 continue;
             };
@@ -64,11 +64,11 @@ impl Engine {
 
     /// The matching layer dropped a task it had been offered; make it runnable again.
     pub fn unoffer(&self, task_id: &str) {
-        let Some(shard) = shard_of_task_id(task_id) else {
+        let Some(shard) = self.shard_of(task_id) else {
             return;
         };
         let key = {
-            let mut st = self.inner.shards[shard.0 as usize].lock();
+            let mut st = self.inner.shards[shard.index()].lock();
             let Some(t) = st.tasks.get_mut(task_id) else {
                 return;
             };
@@ -107,11 +107,11 @@ impl Engine {
     /// A task just became PENDING: if due, try the sink (hot path); otherwise arm its
     /// promote timer.
     pub(crate) fn index_or_offer(&self, task_id: &str) {
-        let Some(shard) = shard_of_task_id(task_id) else {
+        let Some(shard) = self.shard_of(task_id) else {
             return;
         };
         let (dispatchable, promote_at, key, queue) = {
-            let mut st = self.inner.shards[shard.0 as usize].lock();
+            let mut st = self.inner.shards[shard.index()].lock();
             let Some(t) = st.tasks.get_mut(task_id) else {
                 return;
             };
@@ -146,7 +146,7 @@ impl Engine {
         match sink.offer(d) {
             OfferOutcome::Matched | OfferOutcome::Buffered => {}
             OfferOutcome::Rejected => {
-                if let Some(t) = self.inner.shards[shard.0 as usize]
+                if let Some(t) = self.inner.shards[shard.index()]
                     .lock()
                     .tasks
                     .get_mut(task_id)

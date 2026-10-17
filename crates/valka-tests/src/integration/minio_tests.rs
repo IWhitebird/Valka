@@ -78,5 +78,73 @@ async fn minio_lifecycle_and_recovery() {
         node.engine.get_task(&ids[0]).unwrap().status,
         TaskStatus::Completed
     );
-    assert_eq!(node.engine.pending_count("q"), 5);
+    // Recovered PENDING tasks are runnable again: in the engine's index or already handed
+    // to matching by the feeder.
+    assert_eq!(
+        node.engine.pending_count("q") + node.matching.buffered("q"),
+        5
+    );
+}
+
+#[tokio::test]
+async fn minio_passes_the_storage_self_test() {
+    valka_wal::meta::self_test(&s3_store(), "selftest-node")
+        .await
+        .expect("MinIO keeps the conditional-write and LIST promises");
+}
+
+/// Two engines on one real bucket: B tombstones and splits A after A dies, and every
+/// acked task survives. Real time, short leases.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn minio_two_node_takeover() {
+    use valka_engine::{CreateTask, Engine, EngineConfig, NoopSink, TokioClock};
+    let store = s3_store();
+    let cfg = |n: &str| {
+        let mut c = EngineConfig::for_tests(n);
+        c.cluster.num_shards = 16;
+        c.cluster.lease_interval_ms = 300;
+        c.cluster.lease_timeout_ms = 2_000;
+        c.cluster.lease_safety_margin_ms = 700;
+        c.cluster.membership_interval_ms = 200;
+        c.cluster.placement_interval_ms = 200;
+        c
+    };
+    let open = |n: &str| {
+        Engine::open_with(
+            store.clone(),
+            cfg(n),
+            TokioClock::new(),
+            std::sync::Arc::new(NoopSink),
+        )
+    };
+    let a = open("a").await.unwrap();
+    let b = open("b").await.unwrap();
+    let req = || CreateTask {
+        queue_name: "q".into(),
+        task_name: "t".into(),
+        input: None,
+        priority: 0,
+        max_retries: 3,
+        timeout_seconds: 60,
+        idempotency_key: None,
+        metadata: serde_json::json!({}),
+        scheduled_at: None,
+    };
+    let mut ids = Vec::new();
+    while ids.len() < 20 {
+        for e in [&a, &b] {
+            if let Ok(t) = e.create_task(req()).await {
+                ids.push(t.id);
+            }
+        }
+    }
+    a.halt();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while b.owned_shards().len() < 16 {
+        assert!(std::time::Instant::now() < deadline, "b never took over");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    for id in &ids {
+        assert!(b.get_task(id).is_some(), "acked task {id} lost");
+    }
 }

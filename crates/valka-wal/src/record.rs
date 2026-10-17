@@ -175,6 +175,10 @@ impl WalRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
     pub shard: ShardId,
+    /// The shard's ownership generation when the record was written. Replay applies a
+    /// record only to the generation being rebuilt; anything else is skipped and alerted.
+    #[serde(default, rename = "gen")]
+    pub generation: u64,
     /// Per-shard monotonic sequence assigned when the record is applied. Snapshots record
     /// the last applied `shard_seq`, so replay knows exactly which records are already
     /// reflected without relying on idempotency.
@@ -192,6 +196,7 @@ impl Envelope {
     pub fn new(shard: ShardId, record: WalRecord) -> Self {
         Self {
             shard,
+            generation: 0,
             shard_seq: 0,
             record_id: uuid::Uuid::now_v7().to_string(),
             ts_ms: Utc::now().timestamp_millis(),
@@ -202,6 +207,7 @@ impl Envelope {
     pub fn with_ts(shard: ShardId, ts: DateTime<Utc>, record: WalRecord) -> Self {
         Self {
             shard,
+            generation: 0,
             shard_seq: 0,
             record_id: uuid::Uuid::now_v7().to_string(),
             ts_ms: ts.timestamp_millis(),

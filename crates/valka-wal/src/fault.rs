@@ -36,8 +36,10 @@ pub struct FaultConfig {
     pub latency_ms: AtomicU64,
     /// When set, PUTs fail unconditionally (bucket unavailable).
     pub puts_down: AtomicBool,
-    /// When set, every op hangs forever (node is "frozen" / partitioned from the bucket).
+    /// While set, every op waits (node is "frozen" / partitioned from the bucket). Ops
+    /// resume, in order, once it is cleared, like a paused process waking up.
     pub frozen: AtomicBool,
+    thaw: tokio::sync::watch::Sender<bool>,
     pub puts: AtomicU64,
     pub gets: AtomicU64,
     pub lists: AtomicU64,
@@ -53,6 +55,7 @@ impl FaultConfig {
             latency_ms: AtomicU64::new(0),
             puts_down: AtomicBool::new(false),
             frozen: AtomicBool::new(false),
+            thaw: tokio::sync::watch::Sender::new(false),
             puts: AtomicU64::new(0),
             gets: AtomicU64::new(0),
             lists: AtomicU64::new(0),
@@ -77,6 +80,13 @@ impl FaultConfig {
     }
     pub fn freeze(&self, frozen: bool) {
         self.frozen.store(frozen, Ordering::SeqCst);
+        self.thaw.send_replace(frozen);
+    }
+
+    /// Wait while frozen.
+    pub async fn wait_thawed(&self) {
+        let mut rx = self.thaw.subscribe();
+        let _ = rx.wait_for(|frozen| !*frozen).await;
     }
 
     fn roll(&self, per_mille: u32) -> bool {
@@ -107,7 +117,7 @@ impl FaultyStore {
 
     async fn before(&self, op: Op) -> Result<()> {
         if self.cfg.frozen.load(Ordering::SeqCst) {
-            futures::future::pending::<()>().await;
+            self.cfg.wait_thawed().await;
         }
         let lat = self.cfg.latency_ms.load(Ordering::SeqCst);
         if lat > 0 {
@@ -177,7 +187,7 @@ impl ObjectStore for FaultyStore {
             async move {
                 cfg.deletes.fetch_add(1, Ordering::Relaxed);
                 if cfg.frozen.load(Ordering::SeqCst) {
-                    futures::future::pending::<()>().await;
+                    cfg.wait_thawed().await;
                 }
                 if cfg.roll(cfg.fail_per_mille.load(Ordering::SeqCst)) {
                     return Err(generic(Op::Delete));
@@ -190,14 +200,24 @@ impl ObjectStore for FaultyStore {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         self.cfg.lists.fetch_add(1, Ordering::Relaxed);
-        if self.cfg.frozen.load(Ordering::SeqCst) {
-            return Box::pin(futures::stream::pending());
-        }
         if self
             .cfg
             .roll(self.cfg.fail_per_mille.load(Ordering::SeqCst))
         {
             return Box::pin(futures::stream::once(async { Err(generic(Op::List)) }));
+        }
+        if self.cfg.frozen.load(Ordering::SeqCst) {
+            // Start listing only once thawed: the result reflects the bucket at that time.
+            let cfg = self.cfg.clone();
+            let inner = self.inner.clone();
+            let prefix = prefix.cloned();
+            return Box::pin(
+                futures::stream::once(async move {
+                    cfg.wait_thawed().await;
+                    inner.list(prefix.as_ref())
+                })
+                .flatten(),
+            );
         }
         self.inner.list(prefix)
     }

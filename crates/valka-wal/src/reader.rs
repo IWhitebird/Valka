@@ -1,35 +1,53 @@
-//! Reading segments back, in LSN order.
+//! Reading segments back, and own-log truncation.
 
 use crate::error::WalError;
 use crate::lsn::{Lsn, keys};
 use crate::record::Envelope;
 use crate::segment;
 use crate::store::Store;
-use tracing::warn;
 
-/// List a node's segments with LSN strictly greater than `after`, sorted ascending.
+/// One incarnation's segments, sorted ascending.
 pub async fn list_segments(
     store: &Store,
     node_id: &str,
-    after: Option<Lsn>,
+    inc: u32,
 ) -> Result<Vec<(Lsn, String)>, WalError> {
-    let items = store.list(&keys::wal_prefix(node_id)).await?;
-    let mut out = Vec::with_capacity(items.len());
-    for (key, _) in items {
-        match keys::segment_lsn(&key) {
-            Some(lsn) => {
-                if after.is_none_or(|a| lsn > a) {
-                    out.push((lsn, key));
-                }
-            }
-            None => warn!(key, "ignoring foreign object under wal prefix"),
-        }
-    }
+    let mut out: Vec<(Lsn, String)> = store
+        .list(&keys::wal_prefix(node_id))
+        .await?
+        .into_iter()
+        .filter_map(|(key, _)| {
+            let lsn = keys::parse_segment(&key)
+                .filter(|(n, l)| *n == node_id && l.inc == inc)
+                .map(|(_, l)| l)?;
+            Some((lsn, key))
+        })
+        .collect();
     out.sort();
     Ok(out)
 }
 
-/// Fetch and decode one segment.
+/// Every segment of a node (all incarnations), sorted ascending.
+pub async fn list_node_segments(
+    store: &Store,
+    node_id: &str,
+) -> Result<Vec<(Lsn, String)>, WalError> {
+    let mut out: Vec<(Lsn, String)> = store
+        .list(&keys::wal_prefix(node_id))
+        .await?
+        .into_iter()
+        .filter_map(|(key, _)| {
+            let lsn = keys::parse_segment(&key)
+                .filter(|(n, _)| *n == node_id)
+                .map(|(_, l)| l)?;
+            Some((lsn, key))
+        })
+        .collect();
+    out.sort();
+    Ok(out)
+}
+
+/// Fetch and decode one segment. Sealed segments decode to no records.
 pub async fn read_segment(store: &Store, key: &str) -> Result<Vec<Envelope>, WalError> {
     let (bytes, _) = store
         .get(key)
@@ -45,14 +63,14 @@ pub async fn read_segment(store: &Store, key: &str) -> Result<Vec<Envelope>, Wal
     Ok(records)
 }
 
-/// Read every record after `after` (exclusive), tagged with its segment LSN.
+/// Every record of one incarnation, in order (diagnostics and tests).
 pub async fn read_all(
     store: &Store,
     node_id: &str,
-    after: Option<Lsn>,
+    inc: u32,
 ) -> Result<Vec<(Lsn, Envelope)>, WalError> {
     let mut out = Vec::new();
-    for (lsn, key) in list_segments(store, node_id, after).await? {
+    for (lsn, key) in list_segments(store, node_id, inc).await? {
         for e in read_segment(store, &key).await? {
             out.push((lsn, e));
         }
@@ -60,34 +78,33 @@ pub async fn read_all(
     Ok(out)
 }
 
-/// Stream segments to a callback, in order. Stops at the first error.
-pub async fn replay<F>(
-    store: &Store,
-    node_id: &str,
-    after: Option<Lsn>,
-    mut f: F,
-) -> Result<Option<Lsn>, WalError>
-where
-    F: FnMut(Lsn, Envelope),
-{
-    let mut last = None;
-    for (lsn, key) in list_segments(store, node_id, after).await? {
+/// Every record a node ever wrote that is still in the bucket, all incarnations, in order.
+pub async fn read_node(store: &Store, node_id: &str) -> Result<Vec<(Lsn, Envelope)>, WalError> {
+    let mut out = Vec::new();
+    for (lsn, key) in list_node_segments(store, node_id).await? {
         for e in read_segment(store, &key).await? {
-            f(lsn, e);
+            out.push((lsn, e));
         }
-        last = Some(lsn);
     }
-    Ok(last)
+    Ok(out)
 }
 
-/// Delete segments with LSN strictly below `below`. Returns the number removed.
-pub async fn truncate_before(store: &Store, node_id: &str, below: Lsn) -> Result<usize, WalError> {
+/// Delete one incarnation's segments strictly below `below`, ascending and one at a time,
+/// stopping at the first failure, so what remains is always a contiguous suffix. The
+/// caller must have raised the lease's truncation watermark to `below` first.
+pub async fn truncate_before(
+    store: &Store,
+    node_id: &str,
+    inc: u32,
+    below: u64,
+) -> Result<usize, WalError> {
     let mut n = 0;
-    for (lsn, key) in list_segments(store, node_id, None).await? {
-        if lsn < below {
-            store.delete(&key).await?;
-            n += 1;
+    for (lsn, key) in list_segments(store, node_id, inc).await? {
+        if lsn.seq >= below {
+            break;
         }
+        store.delete(&key).await?;
+        n += 1;
     }
     Ok(n)
 }

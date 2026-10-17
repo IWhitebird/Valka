@@ -15,7 +15,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
-use valka_core::{NUM_SHARDS, ShardId};
+use valka_core::ShardId;
 use valka_engine::{Engine, NodeStats};
 
 use crate::rest::{ApiError, AppState};
@@ -49,8 +49,11 @@ const STORAGE_CACHE_TTL: Duration = Duration::from_secs(30);
 /// S3 Standard PUT price, USD per 1000 requests (us-east-1). Only for the estimate.
 const S3_PUT_USD_PER_1000: f64 = 0.005;
 
-fn health(stats: &NodeStats) -> Value {
-    let unowned = NUM_SHARDS as usize - stats.shards_owned;
+fn health(stats: &NodeStats, members: &[valka_engine::MemberInfo]) -> Value {
+    let peers_live = members.iter().any(|m| m.node_id != stats.node_id && m.live);
+    // Alone, every shard should be ours. With peers, ownership is spread and counted by
+    // the scatter endpoint; here only this node's view is known.
+    let unowned = (!peers_live).then(|| stats.num_shards as usize - stats.shards_owned);
     let poisoned: Vec<&str> = stats
         .wal
         .poisoned
@@ -58,9 +61,14 @@ fn health(stats: &NodeStats) -> Value {
         .map(|_| stats.node_id.as_str())
         .into_iter()
         .collect();
-    let status = if !poisoned.is_empty() {
+    let suspect: Vec<&str> = members
+        .iter()
+        .filter(|m| m.suspect)
+        .map(|m| m.node_id.as_str())
+        .collect();
+    let status = if !poisoned.is_empty() || !stats.serving {
         "critical"
-    } else if unowned > 0 {
+    } else if unowned.is_some_and(|u| u > 0) || !suspect.is_empty() {
         "degraded"
     } else {
         "ok"
@@ -69,15 +77,54 @@ fn health(stats: &NodeStats) -> Value {
         "status": status,
         "unowned_shards": unowned,
         "poisoned_nodes": poisoned,
-        "suspect_nodes": [],
+        "suspect_nodes": suspect,
+    })
+}
+
+fn member_status(m: &valka_engine::MemberInfo) -> &'static str {
+    if m.suspect {
+        "suspect"
+    } else if m.state == "dead" {
+        "dead"
+    } else if m.state == "draining" {
+        "draining"
+    } else if m.live {
+        "alive"
+    } else {
+        "unknown"
+    }
+}
+
+/// A peer as this node sees it through the bucket (lease) — no RPC.
+fn peer_json(m: &valka_engine::MemberInfo) -> Value {
+    json!({
+        "node_id": m.node_id,
+        "inc": m.inc,
+        "status": member_status(m),
+        "grpc_addr": m.grpc_addr,
+        "http_addr": m.http_addr,
+        "internal_addr": m.internal_addr,
+        "version": m.version,
+        "protocol": m.protocol,
+        "started_at": m.started_at.map(|t| t.to_rfc3339()),
+        "lease_age_ms": m.lease_age_ms,
+        "eligible": m.eligible,
+        "unsplit": m.unsplit,
     })
 }
 
 fn node_json(state: &AppState, stats: &NodeStats) -> Value {
     json!({
         "node_id": stats.node_id,
-        "epoch": stats.wal.epoch,
-        "status": if stats.wal.poisoned.is_some() { "poisoned" } else { "alive" },
+        "inc": stats.wal.inc,
+        "status": if stats.wal.poisoned.is_some() {
+            "poisoned"
+        } else if !stats.serving {
+            "fenced"
+        } else {
+            "alive"
+        },
+        "lease_age_ms": stats.lease_age_ms,
         "grpc_addr": state.node_info.grpc_addr,
         "http_addr": state.node_info.http_addr,
         "version": state.node_info.version,
@@ -95,13 +142,21 @@ fn node_json(state: &AppState, stats: &NodeStats) -> Value {
 
 pub async fn cluster_overview(State(state): State<AppState>) -> impl IntoResponse {
     let stats = state.engine.stats();
+    let members = state.engine.members();
+    let mut nodes = vec![node_json(&state, &stats)];
+    nodes.extend(
+        members
+            .iter()
+            .filter(|m| m.node_id != stats.node_id)
+            .map(peer_json),
+    );
     Json(json!({
-        "cluster_id": state.cluster.node_id().0,
+        "cluster_id": state.engine.cluster_meta().cluster_id,
         "this_node": stats.node_id,
-        "clustered": state.cluster.is_clustered(),
-        "num_shards": NUM_SHARDS,
-        "health": health(&stats),
-        "nodes": [node_json(&state, &stats)],
+        "clustered": state.engine.config().cluster.enabled,
+        "num_shards": stats.num_shards,
+        "health": health(&stats, &members),
+        "nodes": nodes,
     }))
 }
 
@@ -142,7 +197,12 @@ pub async fn get_shard(
         .engine
         .shard_detail(ShardId(shard))
         .map(Json)
-        .ok_or_else(|| ApiError::NotFound(format!("shard {shard} out of range (0..{NUM_SHARDS})")))
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "shard {shard} out of range (0..{})",
+                state.engine.num_shards()
+            ))
+        })
 }
 
 pub async fn storage(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {

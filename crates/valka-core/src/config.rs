@@ -12,6 +12,7 @@ pub struct ServerConfig {
     pub web_dir: String,
     pub storage: StorageConfig,
     pub wal: WalConfig,
+    pub cluster: ClusterConfig,
     pub gossip: GossipConfig,
     pub matching: MatchingConfig,
     pub scheduler: SchedulerConfig,
@@ -63,6 +64,60 @@ pub struct WalConfig {
     pub completed_retention_secs: u64,
 }
 
+/// Membership, leases and shard placement. One node is a cluster of one: the same
+/// protocol runs whether or not other nodes exist (docs/wal/PHASE2.md).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterConfig {
+    /// Allow other nodes on this bucket. Needs an S3-compatible backend (the local and
+    /// memory backends only work inside one process) and a `token`.
+    pub enabled: bool,
+    /// Shard count for a new cluster, written to `cluster.json` on first start. A power of
+    /// two in 16..=65536. A running cluster's count never changes; 0 means "whatever the
+    /// bucket says, or the default for a new bucket".
+    pub num_shards: u32,
+    /// Shared secret every internal call carries. Required when `enabled`.
+    pub token: Option<String>,
+    /// Listener for node-to-node RPCs. Never expose it publicly.
+    pub internal_addr: String,
+    /// Address other nodes use to reach `internal_addr` (defaults to it).
+    pub advertise_internal_addr: Option<String>,
+    /// Address workers and clients use to reach this node's public gRPC port.
+    pub advertise_grpc_addr: Option<String>,
+    /// Address used to reach this node's REST port.
+    pub advertise_http_addr: Option<String>,
+    /// Optional mTLS for internal traffic (PEM files). The token is still required.
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    pub tls_ca: Option<String>,
+    /// How often a node renews its lease.
+    pub lease_interval_ms: u64,
+    /// A lease unchanged for this long (by the observer's own clock) is dead.
+    pub lease_timeout_ms: u64,
+    /// A node that has not renewed for `lease_timeout - safety_margin` stops serving.
+    pub lease_safety_margin_ms: u64,
+    /// How often the bucket's node list is re-read.
+    pub membership_interval_ms: u64,
+    /// A newly seen node takes part in placement after this long.
+    pub join_delay_ms: u64,
+    /// How often each node re-evaluates which shards it should own.
+    pub placement_interval_ms: u64,
+    /// Shard claims in flight at once.
+    pub claim_concurrency: usize,
+    /// Shards a node hands over per placement tick.
+    pub handover_per_tick: usize,
+    /// A shard stays where it is for at least this long after a move.
+    pub min_residency_secs: u64,
+    /// Another node may redo a dead node's log split after this long.
+    pub split_timeout_ms: u64,
+    /// After claiming shards, recovered PENDING tasks wait this long before re-dispatch so
+    /// reconnecting workers can reattach to their runs first.
+    pub reconcile_grace_ms: u64,
+    /// Garbage collector cadence (dead logs, old snapshots, split markers, dead leases).
+    pub gc_interval_secs: u64,
+    /// Refuse to start while another live process holds this node id.
+    pub startup_lease_check: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GossipConfig {
     pub listen_addr: String,
@@ -111,6 +166,7 @@ impl Default for ServerConfig {
             web_dir: "web/dist".to_string(),
             storage: StorageConfig::default(),
             wal: WalConfig::default(),
+            cluster: ClusterConfig::default(),
             gossip: GossipConfig::default(),
             matching: MatchingConfig::default(),
             scheduler: SchedulerConfig::default(),
@@ -147,6 +203,55 @@ impl Default for WalConfig {
             log_budget_bytes: 64 * 1024 * 1024,
             snapshots_to_keep: 2,
             completed_retention_secs: 24 * 3600,
+        }
+    }
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            num_shards: 0,
+            token: None,
+            internal_addr: "0.0.0.0:50052".to_string(),
+            advertise_internal_addr: None,
+            advertise_grpc_addr: None,
+            advertise_http_addr: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca: None,
+            lease_interval_ms: 2_000,
+            lease_timeout_ms: 10_000,
+            lease_safety_margin_ms: 3_000,
+            membership_interval_ms: 3_000,
+            join_delay_ms: 15_000,
+            placement_interval_ms: 3_000,
+            claim_concurrency: 64,
+            handover_per_tick: 64,
+            min_residency_secs: 300,
+            split_timeout_ms: 30_000,
+            reconcile_grace_ms: 5_000,
+            gc_interval_secs: 300,
+            startup_lease_check: true,
+        }
+    }
+}
+
+impl ClusterConfig {
+    /// Settings for tests: fast placement, no join delay, and leases that never go stale
+    /// on their own (tests that jump paused time by hours must not self-fence).
+    pub fn for_tests() -> Self {
+        Self {
+            lease_interval_ms: 2_000,
+            lease_timeout_ms: 24 * 3600 * 1000,
+            lease_safety_margin_ms: 3_000,
+            membership_interval_ms: 1_000,
+            join_delay_ms: 0,
+            placement_interval_ms: 500,
+            min_residency_secs: 0,
+            reconcile_grace_ms: 0,
+            startup_lease_check: false,
+            ..Default::default()
         }
     }
 }

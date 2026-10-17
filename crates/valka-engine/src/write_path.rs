@@ -14,9 +14,15 @@ use crate::retry::compute_retry_delay;
 use valka_core::SchedulerConfig;
 
 impl Engine {
+    /// The shard of a task/run/signal id, if it is a well-formed id of this cluster.
+    pub fn shard_of(&self, id: &str) -> Option<ShardId> {
+        shard_of_task_id(id).filter(|s| (s.0 as u32) < self.inner.num_shards)
+    }
+
     pub(crate) fn shard_for(&self, task_id: &str) -> Result<ShardId, ServerError> {
-        let shard =
-            shard_of_task_id(task_id).ok_or_else(|| ServerError::TaskNotFound(task_id.into()))?;
+        let shard = self
+            .shard_of(task_id)
+            .ok_or_else(|| ServerError::TaskNotFound(task_id.into()))?;
         if !self.owns(shard) {
             return Err(ServerError::NotOwner(shard.0));
         }
@@ -31,9 +37,18 @@ impl Engine {
         build: impl FnOnce(&ShardState) -> Result<(WalRecord, R), ServerError>,
         after: impl FnOnce(&ShardState) -> V,
     ) -> Result<(Durable, Vec<Transition>, R, V), ServerError> {
-        let mut st = self.inner.shards[shard.0 as usize].lock();
+        if !self.inner.lease.is_serving() {
+            return Err(ServerError::Unavailable(
+                "this node's lease is not current; retry".into(),
+            ));
+        }
+        let mut st = self.inner.shards[shard.index()].lock();
+        if !st.serving() {
+            return Err(ServerError::NotOwner(shard.0));
+        }
         let (record, ret) = build(&st)?;
         let mut env = Envelope::with_ts(shard, self.inner.clock.now(), record);
+        env.generation = st.generation;
         let was_clean = st.records_since_snapshot == 0;
         let transitions = st.apply(&mut env);
         if was_clean {
@@ -50,10 +65,10 @@ impl Engine {
     pub(crate) fn arm_timers_for(&self, transitions: &[Transition]) {
         for tr in transitions {
             if tr.to == Some(TaskStatus::Retry) {
-                let Some(shard) = shard_of_task_id(&tr.task_id) else {
+                let Some(shard) = self.shard_of(&tr.task_id) else {
                     continue;
                 };
-                let at = self.inner.shards[shard.0 as usize]
+                let at = self.inner.shards[shard.index()]
                     .lock()
                     .tasks
                     .get(&tr.task_id)

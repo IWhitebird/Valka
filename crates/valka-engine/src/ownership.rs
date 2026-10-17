@@ -1,0 +1,534 @@
+//! Moving shards: claim, release, and splitting a dead incarnation's log.
+//!
+//! The protocol (docs/wal/PHASE2.md §8):
+//! - **Claim** S: allowed when S's owner record is missing, released, or names an
+//!   incarnation that is dead *and* whose log is split. CAS the record to
+//!   `(me, my inc, gen + 1)`, load S's newest snapshot, write an acquisition snapshot that
+//!   points into my log, and only then serve.
+//! - **Release** S: stop accepting commands, wait until S's records are durable, write a
+//!   final snapshot, CAS the record to released, drop the state.
+//! - **Split** a dead incarnation D: read D's log to its sealed end, rebuild every shard
+//!   D wrote from its newest snapshot at that generation plus D's records, write those
+//!   as split snapshots, then write D's split marker. A dead log is read once, by one node.
+
+use futures::StreamExt;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Duration;
+use tracing::{debug, error, info, warn};
+use valka_core::{ServerError, ShardId};
+use valka_wal::lease::{self, LeaseRecord};
+use valka_wal::owners::{self, OwnerRecord, OwnerState, Versioned};
+use valka_wal::snapshot::{self, LogPtr, SnapshotKey};
+use valka_wal::split::{self, SplitMarker};
+use valka_wal::{Envelope, WalError};
+
+use crate::engine::Engine;
+use crate::state::{ShardPhase, ShardSnapshot, ShardState};
+
+/// Why a shard could not be claimed now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimRefused {
+    /// Its owner is alive (or its log is not split yet): try again later.
+    Busy(String),
+    /// Someone else moved it first.
+    Lost,
+    /// The bucket is inconsistent with the protocol. Alert.
+    Invariant(String),
+}
+
+/// Facts about other nodes' incarnations, cached for one claim round.
+#[derive(Default)]
+pub(crate) struct IncCache {
+    leases: HashMap<String, Option<LeaseRecord>>,
+    split: HashMap<(String, u32), bool>,
+}
+
+impl IncCache {
+    async fn lease(
+        &mut self,
+        store: &valka_wal::Store,
+        node: &str,
+    ) -> Result<Option<LeaseRecord>, WalError> {
+        if let Some(l) = self.leases.get(node) {
+            return Ok(l.clone());
+        }
+        let l = lease::get(store, node).await?.map(|v| v.record);
+        self.leases.insert(node.to_string(), l.clone());
+        Ok(l)
+    }
+
+    /// `(node, inc)` can no longer write and its log is fully split.
+    async fn dead_and_split(
+        &mut self,
+        store: &valka_wal::Store,
+        node: &str,
+        inc: u32,
+    ) -> Result<bool, WalError> {
+        let dead = match self.lease(store, node).await? {
+            Some(l) => l.is_dead_incarnation(inc),
+            // A missing lease belongs to a node that was garbage-collected: long dead.
+            None => true,
+        };
+        if !dead {
+            return Ok(false);
+        }
+        let k = (node.to_string(), inc);
+        if let Some(s) = self.split.get(&k) {
+            return Ok(*s);
+        }
+        let s = split::marker_exists(store, node, inc).await?;
+        // Only cache a positive answer: a split may finish while the round runs.
+        if s {
+            self.split.insert(k, true);
+        }
+        Ok(s)
+    }
+}
+
+impl Engine {
+    // ───────────────────────── claim ─────────────────────────
+
+    /// Claim `shards` (at most `claim_concurrency` at once). Returns how many are now
+    /// served. Shards that cannot be claimed yet are skipped.
+    pub async fn claim_shards(&self, shards: Vec<ShardId>) -> usize {
+        if shards.is_empty() || !self.is_serving() {
+            return 0;
+        }
+        let _moves = self.inner.moves.lock().await;
+        // One LIST for every shard's snapshots instead of one per shard.
+        let snaps = match snapshot::list_all(&self.inner.store).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "claim round: listing snapshots failed");
+                return 0;
+            }
+        };
+        let cache = tokio::sync::Mutex::new(IncCache::default());
+        let concurrency = self.inner.cfg.cluster.claim_concurrency.max(1);
+        let results: Vec<(ShardId, Result<(), ClaimRefused>)> = futures::stream::iter(shards)
+            .map(|s| {
+                let listed = snaps.get(&s).cloned().unwrap_or_default();
+                let cache = &cache;
+                async move { (s, self.claim_one(s, listed, cache).await) }
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+        let mut claimed = 0;
+        for (s, r) in results {
+            match r {
+                Ok(()) => claimed += 1,
+                Err(ClaimRefused::Busy(why)) => debug!(shard = %s, why, "not claimable yet"),
+                Err(ClaimRefused::Lost) => debug!(shard = %s, "claim lost to another node"),
+                Err(ClaimRefused::Invariant(why)) => {
+                    error!(shard = %s, why, "refusing to claim: bucket violates the protocol")
+                }
+            }
+        }
+        if claimed > 0 {
+            self.inner.pending_wake.notify_one();
+            info!(claimed, "claimed shards");
+        }
+        claimed
+    }
+
+    async fn claim_one(
+        &self,
+        shard: ShardId,
+        listed: Vec<SnapshotKey>,
+        cache: &tokio::sync::Mutex<IncCache>,
+    ) -> Result<(), ClaimRefused> {
+        {
+            let mut st = self.inner.shards[shard.index()].lock();
+            if st.phase != ShardPhase::Unowned {
+                return Err(ClaimRefused::Busy(format!("phase {}", st.phase.as_str())));
+            }
+            st.phase = ShardPhase::Loading;
+        }
+        let r = self.claim_loading(shard, listed, cache).await;
+        if r.is_err() {
+            let mut st = self.inner.shards[shard.index()].lock();
+            if st.phase == ShardPhase::Loading {
+                *st = ShardState::new(shard);
+            }
+        }
+        r
+    }
+
+    async fn claim_loading(
+        &self,
+        shard: ShardId,
+        listed: Vec<SnapshotKey>,
+        cache: &tokio::sync::Mutex<IncCache>,
+    ) -> Result<(), ClaimRefused> {
+        let store = &self.inner.store;
+        let me = self.node_id().to_string();
+        let inc = self.incarnation();
+        let io = |e: WalError| ClaimRefused::Busy(e.to_string());
+
+        // 1. Who owns it, and may it move?
+        let current = owners::get(store, shard).await.map_err(io)?;
+        if let Some(v) = &current {
+            let r = &v.record;
+            let movable = match r.state {
+                OwnerState::Released => true,
+                OwnerState::Owned if r.node == me && r.inc == inc => true,
+                OwnerState::Owned => cache
+                    .lock()
+                    .await
+                    .dead_and_split(store, &r.node, r.inc)
+                    .await
+                    .map_err(io)?,
+            };
+            if !movable {
+                return Err(ClaimRefused::Busy(format!(
+                    "owned by {}.{} (gen {})",
+                    r.node, r.inc, r.generation
+                )));
+            }
+        }
+        let generation = current.as_ref().map_or(0, |v| v.record.generation) + 1;
+        // An earlier claim attempt of this very process that failed after its CAS.
+        let own_attempt = current.as_ref().is_some_and(|v| {
+            v.record.node == me && v.record.inc == inc && v.record.state == OwnerState::Owned
+        });
+
+        // 2. Move its history to me.
+        let next = OwnerRecord {
+            node: me.clone(),
+            inc,
+            generation,
+            state: OwnerState::Owned,
+        };
+        if !owners::cas(store, shard, current.as_ref(), &next)
+            .await
+            .map_err(io)?
+        {
+            return Err(ClaimRefused::Lost);
+        }
+
+        // 3. Its newest snapshot. No snapshot at all: nobody ever served it.
+        let newest = match listed.last() {
+            None => None,
+            Some(_) => snapshot::load_newest_of::<ShardSnapshot>(store, &listed, |_| true)
+                .await
+                .map_err(io)?,
+        };
+        let mut state = match newest {
+            None => ShardState::new(shard),
+            Some((key, snap)) => {
+                if key.generation >= generation {
+                    return Err(ClaimRefused::Invariant(format!(
+                        "snapshot {} is at or above the generation being claimed ({generation})",
+                        key.key()
+                    )));
+                }
+                if let LogPtr::At {
+                    node, inc: pinc, ..
+                } = &key.ptr
+                {
+                    let ok = if node == &me && *pinc == inc {
+                        own_attempt
+                    } else {
+                        cache
+                            .lock()
+                            .await
+                            .dead_and_split(store, node, *pinc)
+                            .await
+                            .map_err(io)?
+                    };
+                    if !ok {
+                        return Err(ClaimRefused::Invariant(format!(
+                            "newest snapshot {} points into a log that is not split",
+                            key.key()
+                        )));
+                    }
+                }
+                ShardState::from_snapshot(snap, Some(key))
+            }
+        };
+        state.generation = generation;
+
+        // 4. Acquisition snapshot, pointing into my log, before serving.
+        let ptr = LogPtr::At {
+            node: me.clone(),
+            inc,
+            seq: self.inner.writer.next_lsn().seq,
+        };
+        let key = SnapshotKey {
+            shard,
+            generation,
+            seq: state.shard_seq,
+            ptr,
+        };
+        let taken_at = self.inner.clock.now();
+        snapshot::write(store, &key, &state.to_snapshot(taken_at))
+            .await
+            .map_err(io)?;
+
+        // 5. Serve.
+        state.phase = ShardPhase::Serving;
+        state.snapshot_seq = state.shard_seq;
+        state.snapshot_key = Some(key);
+        state.snapshot_at = Some(taken_at);
+        state.records_since_snapshot = 0;
+        state.dirty_since_lsn = None;
+        {
+            let mut st = self.inner.shards[shard.index()].lock();
+            if st.phase != ShardPhase::Loading {
+                return Err(ClaimRefused::Invariant(
+                    "shard changed phase while loading".into(),
+                ));
+            }
+            *st = state;
+        }
+        let now = tokio::time::Instant::now();
+        self.inner.moved_at.lock().insert(shard, now);
+        let grace = Duration::from_millis(self.inner.cfg.cluster.reconcile_grace_ms);
+        if !grace.is_zero() {
+            self.inner.hold_until.lock().insert(shard, now + grace);
+        }
+        self.rebuild_shard_indexes(shard);
+        Ok(())
+    }
+
+    // ───────────────────────── release ─────────────────────────
+
+    /// Hand `shards` back (at most `limit`). Returns how many were released.
+    pub async fn release_shards(&self, shards: Vec<ShardId>, limit: usize) -> usize {
+        let _moves = self.inner.moves.lock().await;
+        let mut released = 0;
+        for shard in shards.into_iter().take(limit) {
+            match self.release_one(shard).await {
+                Ok(true) => released += 1,
+                Ok(false) => {}
+                Err(e) => warn!(shard = %shard, error = %e, "release failed"),
+            }
+        }
+        if released > 0 {
+            info!(released, "released shards");
+        }
+        released
+    }
+
+    async fn release_one(&self, shard: ShardId) -> Result<bool, ServerError> {
+        let generation = {
+            let mut st = self.inner.shards[shard.index()].lock();
+            if st.phase != ShardPhase::Serving {
+                return Ok(false);
+            }
+            st.phase = ShardPhase::Releasing;
+            st.generation
+        };
+        // Coalesced heartbeats for this shard go into the WAL before the final snapshot.
+        self.flush_lease_records_for(Some(shard));
+        let back_to_serving = |e: ServerError| {
+            let mut st = self.inner.shards[shard.index()].lock();
+            if st.phase == ShardPhase::Releasing {
+                st.phase = ShardPhase::Serving;
+            }
+            e
+        };
+        self.inner
+            .writer
+            .sync()
+            .await
+            .map_err(|e| back_to_serving(e.into()))?;
+        let (key, snap) = {
+            let st = self.inner.shards[shard.index()].lock();
+            let key = SnapshotKey {
+                shard,
+                generation,
+                seq: st.shard_seq,
+                ptr: LogPtr::Final,
+            };
+            (key, st.to_snapshot(self.inner.clock.now()))
+        };
+        snapshot::write(&self.inner.store, &key, &snap)
+            .await
+            .map_err(|e| back_to_serving(e.into()))?;
+        let current = owners::get(&self.inner.store, shard)
+            .await
+            .map_err(|e| back_to_serving(e.into()))?;
+        let mine = current.as_ref().is_some_and(|v| {
+            v.record.node == self.node_id()
+                && v.record.inc == self.incarnation()
+                && v.record.generation == generation
+                && v.record.state == OwnerState::Owned
+        });
+        let ok = mine
+            && owners::cas(
+                &self.inner.store,
+                shard,
+                current.as_ref(),
+                &OwnerRecord {
+                    node: self.node_id().to_string(),
+                    inc: self.incarnation(),
+                    generation,
+                    state: OwnerState::Released,
+                },
+            )
+            .await
+            .map_err(|e| back_to_serving(e.into()))?;
+        // Either way the shard is no longer ours to serve: released, or (owner record not
+        // ours) taken over after this node was declared dead.
+        {
+            let mut st = self.inner.shards[shard.index()].lock();
+            *st = ShardState::new(shard);
+        }
+        self.inner
+            .moved_at
+            .lock()
+            .insert(shard, tokio::time::Instant::now());
+        self.inner.hold_until.lock().remove(&shard);
+        if !ok {
+            error!(shard = %shard, owner = ?current.map(|v| v.record), "owner record is not ours at release; this node was taken over");
+        }
+        let _ = snapshot::prune(
+            &self.inner.store,
+            shard,
+            self.inner.cfg.wal.snapshots_to_keep,
+        )
+        .await;
+        Ok(ok)
+    }
+
+    // ───────────────────────── split ─────────────────────────
+
+    /// Split a dead incarnation's log into per-shard snapshots and mark it split.
+    /// Idempotent: running it again (or concurrently elsewhere) writes the same snapshots.
+    pub async fn split_incarnation(
+        &self,
+        node: &str,
+        inc: u32,
+        trunc: u64,
+    ) -> Result<(), ServerError> {
+        let store = &self.inner.store;
+        if split::marker_exists(store, node, inc).await? {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let log = match split::read_sealed(store, node, inc, trunc).await {
+            Ok(l) => l,
+            Err(e) => {
+                if split::marker_exists(store, node, inc).await? {
+                    return Ok(());
+                }
+                return Err(e.into());
+            }
+        };
+        let total = log.records.len();
+
+        // Per shard, the records of the newest generation this log holds for it.
+        let mut groups: BTreeMap<ShardId, (u64, Vec<Envelope>)> = BTreeMap::new();
+        for (_, env) in log.records {
+            let g = groups
+                .entry(env.shard)
+                .or_insert((env.generation, Vec::new()));
+            if env.generation > g.0 {
+                *g = (env.generation, Vec::new());
+            }
+            if env.generation == g.0 {
+                g.1.push(env);
+            }
+        }
+        let written: Vec<Result<bool, ServerError>> = futures::stream::iter(groups)
+            .map(|(shard, (generation, records))| async move {
+                self.split_shard(shard, generation, records).await
+            })
+            .buffer_unordered(32)
+            .collect()
+            .await;
+        let mut snapshots_written = 0;
+        for w in written {
+            if w? {
+                snapshots_written += 1;
+            }
+        }
+        split::write_marker(
+            store,
+            &SplitMarker {
+                node: node.to_string(),
+                inc,
+                split_by: self.node_id().to_string(),
+                at: chrono::Utc::now(),
+                end: log.end,
+                records: total,
+                snapshots_written,
+            },
+        )
+        .await?;
+        info!(
+            node,
+            inc,
+            records = total,
+            segments = log.segments_read,
+            snapshots = snapshots_written,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "split dead incarnation"
+        );
+        if let Err(e) = split::delete_incarnation_log(store, node, inc).await {
+            warn!(node, inc, error = %e, "deleting split log failed; the collector retries");
+        }
+        Ok(())
+    }
+
+    /// Rebuild one shard at `generation` from its newest snapshot plus `records`.
+    async fn split_shard(
+        &self,
+        shard: ShardId,
+        generation: u64,
+        records: Vec<Envelope>,
+    ) -> Result<bool, ServerError> {
+        if shard.0 as u32 >= self.inner.num_shards {
+            warn!(shard = %shard, "split: record for a shard outside the cluster; skipped");
+            return Ok(false);
+        }
+        let store = &self.inner.store;
+        let listed = snapshot::list(store, shard).await?;
+        if listed.iter().any(|k| k.generation > generation) {
+            // The shard moved on after this log was split once already.
+            return Ok(false);
+        }
+        let base = snapshot::load_newest_of::<ShardSnapshot>(store, &listed, |k| {
+            k.generation <= generation
+        })
+        .await?;
+        let mut st = match base {
+            Some((key, snap)) => ShardState::from_snapshot(snap, Some(key)),
+            None => ShardState::new(shard),
+        };
+        st.generation = generation;
+        let mut applied = 0usize;
+        let mut skipped_gen = HashSet::new();
+        for mut env in records {
+            if env.generation != generation {
+                skipped_gen.insert(env.generation);
+                continue;
+            }
+            if env.shard_seq > st.shard_seq {
+                st.apply(&mut env);
+                applied += 1;
+            }
+        }
+        if !skipped_gen.is_empty() {
+            warn!(shard = %shard, generation, ?skipped_gen, "split skipped records of other generations");
+        }
+        if applied == 0 {
+            return Ok(false);
+        }
+        let key = SnapshotKey {
+            shard,
+            generation,
+            seq: st.shard_seq,
+            ptr: LogPtr::Split,
+        };
+        snapshot::write(store, &key, &st.to_snapshot(chrono::Utc::now())).await?;
+        Ok(true)
+    }
+
+    /// The owner record of a shard (admin, diagnostics).
+    pub async fn owner_record(&self, shard: ShardId) -> Result<Option<Versioned>, ServerError> {
+        Ok(owners::get(&self.inner.store, shard).await?)
+    }
+}

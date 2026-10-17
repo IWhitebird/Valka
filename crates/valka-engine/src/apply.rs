@@ -13,6 +13,9 @@ use crate::state::{
 };
 
 impl ShardState {
+    /// Apply a record. Assigns `shard_seq` when the envelope carries none (runtime path);
+    /// during replay the envelope's own `shard_seq` is trusted and records at or below the
+    /// current sequence are skipped.
     pub fn apply(&mut self, env: &mut Envelope) -> Vec<Transition> {
         if env.shard_seq == 0 {
             self.shard_seq += 1;
@@ -442,7 +445,7 @@ impl ShardState {
 mod tests {
     use chrono::Utc;
     use valka_core::{ShardId, TaskStatus};
-    use valka_wal::{Envelope, FailureOutcome, Lsn, TaskSpec, WalRecord};
+    use valka_wal::{Envelope, FailureOutcome, TaskSpec, WalRecord};
 
     use crate::state::{ShardSnapshot, ShardState, SignalStatus};
 
@@ -616,11 +619,10 @@ mod tests {
         let snap = s.to_snapshot(Utc::now());
         let json = serde_json::to_string(&snap).unwrap();
         let back: ShardSnapshot = serde_json::from_str(&json).unwrap();
-        let r = ShardState::from_snapshot(back, Lsn::new(1, 4));
+        let r = ShardState::from_snapshot(back, None);
         assert_eq!(r.shard_seq, 2);
         assert_eq!(r.tasks["a"].signals, vec!["sig".to_string()]);
         assert_eq!(r.signals["sig"].status, SignalStatus::Pending);
-        assert_eq!(r.snapshot_lsn, Lsn::new(1, 4));
     }
 
     fn dispatched(s: &mut ShardState, task: &str, run: &str, attempt: i32) {
@@ -710,7 +712,7 @@ mod tests {
         ));
         let json = serde_json::to_value(s.to_snapshot(Utc::now())).unwrap();
         let back: ShardSnapshot = serde_json::from_value(json.clone()).unwrap();
-        let r = ShardState::from_snapshot(back, Lsn::new(1, 1));
+        let r = ShardState::from_snapshot(back, None);
         assert_eq!(r.tasks["a"].checkpoints, s.tasks["a"].checkpoints);
 
         let mut old = json;

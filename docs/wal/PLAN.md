@@ -38,9 +38,9 @@ Design, decisions and milestones: [`PHASE2.md`](PHASE2.md).
 
 - [x] M0 Phase-1 hardening: snapshot durability fix, `AlreadyExists` read-back, end-to-end result acks in all four SDKs, non-blocking SDK receive loops, worker drain and server-restart protocol, exit on poison, log budget.
 - [ ] M1 TLA+ model of leases, ownership, sealing, splitting and GC; TLC in CI.
-- [ ] M2 Formats: `cluster.json`, 16-bit shard ids, `gen` in records, sealable segments, `owners/`, `nodes/`, new snapshot keys.
-- [ ] M3 One node on the full protocol: incarnations, lease fencing, per-shard claim/release/split.
-- [ ] M4 Membership, guardian tombstones, rendezvous placement, takeover, GC; turmoil harness starts.
+- [x] M2 Formats: `cluster.json`, 16-bit shard ids, `gen` in records, sealable segments (v2 header with node id, flags, shard list), `owners/`, `nodes/`, `snapshots/{hh}/{shard}/{gen}-{seq}-{ptr}`, `splits/`, hashed prefixes, storage self-test, clustered mode refuses local/memory.
+- [x] M3 One node on the full protocol: incarnations (lease CAS at start), renewal + self-fencing, own-lease check after every segment PUT, per-shard phases (Unowned → Loading → Serving → Releasing), claim with acquisition snapshot, release with final snapshot, split; a restart splits its own previous incarnations and claims. Truncation raises the lease's watermark before deleting (fixes the LIST-hole hazard, see PHASE2 §8.3).
+- [x] M4 Membership from the bucket (LIST `nodes/` + ETag ageing by the observer's own clock), guardian tombstones and splits, rendezvous placement with join delay, residency and handover limits, GC (split logs, snapshots, unreferenced markers, long-dead leases). Multi-engine tests: convergence, kill, freeze-then-wake (fenced), bucket cut-off (self-fence before takeover), drain, crashed claim, restart, GC; MinIO: self-test and two-node takeover. Gossip is not needed for correctness and is not wired in yet (an accelerator for suspicion, M8); the turmoil harness moves to M9.
 - [ ] M5 Queue partitions and request routing; internal RPCs with token + mTLS.
 - [ ] M6 Cross-node matching (offers, claims, grants); result, heartbeat, cancel and signal routing.
 - [ ] M7 Worker reattach in the proto and all four SDKs.

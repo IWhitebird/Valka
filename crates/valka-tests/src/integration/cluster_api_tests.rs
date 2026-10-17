@@ -35,7 +35,7 @@ async fn cluster_overview_reports_single_healthy_node() {
     )
     .await;
     assert_eq!(body["this_node"], "test-node");
-    assert_eq!(body["num_shards"], 4096);
+    assert_eq!(body["num_shards"], 256);
     assert_eq!(body["health"]["status"], "ok");
     assert_eq!(body["health"]["unowned_shards"], 0);
     let nodes = body["nodes"].as_array().unwrap();
@@ -43,7 +43,8 @@ async fn cluster_overview_reports_single_healthy_node() {
     let n = &nodes[0];
     assert_eq!(n["node_id"], "test-node");
     assert_eq!(n["status"], "alive");
-    assert_eq!(n["shards_owned"], 4096);
+    assert_eq!(n["shards_owned"], 256);
+    assert_eq!(n["inc"], 1);
     assert_eq!(n["shards_with_tasks"].as_u64().unwrap() >= 1, true);
     assert_eq!(n["tasks"]["total"], 2);
     assert_eq!(n["tasks"]["running"], 1);
@@ -73,9 +74,11 @@ async fn shard_map_lists_all_shards_and_filters() {
             .unwrap(),
     )
     .await;
-    assert_eq!(all.as_array().unwrap().len(), 4096);
+    assert_eq!(all.as_array().unwrap().len(), 256);
     assert_eq!(all[0]["shard"], 0);
     assert_eq!(all[0]["owner"], "test-node");
+    assert_eq!(all[0]["phase"], "serving");
+    assert_eq!(all[0]["gen"], 1);
 
     let dirty = parse_response_json(
         node.router()
@@ -125,7 +128,7 @@ async fn shard_detail_and_out_of_range() {
     assert_eq!(body["queues"]["q"]["total"], 1);
     let resp = node
         .router()
-        .oneshot(get_req("/api/v1/cluster/shards/4096"))
+        .oneshot(get_req("/api/v1/cluster/shards/256"))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -155,7 +158,8 @@ async fn storage_stats_and_snapshot_now() {
     assert_eq!(s1["backend"], "memory");
     assert!(s1["wal"]["segments"].as_u64().unwrap() >= 1);
     assert!(s1["wal"]["bytes"].as_u64().unwrap() > 0);
-    assert_eq!(s1["snapshots"]["count"], 0);
+    // One acquisition snapshot per shard, written when the node claimed it.
+    assert_eq!(s1["snapshots"]["count"], 256);
     assert_eq!(s1["estimate"]["flush_interval_ms"], 5);
     assert!(s1["estimate"]["max_usd_per_day"].as_f64().unwrap() > 0.0);
 
@@ -177,7 +181,7 @@ async fn storage_stats_and_snapshot_now() {
             .unwrap(),
     )
     .await;
-    assert!(s2["snapshots"]["count"].as_u64().unwrap() >= 1);
+    assert!(s2["snapshots"]["count"].as_u64().unwrap() > 256);
     assert!(s2["wal"]["segments"].as_u64().unwrap() <= 1);
 
     // Cached: same payload within the TTL.

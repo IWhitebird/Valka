@@ -1,7 +1,7 @@
 //! Step checkpoints: a running run records completed steps so a retry resumes after them.
 
 use serde_json::Value;
-use valka_core::{ServerError, shard_of_task_id};
+use valka_core::ServerError;
 use valka_wal::WalRecord;
 
 use crate::engine::Engine;
@@ -71,8 +71,8 @@ impl Engine {
     }
 
     pub fn checkpoints_for_task(&self, task_id: &str) -> Option<Vec<CheckpointView>> {
-        let shard = shard_of_task_id(task_id)?;
-        self.inner.shards[shard.0 as usize]
+        let shard = self.shard_of(task_id)?;
+        self.inner.shards[shard.index()]
             .lock()
             .tasks
             .get(task_id)

@@ -73,7 +73,10 @@ Examples for each language are in `examples/{rs,typescript,python,go}/`.
 Every write goes through `Engine::mutate`: lock the shard, validate against RAM, build a `WalRecord`, `ShardState::apply` it, `WalWriter::append`, unlock, then `await durable` before acknowledging. Things that must only happen once durable (events, offering to matching) go in `after_durable`. `ShardState::apply` is total: a record whose precondition no longer holds is a no-op.
 
 ### Snapshot exactness
-Envelopes carry a per-shard `shard_seq`; snapshots store the last applied `shard_seq`. Replay skips records at or below it, so snapshots never rely on idempotency. Segments below every dirty shard's `dirty_since_lsn` (and below the durable LSN) are truncated after a snapshot round.
+Envelopes carry a per-shard `shard_seq` and the shard's ownership generation `gen`; snapshots store the last applied `shard_seq`. Replay skips records at or below it and records of other generations, so snapshots never rely on idempotency. After a snapshot round the node raises its lease's `trunc` watermark, then deletes its own segments below every dirty shard's `dirty_since_lsn` (and below the durable LSN), ascending.
+
+### Ownership (docs/wal/PHASE2.md)
+One code path for one node or many. Start = lease CAS (`inc + 1`, fences the previous run of the node id) → split the node's own unsplit incarnations → placement claims shards. Claim: owner record CAS to `gen + 1` (allowed if missing, released, or its incarnation is dead *and* split) → load newest snapshot → acquisition snapshot pointing into my log → Serving. Release: Releasing → sync → final snapshot → CAS released. A guardian tombstones a lease unchanged for `lease_timeout` (its own clock) and splits the dead log (`valka-engine/src/ownership.rs`, `cluster.rs`). Every segment PUT is followed by a conditional GET of the node's own lease before acks are released. Multi-node tests: `valka-engine/src/cluster_tests.rs`.
 
 ### Time in tests
 `TokioClock` derives wall time from tokio's instant, so `#[tokio::test(start_paused = true)]` + `tokio::time::advance` moves leases, retries and timestamps deterministically. `FaultyStore` (valka-wal) injects latency, errors, lost PUT acks and freezes.
@@ -121,7 +124,9 @@ Layered via figment: defaults → `valka.toml` → env vars (VALKA_ prefix).
 Key env vars:
 - `VALKA_STORAGE__BACKEND` — `local` (default, `./data`), `s3`, or `memory`
 - `VALKA_STORAGE__BUCKET` / `VALKA_STORAGE__ENDPOINT` / `VALKA_STORAGE__ALLOW_HTTP` — S3 settings (MinIO: `http://localhost:9000`, allow_http)
-- `VALKA_NODE_ID` — set a stable id in production; a node replays `wal/<node_id>/`
+- `VALKA_NODE_ID` — stable node id (default: the host name); a restarted node reclaims its own shards at once
+- `VALKA_CLUSTER__NUM_SHARDS` — shard count of a new bucket (default 4096; tests use 256)
+- `VALKA_CLUSTER__ENABLED` / `VALKA_CLUSTER__TOKEN` — allow several nodes on one bucket (S3 only)
 - `VALKA_WAL__FLUSH_INTERVAL_MS` — group-commit window (default 50)
 - `VALKA_GRPC_ADDR` — gRPC listen address (default `0.0.0.0:50051`)
 - `VALKA_HTTP_ADDR` — REST/HTTP listen address (default `0.0.0.0:8989`)
@@ -130,22 +135,26 @@ Key env vars:
 ## Storage layout (bucket)
 
 ```
-assignment                          shard → {node, epoch}, CAS'd
-wal/{node_id}/{epoch:08}-{seq:016}.seg   WAL segments (header + CRC-framed zstd JSON records)
-snapshots/{shard:04}/{epoch}-{seq}.snap  per-shard snapshots (zstd JSON)
-logs/{run_id}/{uuidv7}.log          task log chunks
+cluster.json                                   cluster id, num_shards, format (created once)
+nodes/{node}/lease                             inc, state, counter, trunc watermark, addrs; CAS'd
+owners/{hh}/{shard}                            {node, inc, gen, owned|released}; CAS'd on moves
+wal/{node}/{inc:010}-{seq:016}.seg             WAL segments (v2 header + CRC-framed zstd JSON), create-only
+snapshots/{hh}/{shard}/{gen}-{seq}-{ptr}.snap  per-shard snapshots; ptr = node.inc.seq | final | split
+splits/{node}/{inc}                            "this dead incarnation's log is split"
+logs/{hh}/{run_id}/{uuidv7}.log                task log chunks
 ```
+`object_store` lists by path segment: LIST prefixes must end at a `/`.
 Dev default is `./data` via the `local` backend. MinIO for S3 semantics: `docker compose up -d minio minio-init`.
 
 ## Tests
 
 ```bash
 cargo test --workspace                                   # everything, no external services
-cargo test -p valka-wal                                  # 25: store, codec, writer under faults, snapshots, ownership
-cargo test -p valka-engine                               # 42: lifecycle, timers (paused time), recovery, checkpoints, results, log budget, crash/replay proptest
+cargo test -p valka-wal                                  # 37: store, codec, writer under faults, snapshots, leases, owners, split/seal
+cargo test -p valka-engine                               # 50: lifecycle, timers (paused time), recovery, checkpoints, results, log budget, crash/replay proptest, multi-node takeover
 cargo test -p valka-tests                                # 266: unit + REST + lifecycle + dispatcher + gRPC e2e with the SDK, server exit
 VALKA_TEST_S3_ENDPOINT=http://localhost:9000 AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
-  cargo test -p valka-tests --features minio minio_    # real S3 conditional writes (bucket valka-test)
+  cargo test -p valka-tests --features minio minio_    # real S3: CAS, self-test, two-node takeover (bucket valka-test)
 ```
 
 Integration tests build a `TestNode` (engine + dispatcher + REST router) on an in-memory object store per test; `Store::wrap` over a shared `InMemory` simulates a node crash + restart on the same bucket.

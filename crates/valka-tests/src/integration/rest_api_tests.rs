@@ -58,7 +58,7 @@ async fn test_rest_create_task() {
     // Durable in the bucket.
     node.engine.sync().await.unwrap();
     assert_eq!(
-        valka_wal::reader::read_all(&node.store, "test-node", None)
+        valka_wal::reader::read_node(&node.store, "test-node")
             .await
             .unwrap()
             .len(),

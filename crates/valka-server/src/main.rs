@@ -30,9 +30,10 @@ async fn main() -> Result<()> {
     let mut config = valka_core::ServerConfig::load(config_path.as_deref())?;
 
     if config.node_id.is_empty() {
-        // Diskless nodes get a fresh identity each start. Set VALKA_NODE_ID for a
-        // stable identity (recommended in production so the node replays its own WAL).
-        config.node_id = uuid::Uuid::now_v7().to_string();
+        // A stable identity lets a restarted node reclaim its own shards right away. The
+        // host name is stable on a VM, a dev machine, a container across restarts and a
+        // StatefulSet pod; set VALKA_NODE_ID to choose one explicitly.
+        config.node_id = default_node_id();
     }
     info!(node_id = %config.node_id, backend = %config.storage.backend, "Node ID assigned");
 
@@ -149,8 +150,11 @@ async fn main() -> Result<()> {
     })
     .await;
 
-    // Flush the WAL and snapshot dirty shards so the next start replays little.
-    if let Err(e) = node.engine.shutdown().await {
+    // A clean stop hands shards to live peers, or snapshots them for the next start.
+    // A poisoned node must not write anything more: it exits and its successor recovers.
+    if reason.is_clean()
+        && let Err(e) = node.engine.stop().await
+    {
         tracing::error!(error = %e, "engine shutdown failed");
     }
 
@@ -163,5 +167,34 @@ async fn main() -> Result<()> {
         Ok(())
     } else {
         anyhow::bail!("Valka server stopped: {reason:?}")
+    }
+}
+
+/// The host name, reduced to the characters node ids allow.
+fn default_node_id() -> String {
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|h| h.trim().to_string())
+        })
+        .unwrap_or_default();
+    let id: String = host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(64)
+        .collect();
+    if id.is_empty() {
+        "valka-1".to_string()
+    } else {
+        id
     }
 }
