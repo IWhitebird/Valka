@@ -6,7 +6,8 @@ use valka_core::{ServerError, ShardId, TaskStatus};
 use valka_wal::{TaskSpec, WalRecord};
 
 use crate::engine::{
-    CreateTask, DispatchInfo, Engine, FailResult, ResultOutcome, RunLocation, RunResult,
+    CreateTask, DispatchInfo, Engine, FailResult, ReattachOutcome, ResultOutcome, RunLocation,
+    RunResult,
 };
 use crate::state::{RunEnd, RunStatus, SignalStatus};
 use crate::timers::TimerKind;
@@ -465,6 +466,92 @@ impl Engine {
             checkpoints: t.checkpoint_views(),
             pending_signals: Vec::new(),
         })
+    }
+
+    /// A worker reconnected (through `node_id`) with a run in progress (PHASE2 §11.4):
+    /// a current run is reattached to its new node; a run whose dispatch record was lost
+    /// in a crash (task PENDING at exactly that attempt) is adopted under the worker's
+    /// run id; anything else is stale.
+    pub async fn reattach(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        attempt: i32,
+        worker_id: &str,
+        node_id: &str,
+    ) -> Result<ReattachOutcome, ServerError> {
+        let shard = self.shard_for(task_id)?;
+        let lease = self.inner.clock.now()
+            + ChronoDuration::seconds(self.inner.cfg.scheduler.heartbeat_lease_secs);
+        enum Plan {
+            Reattach,
+            Adopt,
+            Stale,
+        }
+        let plan = {
+            let st = self.inner.shards[shard.index()].lock();
+            match st.tasks.get(task_id) {
+                None => Plan::Stale,
+                Some(t) => match t.status {
+                    TaskStatus::Running
+                        if t.current_run()
+                            .is_some_and(|r| r.id == run_id && r.status == RunStatus::Running) =>
+                    {
+                        Plan::Reattach
+                    }
+                    TaskStatus::Pending
+                        if t.due
+                            && attempt == t.attempt_count + 1
+                            && !t.runs.iter().any(|r| r.id == run_id) =>
+                    {
+                        Plan::Adopt
+                    }
+                    _ => Plan::Stale,
+                },
+            }
+        };
+        match plan {
+            Plan::Stale => Ok(ReattachOutcome::Stale),
+            Plan::Adopt => match self.dispatch_to(task_id, worker_id, node_id, Some(run_id)) {
+                Ok(_) => Ok(ReattachOutcome::Adopted),
+                Err(ServerError::InvalidStatusTransition { .. }) => Ok(ReattachOutcome::Stale),
+                Err(e) => Err(e),
+            },
+            Plan::Reattach => {
+                let res = self.mutate(
+                    shard,
+                    |st| {
+                        let t = st
+                            .tasks
+                            .get(task_id)
+                            .ok_or_else(|| ServerError::TaskNotFound(task_id.into()))?;
+                        ensure_running(t, run_id)?;
+                        Ok((
+                            WalRecord::RunReattached {
+                                task_id: task_id.into(),
+                                run_id: run_id.into(),
+                                worker_id: worker_id.into(),
+                                node_id: node_id.into(),
+                                lease_until: lease,
+                            },
+                            (),
+                        ))
+                    },
+                    |_| (),
+                );
+                match res {
+                    Ok((durable, transitions, _, _)) => {
+                        // Asynchronous like a dispatch record: losing it only costs the
+                        // routing of a cancel or signal until the next reattach.
+                        self.spawn_after_durable(durable, transitions);
+                        Ok(ReattachOutcome::Reattached)
+                    }
+                    Err(ServerError::InvalidStatusTransition { .. })
+                    | Err(ServerError::LeaseExpired(_)) => Ok(ReattachOutcome::Stale),
+                    Err(e) => Err(e),
+                }
+            }
+        }
     }
 
     /// The run was dispatched but its worker never got the assignment: put the task back

@@ -30,8 +30,8 @@ pub use checkpoints::{MAX_CHECKPOINT_BYTES, MAX_CHECKPOINTS_PER_TASK, MAX_STEP_N
 pub use clock::{Clock, TokioClock};
 pub use cluster::{GcReport, MemberInfo};
 pub use engine::{
-    CreateTask, DispatchInfo, Engine, EngineConfig, EngineEvent, FailResult, ResultOutcome,
-    RunLocation, RunResult,
+    CreateTask, DispatchInfo, Engine, EngineConfig, EngineEvent, FailResult, ReattachOutcome,
+    ResultOutcome, RunLocation, RunResult,
 };
 pub use ingest::LogIngester;
 pub use ownership::ClaimRefused;

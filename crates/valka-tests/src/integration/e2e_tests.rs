@@ -503,3 +503,86 @@ async fn e2e_task_outliving_a_restart_still_logs_and_checkpoints() {
     let _ = server.shutdown.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), server.handle).await;
 }
+
+/// The server crashes after dispatching a task but before the dispatch record reached the
+/// bucket. The restarted server sees the task PENDING; the worker, still running it,
+/// reconnects and reports the run in its hello, and the server adopts it instead of
+/// running the task again (PHASE2 §11.4).
+#[tokio::test]
+async fn e2e_reconnecting_worker_adopts_a_run_whose_dispatch_was_lost() {
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let (faulty, faults) = valka_wal::fault::faulty_over(backing.clone(), 5);
+    let port = free_port().await;
+    let server = start_server(faulty, "adopt", port).await;
+    let mut client = ValkaClient::connect(&server.addr).await.unwrap();
+    let id = client.create_task("q", "t", None).await.unwrap().id;
+    // From here nothing reaches the bucket: the dispatch record will be lost.
+    faults.set_puts_down(true);
+
+    let started = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (s, gate) = (started.clone(), release.clone());
+    let worker = ValkaWorker::builder()
+        .name("adopted-worker")
+        .server_addr(&server.addr)
+        .queues(&["q"])
+        .concurrency(1)
+        .handler(move |_ctx| {
+            let (s, gate) = (s.clone(), gate.clone());
+            async move {
+                s.fetch_add(1, Ordering::SeqCst);
+                gate.notified().await;
+                Ok(serde_json::json!({"adopted": true}))
+            }
+        })
+        .build()
+        .await
+        .unwrap();
+    let stop = worker.shutdown_handle();
+    let worker_task = tokio::spawn(worker.run());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while started.load(Ordering::SeqCst) == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "task never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let run_on_worker = server.node.engine.runs_for_task(&id).unwrap()[0].id.clone();
+
+    // Crash, bucket back, restart on the same bucket and port.
+    let _ = server.shutdown.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), server.handle).await;
+    server.node.engine.halt();
+    drop(server.node);
+    drop(client);
+    faults.set_puts_down(false);
+    let store = Store::wrap(backing, "", true, "shared-memory");
+    let server = start_server(store, "adopt", port).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let runs = server.node.engine.runs_for_task(&id).unwrap_or_default();
+        if runs.first().is_some_and(|r| r.id == run_on_worker) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the reconnecting worker's run was not adopted: {runs:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    release.notify_one();
+    let mut client = ValkaClient::connect(&server.addr).await.unwrap();
+    let t = wait_status(&mut client, &id, 4, Duration::from_secs(15)).await;
+    assert_eq!(t.attempt_count, 1);
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        1,
+        "the task ran exactly once"
+    );
+    assert_eq!(server.node.engine.runs_for_task(&id).unwrap().len(), 1);
+
+    stop.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker_task).await;
+    let _ = server.shutdown.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), server.handle).await;
+}

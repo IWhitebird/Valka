@@ -499,6 +499,16 @@ impl Api {
                 e.signal_acked(&signal_id);
                 Ok(Reply::Done)
             }
+            Command::Reattach {
+                task_id,
+                run_id,
+                attempt,
+                worker_id,
+                node_id,
+            } => Ok(Reply::Reattached(
+                e.reattach(&task_id, &run_id, attempt, &worker_id, &node_id)
+                    .await?,
+            )),
             Command::ResetSignals { task_id } => {
                 self.ensure_readable(&task_id)?;
                 e.reset_signals(&task_id);
@@ -1001,6 +1011,32 @@ impl TaskRouter for Api {
                 task_id: task_id.into(),
             })
             .await;
+    }
+
+    async fn reattach(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        attempt: i32,
+        worker_id: &str,
+    ) -> Result<valka_engine::ReattachOutcome, ServerError> {
+        if self.inner.engine.shard_of(task_id).is_none() {
+            return Ok(valka_engine::ReattachOutcome::Stale);
+        }
+        let cmd = Command::Reattach {
+            task_id: task_id.into(),
+            run_id: run_id.into(),
+            attempt,
+            worker_id: worker_id.into(),
+            node_id: self.node_id().into(),
+        };
+        match self.route(cmd).await {
+            Ok(Reply::Reattached(o)) => Ok(o),
+            // A task the cluster does not know: it was deleted, the run is stale.
+            Err(ServerError::TaskNotFound(_)) => Ok(valka_engine::ReattachOutcome::Stale),
+            Ok(r) => Err(unexpected(r)),
+            Err(e) => Err(e),
+        }
     }
 }
 

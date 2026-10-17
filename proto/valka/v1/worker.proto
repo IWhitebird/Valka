@@ -43,6 +43,16 @@ message WorkerHello {
     repeated string queues = 3;
     int32 concurrency = 4;
     string metadata = 5;           // JSON string
+    // Runs this worker is still executing when it (re)connects. The server reattaches
+    // each one, adopts it if its dispatch record was lost in a crash, or answers with a
+    // TaskCancellation if the run is stale.
+    repeated RunningTask running = 6;
+}
+
+message RunningTask {
+    string task_id = 1;
+    string task_run_id = 2;
+    int32 attempt_number = 3;
 }
 
 message TaskResult {

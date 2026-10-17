@@ -10,6 +10,8 @@ import {
   type ResultAck,
   type TaskResult,
   type WorkerRequest,
+  type RunningTask,
+  type WorkerHello,
 } from "./generated/valka/v1/worker.js";
 import { RetryPolicy } from "./retry.js";
 import type { TaskHandler, ValkaWorkerOptions } from "./types.js";
@@ -78,6 +80,9 @@ export class ValkaWorker {
   // Survive reconnects: tasks running or awaiting a result ack (heartbeated on whichever
   // connection is current), results not yet acknowledged, and the current connection.
   private readonly running = new Set<string>();
+  // Runs still executing, by task id: listed in every WorkerHello so the server can
+  // reattach them to the new connection (or adopt or cancel them).
+  private readonly runs = new Map<string, RunningTask>();
   private readonly unacked = new Map<string, TaskResult>();
   private readonly taskContexts = new Map<string, TaskContext>();
   private outbound: ((msg: DeepPartial<WorkerRequest>) => void) | null = null;
@@ -123,6 +128,18 @@ export class ValkaWorker {
   }
 
   /** Keep the result until it is APPLIED or STALE; a later connection resends it. */
+  /** Opens a session: lists runs still executing from before this connection. */
+  helloMessage(): WorkerHello {
+    return {
+      workerId: this.workerId,
+      workerName: this.name,
+      queues: this.queues,
+      concurrency: this.concurrency,
+      metadata: this.metadataStr,
+      running: Array.from(this.runs.values()),
+    };
+  }
+
   private deliver(result: TaskResult): void {
     this.unacked.set(result.taskRunId, result);
     this.outbound?.({ taskResult: result });
@@ -193,15 +210,7 @@ export class ValkaWorker {
     };
 
     // Send WorkerHello
-    send({
-      hello: {
-        workerId: this.workerId,
-        workerName: this.name,
-        queues: this.queues,
-        concurrency: this.concurrency,
-        metadata: this.metadataStr,
-      },
-    });
+    send({ hello: this.helloMessage() });
 
     // Register this connection before resending: a result delivered concurrently is
     // then either in the resend below or sent on this connection.
@@ -263,6 +272,11 @@ export class ValkaWorker {
         if (response.taskAssignment) {
           const assignment = response.taskAssignment;
           this.running.add(assignment.taskId);
+          this.runs.set(assignment.taskId, {
+            taskId: assignment.taskId,
+            taskRunId: assignment.taskRunId,
+            attemptNumber: assignment.attemptNumber,
+          });
 
           this.acquireSlot().then(async () => {
             const ctx = new TaskContext(
@@ -314,6 +328,7 @@ export class ValkaWorker {
               };
             }
             this.taskContexts.delete(assignment.taskId);
+            this.runs.delete(assignment.taskId);
             this.releaseSlot();
             this.deliver(result);
           });

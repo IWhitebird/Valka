@@ -132,3 +132,28 @@ def test_checkpoint_without_a_session_fails_fast():
 
     asyncio.run(run())
 
+
+def test_hello_lists_runs_still_executing():
+    gate = asyncio.Event()
+
+    async def handler(ctx):
+        await gate.wait()
+        return {}
+
+    async def run():
+        w = make_worker(handler)
+        assert list(w._hello().hello.running) == []
+        assignment = worker_pb2.TaskAssignment(
+            task_id="a", task_run_id="a-run", attempt_number=3
+        )
+        await w._handle_task_assignment(assignment)
+        running = w._hello().hello.running
+        assert [(r.task_id, r.task_run_id, r.attempt_number) for r in running] == [
+            ("a", "a-run", 3)
+        ]
+        gate.set()
+        await asyncio.gather(*w._active_tasks.values())
+        await asyncio.sleep(0)
+        assert list(w._hello().hello.running) == []
+
+    asyncio.run(run())

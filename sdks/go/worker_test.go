@@ -1,6 +1,7 @@
 package valka
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -83,5 +84,37 @@ func TestUnackedResultsAreResentOnNewSession(t *testing.T) {
 	w.resendUnacked()
 	if got := sentResults(w); len(got) != 2 {
 		t.Fatalf("expected both unacked results resent, got %d", len(got))
+	}
+}
+
+func TestHelloListsRunsStillExecuting(t *testing.T) {
+	release := make(chan struct{})
+	w, err := NewWorker(
+		WithQueues("q"),
+		WithHandler(func(*TaskContext) (interface{}, error) {
+			<-release
+			return nil, nil
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := w.helloRequest().GetHello().Running; len(got) != 0 {
+		t.Fatalf("a fresh worker runs nothing, got %v", got)
+	}
+	w.handleTaskAssignment(context.Background(), &pb.TaskAssignment{
+		TaskId: "t1", TaskRunId: "r1", AttemptNumber: 2, QueueName: "q", TaskName: "n",
+	})
+	running := w.helloRequest().GetHello().Running
+	if len(running) != 1 || running[0].TaskRunId != "r1" || running[0].AttemptNumber != 2 {
+		t.Fatalf("the executing run must be reported on reconnect, got %v", running)
+	}
+	close(release)
+	deadline := time.Now().Add(5 * time.Second)
+	for len(w.helloRequest().GetHello().Running) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("a finished run is still reported")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

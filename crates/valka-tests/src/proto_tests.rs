@@ -121,9 +121,15 @@ fn test_worker_hello_construction() {
         queues: vec!["q1".to_string(), "q2".to_string()],
         concurrency: 4,
         metadata: "{\"env\":\"prod\"}".to_string(),
+        running: vec![RunningTask {
+            task_id: "t".to_string(),
+            task_run_id: "r".to_string(),
+            attempt_number: 2,
+        }],
     };
     assert_eq!(hello.queues.len(), 2);
     assert_eq!(hello.concurrency, 4);
+    assert_eq!(hello.running[0].attempt_number, 2);
 }
 
 #[test]

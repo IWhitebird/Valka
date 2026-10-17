@@ -33,6 +33,7 @@ type ValkaWorker struct {
 
 	semaphore      chan struct{}
 	activeTasks    sync.Map
+	runs           sync.Map // task_id -> *pb.RunningTask, sent in WorkerHello on every connect
 	signalChannels sync.Map // task_id -> chan *pb.TaskSignal
 	unacked        sync.Map // task_run_id -> *pb.TaskResult, kept until APPLIED or STALE
 	clientMu       sync.RWMutex
@@ -271,24 +272,7 @@ func (w *ValkaWorker) session(ctx context.Context) error {
 		return NewConnectionError("failed to open session", err)
 	}
 
-	// Send hello
-	metaStr := ""
-	if w.metadata != nil {
-		data, _ := json.Marshal(w.metadata)
-		metaStr = string(data)
-	}
-	hello := &pb.WorkerRequest{
-		Request: &pb.WorkerRequest_Hello{
-			Hello: &pb.WorkerHello{
-				WorkerId:    w.workerID,
-				WorkerName:  w.name,
-				Queues:      w.queues,
-				Concurrency: int32(w.concurrency),
-				Metadata:    metaStr,
-			},
-		},
-	}
-	if err := stream.Send(hello); err != nil {
+	if err := stream.Send(w.helloRequest()); err != nil {
 		return NewConnectionError("failed to send hello", err)
 	}
 
@@ -405,6 +389,11 @@ func (w *ValkaWorker) handleTaskAssignment(ctx context.Context, assignment *pb.T
 
 	taskCtx, taskCancel := context.WithCancel(ctx)
 	w.activeTasks.Store(assignment.TaskId, taskCancel)
+	w.runs.Store(assignment.TaskId, &pb.RunningTask{
+		TaskId:        assignment.TaskId,
+		TaskRunId:     assignment.TaskRunId,
+		AttemptNumber: assignment.AttemptNumber,
+	})
 
 	// Create signal channel for this task
 	sigCh := make(chan *pb.TaskSignal, 64)
@@ -417,6 +406,7 @@ func (w *ValkaWorker) handleTaskAssignment(ctx context.Context, assignment *pb.T
 		defer func() {
 			<-w.semaphore
 			w.activeTasks.Delete(assignment.TaskId)
+			w.runs.Delete(assignment.TaskId)
 			w.signalChannels.Delete(assignment.TaskId)
 			w.wg.Done()
 		}()
@@ -511,4 +501,32 @@ func generateUUID() string {
 	b[8] = (b[8] & 0x3f) | 0x80 // variant 2
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// helloRequest opens a session. It lists the runs still executing from before this
+// connection: the server reattaches each one to this connection, adopts it if its
+// dispatch was lost, or cancels it if it is stale.
+func (w *ValkaWorker) helloRequest() *pb.WorkerRequest {
+	metaStr := ""
+	if w.metadata != nil {
+		data, _ := json.Marshal(w.metadata)
+		metaStr = string(data)
+	}
+	var running []*pb.RunningTask
+	w.runs.Range(func(_, v interface{}) bool {
+		running = append(running, v.(*pb.RunningTask))
+		return true
+	})
+	return &pb.WorkerRequest{
+		Request: &pb.WorkerRequest_Hello{
+			Hello: &pb.WorkerHello{
+				WorkerId:    w.workerID,
+				WorkerName:  w.name,
+				Queues:      w.queues,
+				Concurrency: int32(w.concurrency),
+				Metadata:    metaStr,
+				Running:     running,
+			},
+		},
+	}
 }

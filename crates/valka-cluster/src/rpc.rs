@@ -6,7 +6,7 @@ use serde_json::Value;
 use valka_core::{ServerError, TaskStatus};
 use valka_engine::{
     CheckpointView, CreateTask, DeadLetterView, DispatchInfo, DispatchableTask, NodeStats,
-    ResultOutcome, RunResult, RunView, ShardStats, SignalView, TaskView,
+    ReattachOutcome, ResultOutcome, RunResult, RunView, ShardStats, SignalView, TaskView,
 };
 
 /// A command for another node: most are about one task and run on the owner of its
@@ -87,6 +87,14 @@ pub enum Command {
     ResetSignals {
         task_id: String,
     },
+    /// A worker attached to `node_id` reconnected with this run in progress.
+    Reattach {
+        task_id: String,
+        run_id: String,
+        attempt: i32,
+        worker_id: String,
+        node_id: String,
+    },
 
     // ── addressed to a node, not routed by shard ──
     /// Extend the leases of these running tasks (those the receiving node owns).
@@ -135,6 +143,7 @@ impl Command {
             | Command::Unoffer { task_id }
             | Command::ReportResult { task_id, .. }
             | Command::Checkpoint { task_id, .. }
+            | Command::Reattach { task_id, .. }
             | Command::ResetSignals { task_id } => Target::Shard(task_id),
             Command::FindIdempotent { probe_id, .. } => Target::Shard(probe_id),
             Command::SignalDelivered { signal_id } | Command::SignalAcked { signal_id } => {
@@ -174,6 +183,7 @@ impl Command {
             Command::SignalDelivered { .. } => "signal_delivered",
             Command::SignalAcked { .. } => "signal_acked",
             Command::ResetSignals { .. } => "reset_signals",
+            Command::Reattach { .. } => "reattach",
             Command::Heartbeat { .. } => "heartbeat",
             Command::Fetch { .. } => "fetch",
             Command::CancelOnWorker { .. } => "cancel_on_worker",
@@ -199,6 +209,7 @@ pub enum Reply {
     Result(ResultOutcome),
     Checkpoint(CheckpointView),
     Fetched(Vec<DispatchableTask>),
+    Reattached(ReattachOutcome),
     /// Whether a worker of the receiving node got the message.
     Delivered(bool),
     /// Task ids the receiving node does not own.

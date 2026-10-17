@@ -1420,3 +1420,61 @@ async fn dispatch_with_a_run_id_is_idempotent_and_a_returned_run_spends_no_attem
     assert_eq!(d.pending_signals.len(), 1);
     assert_eq!(d.pending_signals[0].signal_name, "early");
 }
+
+#[tokio::test(start_paused = true)]
+async fn reattach_reattaches_adopts_or_calls_a_run_stale() {
+    use crate::ReattachOutcome::{Adopted, Reattached, Stale};
+    let store = Store::memory();
+    let e = open(&store).await;
+
+    // A current run, reconnecting through another node: it moves there.
+    let t = e.create_task(create("q")).await.unwrap();
+    let d = e.dispatch(&t.id, "w").unwrap();
+    assert_eq!(
+        e.reattach(&t.id, &d.run_id, d.attempt, "w", "node-b")
+            .await
+            .unwrap(),
+        Reattached
+    );
+    settle().await;
+    let loc = e.run_location(&t.id).unwrap();
+    assert_eq!(
+        (loc.worker_id.as_str(), loc.node_id.as_str()),
+        ("w", "node-b")
+    );
+
+    // A run whose dispatch record was lost: the task is PENDING at that very attempt.
+    let lost = e.create_task(create("q")).await.unwrap();
+    let shard = e.shard_of(&lost.id).unwrap();
+    let run = valka_core::new_id_in_shard(shard).to_string();
+    assert_eq!(
+        e.reattach(&lost.id, &run, 1, "w2", "node-c").await.unwrap(),
+        Adopted
+    );
+    let v = e.get_task(&lost.id).unwrap();
+    assert_eq!(v.status, TaskStatus::Running);
+    assert_eq!(e.runs_for_task(&lost.id).unwrap()[0].id, run);
+    // ...but not at another attempt, nor twice.
+    let other = e.create_task(create("q")).await.unwrap();
+    let r2 = valka_core::new_id_in_shard(e.shard_of(&other.id).unwrap()).to_string();
+    assert_eq!(
+        e.reattach(&other.id, &r2, 2, "w", "n").await.unwrap(),
+        Stale
+    );
+
+    // Finished, cancelled, superseded or unknown runs are stale.
+    e.complete_run(&t.id, &d.run_id, None).await.unwrap();
+    assert_eq!(
+        e.reattach(&t.id, &d.run_id, d.attempt, "w", "node-b")
+            .await
+            .unwrap(),
+        Stale
+    );
+    e.cancel_task(&lost.id, "user").await.unwrap();
+    assert_eq!(
+        e.reattach(&lost.id, &run, 1, "w2", "node-c").await.unwrap(),
+        Stale
+    );
+    let gone = valka_core::new_id_in_shard(shard).to_string();
+    assert_eq!(e.reattach(&gone, &gone, 1, "w", "n").await.unwrap(), Stale);
+}

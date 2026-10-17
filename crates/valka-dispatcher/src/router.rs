@@ -7,7 +7,9 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use valka_core::ServerError;
-use valka_engine::{CheckpointView, DispatchInfo, Engine, ResultOutcome, RunResult};
+use valka_engine::{
+    CheckpointView, DispatchInfo, Engine, ReattachOutcome, ResultOutcome, RunResult,
+};
 
 #[async_trait]
 pub trait TaskRouter: Send + Sync {
@@ -31,6 +33,14 @@ pub trait TaskRouter: Send + Sync {
     async fn signal_acked(&self, signal_id: &str);
     /// The worker running the task went away: undelivered signals go back to PENDING.
     async fn reset_signals(&self, task_id: &str);
+    /// A (re)connecting worker still runs this run, attached to this node now.
+    async fn reattach(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        attempt: i32,
+        worker_id: &str,
+    ) -> Result<ReattachOutcome, ServerError>;
 }
 
 /// Every task is this node's own.
@@ -70,5 +80,17 @@ impl TaskRouter for LocalRouter {
     }
     async fn reset_signals(&self, task_id: &str) {
         self.0.reset_signals(task_id);
+    }
+    async fn reattach(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        attempt: i32,
+        worker_id: &str,
+    ) -> Result<ReattachOutcome, ServerError> {
+        let node = self.0.node_id().to_string();
+        self.0
+            .reattach(task_id, run_id, attempt, worker_id, &node)
+            .await
     }
 }

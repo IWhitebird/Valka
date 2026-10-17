@@ -52,18 +52,30 @@ class WorkerResponse(_message.Message):
     def __init__(self, task_assignment: _Optional[_Union[TaskAssignment, _Mapping]] = ..., task_cancellation: _Optional[_Union[TaskCancellation, _Mapping]] = ..., heartbeat_ack: _Optional[_Union[HeartbeatAck, _Mapping]] = ..., server_shutdown: _Optional[_Union[ServerShutdown, _Mapping]] = ..., task_signal: _Optional[_Union[TaskSignal, _Mapping]] = ..., result_ack: _Optional[_Union[ResultAck, _Mapping]] = ...) -> None: ...
 
 class WorkerHello(_message.Message):
-    __slots__ = ("worker_id", "worker_name", "queues", "concurrency", "metadata")
+    __slots__ = ("worker_id", "worker_name", "queues", "concurrency", "metadata", "running")
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_NAME_FIELD_NUMBER: _ClassVar[int]
     QUEUES_FIELD_NUMBER: _ClassVar[int]
     CONCURRENCY_FIELD_NUMBER: _ClassVar[int]
     METADATA_FIELD_NUMBER: _ClassVar[int]
+    RUNNING_FIELD_NUMBER: _ClassVar[int]
     worker_id: str
     worker_name: str
     queues: _containers.RepeatedScalarFieldContainer[str]
     concurrency: int
     metadata: str
-    def __init__(self, worker_id: _Optional[str] = ..., worker_name: _Optional[str] = ..., queues: _Optional[_Iterable[str]] = ..., concurrency: _Optional[int] = ..., metadata: _Optional[str] = ...) -> None: ...
+    running: _containers.RepeatedCompositeFieldContainer[RunningTask]
+    def __init__(self, worker_id: _Optional[str] = ..., worker_name: _Optional[str] = ..., queues: _Optional[_Iterable[str]] = ..., concurrency: _Optional[int] = ..., metadata: _Optional[str] = ..., running: _Optional[_Iterable[_Union[RunningTask, _Mapping]]] = ...) -> None: ...
+
+class RunningTask(_message.Message):
+    __slots__ = ("task_id", "task_run_id", "attempt_number")
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    TASK_RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_NUMBER_FIELD_NUMBER: _ClassVar[int]
+    task_id: str
+    task_run_id: str
+    attempt_number: int
+    def __init__(self, task_id: _Optional[str] = ..., task_run_id: _Optional[str] = ..., attempt_number: _Optional[int] = ...) -> None: ...
 
 class TaskResult(_message.Message):
     __slots__ = ("task_id", "task_run_id", "success", "retryable", "output", "error_message")

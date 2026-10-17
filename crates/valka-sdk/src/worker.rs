@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -137,7 +137,9 @@ pub struct ValkaWorker {
 /// acknowledged, and the current outbound channel.
 #[derive(Default)]
 struct Session {
-    running: Mutex<HashSet<String>>,
+    /// task id -> the run this worker executes (sent in `WorkerHello.running` on every
+    /// connect, so the server can reattach it to the new connection's node).
+    running: Mutex<HashMap<String, RunningTask>>,
     unacked: Mutex<HashMap<String, TaskResult>>,
     signals: Mutex<HashMap<String, mpsc::Sender<TaskSignal>>>,
     outbound: Mutex<Option<mpsc::Sender<WorkerRequest>>>,
@@ -253,6 +255,14 @@ impl ValkaWorker {
                 queues: self.queues.clone(),
                 concurrency: self.concurrency,
                 metadata: self.metadata.clone(),
+                running: self
+                    .session
+                    .running
+                    .lock()
+                    .await
+                    .values()
+                    .cloned()
+                    .collect(),
             })),
         };
         request_tx
@@ -282,7 +292,7 @@ impl ValkaWorker {
             loop {
                 interval.tick().await;
                 let task_ids: Vec<String> =
-                    hb_session.running.lock().await.iter().cloned().collect();
+                    hb_session.running.lock().await.keys().cloned().collect();
                 let hb = WorkerRequest {
                     request: Some(worker_request::Request::Heartbeat(Heartbeat {
                         active_task_ids: task_ids,
@@ -361,7 +371,14 @@ impl ValkaWorker {
     /// the spawned task, so cancels, signals and acks keep flowing at full capacity.
     async fn start_task(&self, assignment: TaskAssignment, rpc: WorkerServiceClient<Channel>) {
         let task_id = assignment.task_id.clone();
-        self.session.running.lock().await.insert(task_id.clone());
+        self.session.running.lock().await.insert(
+            task_id.clone(),
+            RunningTask {
+                task_id: task_id.clone(),
+                task_run_id: assignment.task_run_id.clone(),
+                attempt_number: assignment.attempt_number,
+            },
+        );
         let (sig_tx, sig_rx) = mpsc::channel::<TaskSignal>(64);
         self.session
             .signals

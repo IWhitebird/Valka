@@ -99,6 +99,17 @@ pub struct DispatchInfo {
     pub pending_signals: Vec<crate::view::SignalView>,
 }
 
+/// The owner's answer to a worker that reconnects with a run in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ReattachOutcome {
+    /// The run is current; it now lives on the worker's new node.
+    Reattached,
+    /// Its dispatch record was lost in a crash; the worker's run was recorded now.
+    Adopted,
+    /// The run ended or was superseded: the worker must stop it.
+    Stale,
+}
+
 /// Where a running run lives: which worker, attached to which node.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RunLocation {

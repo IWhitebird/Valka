@@ -244,6 +244,29 @@ impl ShardState {
                 }
             }
 
+            WalRecord::RunReattached {
+                task_id,
+                run_id,
+                worker_id,
+                node_id,
+                lease_until,
+            } => {
+                let Some(t) = self.tasks.get_mut(task_id) else {
+                    return out;
+                };
+                if t.status != TaskStatus::Running {
+                    return out;
+                }
+                if let Some(run) = t.runs.last_mut().filter(|r| r.id == *run_id)
+                    && run.status == RunStatus::Running
+                {
+                    run.worker_id = worker_id.clone();
+                    run.node_id = node_id.clone();
+                    run.lease_until = run.lease_until.max(*lease_until);
+                    run.last_heartbeat = now;
+                }
+            }
+
             WalRecord::RunReturned { task_id, run_id } => {
                 let Some(t) = self.tasks.get_mut(task_id) else {
                     return out;

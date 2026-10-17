@@ -63,6 +63,9 @@ class ValkaWorker:
 
         self._semaphore = asyncio.Semaphore(concurrency)
         self._active_tasks: dict[str, asyncio.Task[None]] = {}
+        # Runs still executing, by task id: listed in every WorkerHello so the server can
+        # reattach them to the new connection (or adopt or cancel them).
+        self._runs: dict[str, tuple[str, int]] = {}
         self._task_contexts: dict[str, TaskContext] = {}
         # task_run_id -> TaskResult, kept until the server answers APPLIED or STALE.
         self._unacked: dict[str, Any] = {}
@@ -169,18 +172,7 @@ class ValkaWorker:
             self._stub = worker_pb2_grpc.WorkerServiceStub(channel)
             self._stream = self._stub.Session()
 
-            # Send hello
-            meta_str = json.dumps(self._metadata) if self._metadata else ""
-            hello = worker_pb2.WorkerRequest(
-                hello=worker_pb2.WorkerHello(
-                    worker_id=self._worker_id,
-                    worker_name=self._name,
-                    queues=self._queues,
-                    concurrency=self._concurrency,
-                    metadata=meta_str,
-                )
-            )
-            await self._stream.write(hello)
+            await self._stream.write(self._hello())
             for result in list(self._unacked.values()):
                 await self._stream.write(worker_pb2.WorkerRequest(task_result=result))
 
@@ -286,7 +278,29 @@ class ValkaWorker:
         except Exception:
             logger.debug("Result send failed; the next session resends", exc_info=True)
 
+    def _hello(self) -> Any:
+        """Open a session, listing the runs still executing from before this connection."""
+        from valka._proto.valka.v1 import worker_pb2
+
+        meta_str = json.dumps(self._metadata) if self._metadata else ""
+        return worker_pb2.WorkerRequest(
+            hello=worker_pb2.WorkerHello(
+                worker_id=self._worker_id,
+                worker_name=self._name,
+                queues=self._queues,
+                concurrency=self._concurrency,
+                metadata=meta_str,
+                running=[
+                    worker_pb2.RunningTask(
+                        task_id=task_id, task_run_id=run_id, attempt_number=attempt
+                    )
+                    for task_id, (run_id, attempt) in self._runs.items()
+                ],
+            )
+        )
+
     async def _handle_task_assignment(self, assignment: Any) -> None:
+        self._runs[assignment.task_id] = (assignment.task_run_id, assignment.attempt_number)
         task = asyncio.create_task(self._execute_task(assignment))
         self._active_tasks[assignment.task_id] = task
         task.add_done_callback(lambda _t: self._task_done(assignment.task_id))
@@ -298,6 +312,7 @@ class ValkaWorker:
 
     def _task_done(self, task_id: str) -> None:
         self._active_tasks.pop(task_id, None)
+        self._runs.pop(task_id, None)
         self._task_contexts.pop(task_id, None)
 
     async def _execute_task(self, assignment: Any) -> None:

@@ -55,6 +55,13 @@ pub async fn handle_worker_stream(
     );
 
     dispatcher.register_worker(handle).await;
+    // Runs the worker kept running across a reconnect: reattach, adopt or cancel each,
+    // before it is offered new work (its slots are busy with them).
+    if !hello.running.is_empty() {
+        dispatcher
+            .reattach_running(&worker_id, &hello.running, &response_tx)
+            .await;
+    }
 
     // Start background task matching loop for this worker
     let dispatcher_clone = dispatcher.clone();

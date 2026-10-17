@@ -359,3 +359,73 @@ async fn test_every_result_is_answered_with_a_result_ack() {
         TaskStatus::Cancelled
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn test_reconnecting_worker_keeps_current_runs_and_cancels_stale_ones() {
+    use valka_proto::{RunningTask, worker_response};
+    let node = TestNode::new().await;
+    node.engine
+        .set_sink(std::sync::Arc::new(valka_engine::NoopSink));
+    let live = node.create("q", "t").await;
+    let live_run = node.start(&live.id, "w-old");
+    let done = node.create("q", "t").await;
+    node.complete(&done.id).await;
+    let done_run = node.engine.runs_for_task(&done.id).unwrap()[0].id.clone();
+    let lost = node.create("q", "t").await;
+    let lost_run = valka_core::new_id_in_shard(node.engine.shard_of(&lost.id).unwrap()).to_string();
+
+    let (wid, mut rx) = node.register_worker(&["q"], 4).await;
+    let handle_tx = node
+        .dispatcher
+        .workers()
+        .get(wid.as_ref())
+        .unwrap()
+        .response_tx
+        .clone();
+    node.dispatcher
+        .reattach_running(
+            &wid,
+            &[
+                RunningTask {
+                    task_id: live.id.clone(),
+                    task_run_id: live_run.clone(),
+                    attempt_number: 1,
+                },
+                RunningTask {
+                    task_id: done.id.clone(),
+                    task_run_id: done_run,
+                    attempt_number: 1,
+                },
+                RunningTask {
+                    task_id: lost.id.clone(),
+                    task_run_id: lost_run.clone(),
+                    attempt_number: 1,
+                },
+            ],
+            &handle_tx,
+        )
+        .await;
+    // Only the finished run is cancelled on the worker.
+    let msg = rx.recv().await.unwrap();
+    match msg.response {
+        Some(worker_response::Response::TaskCancellation(c)) => assert_eq!(c.task_id, done.id),
+        other => panic!("expected a cancellation, got {other:?}"),
+    }
+    assert!(rx.try_recv().is_err());
+    // The live run now belongs to the new worker; the lost dispatch was adopted.
+    settle().await;
+    let loc = node.engine.run_location(&live.id).unwrap();
+    assert_eq!(loc.worker_id, wid.0);
+    assert_eq!(
+        node.engine.get_task(&lost.id).unwrap().status,
+        TaskStatus::Running
+    );
+    let active = node
+        .dispatcher
+        .workers()
+        .get(wid.as_ref())
+        .unwrap()
+        .active_tasks
+        .clone();
+    assert!(active.contains(&live.id) && active.contains(&lost.id) && !active.contains(&done.id));
+}

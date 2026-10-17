@@ -86,6 +86,18 @@ export interface WorkerHello {
   concurrency: number;
   /** JSON string */
   metadata: string;
+  /**
+   * Runs this worker is still executing when it (re)connects. The server reattaches
+   * each one, adopts it if its dispatch record was lost in a crash, or answers with a
+   * TaskCancellation if the run is stale.
+   */
+  running: RunningTask[];
+}
+
+export interface RunningTask {
+  taskId: string;
+  taskRunId: string;
+  attemptNumber: number;
 }
 
 export interface TaskResult {
@@ -543,7 +555,7 @@ export const WorkerResponse: MessageFns<WorkerResponse> = {
 };
 
 function createBaseWorkerHello(): WorkerHello {
-  return { workerId: "", workerName: "", queues: [], concurrency: 0, metadata: "" };
+  return { workerId: "", workerName: "", queues: [], concurrency: 0, metadata: "", running: [] };
 }
 
 export const WorkerHello: MessageFns<WorkerHello> = {
@@ -562,6 +574,9 @@ export const WorkerHello: MessageFns<WorkerHello> = {
     }
     if (message.metadata !== "") {
       writer.uint32(42).string(message.metadata);
+    }
+    for (const v of message.running) {
+      RunningTask.encode(v!, writer.uint32(50).fork()).join();
     }
     return writer;
   },
@@ -613,6 +628,14 @@ export const WorkerHello: MessageFns<WorkerHello> = {
           message.metadata = reader.string();
           continue;
         }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.running.push(RunningTask.decode(reader, reader.uint32()));
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -637,6 +660,7 @@ export const WorkerHello: MessageFns<WorkerHello> = {
       queues: globalThis.Array.isArray(object?.queues) ? object.queues.map((e: any) => globalThis.String(e)) : [],
       concurrency: isSet(object.concurrency) ? globalThis.Number(object.concurrency) : 0,
       metadata: isSet(object.metadata) ? globalThis.String(object.metadata) : "",
+      running: globalThis.Array.isArray(object?.running) ? object.running.map((e: any) => RunningTask.fromJSON(e)) : [],
     };
   },
 
@@ -657,6 +681,9 @@ export const WorkerHello: MessageFns<WorkerHello> = {
     if (message.metadata !== "") {
       obj.metadata = message.metadata;
     }
+    if (message.running?.length) {
+      obj.running = message.running.map((e) => RunningTask.toJSON(e));
+    }
     return obj;
   },
 
@@ -670,6 +697,111 @@ export const WorkerHello: MessageFns<WorkerHello> = {
     message.queues = object.queues?.map((e) => e) || [];
     message.concurrency = object.concurrency ?? 0;
     message.metadata = object.metadata ?? "";
+    message.running = object.running?.map((e) => RunningTask.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseRunningTask(): RunningTask {
+  return { taskId: "", taskRunId: "", attemptNumber: 0 };
+}
+
+export const RunningTask: MessageFns<RunningTask> = {
+  encode(message: RunningTask, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.taskId !== "") {
+      writer.uint32(10).string(message.taskId);
+    }
+    if (message.taskRunId !== "") {
+      writer.uint32(18).string(message.taskRunId);
+    }
+    if (message.attemptNumber !== 0) {
+      writer.uint32(24).int32(message.attemptNumber);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RunningTask {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseRunningTask();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.taskId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.taskRunId = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.attemptNumber = reader.int32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): RunningTask {
+    return {
+      taskId: isSet(object.taskId)
+        ? globalThis.String(object.taskId)
+        : isSet(object.task_id)
+        ? globalThis.String(object.task_id)
+        : "",
+      taskRunId: isSet(object.taskRunId)
+        ? globalThis.String(object.taskRunId)
+        : isSet(object.task_run_id)
+        ? globalThis.String(object.task_run_id)
+        : "",
+      attemptNumber: isSet(object.attemptNumber)
+        ? globalThis.Number(object.attemptNumber)
+        : isSet(object.attempt_number)
+        ? globalThis.Number(object.attempt_number)
+        : 0,
+    };
+  },
+
+  toJSON(message: RunningTask): unknown {
+    const obj: any = {};
+    if (message.taskId !== "") {
+      obj.taskId = message.taskId;
+    }
+    if (message.taskRunId !== "") {
+      obj.taskRunId = message.taskRunId;
+    }
+    if (message.attemptNumber !== 0) {
+      obj.attemptNumber = Math.round(message.attemptNumber);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<RunningTask>, I>>(base?: I): RunningTask {
+    return RunningTask.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<RunningTask>, I>>(object: I): RunningTask {
+    const message = createBaseRunningTask();
+    message.taskId = object.taskId ?? "";
+    message.taskRunId = object.taskRunId ?? "";
+    message.attemptNumber = object.attemptNumber ?? 0;
     return message;
   },
 };

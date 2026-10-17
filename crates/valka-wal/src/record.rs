@@ -86,6 +86,15 @@ pub enum WalRecord {
         run_id: String,
         lease_until: DateTime<Utc>,
     },
+    /// A running run's worker reconnected through `node_id` (after its node died or its
+    /// stream broke): cancels and signals go there now.
+    RunReattached {
+        task_id: String,
+        run_id: String,
+        worker_id: String,
+        node_id: String,
+        lease_until: DateTime<Utc>,
+    },
     /// A dispatched run never started (its worker was gone before the assignment reached
     /// it): back to PENDING without spending an attempt.
     RunReturned {
@@ -144,6 +153,7 @@ impl WalRecord {
             | LeaseExpired { task_id, .. }
             | LeaseExtended { task_id, .. }
             | RunReturned { task_id, .. }
+            | RunReattached { task_id, .. }
             | TaskCheckpointed { task_id, .. }
             | TaskPromoted { task_id }
             | TaskCancelled { task_id, .. }
@@ -166,6 +176,7 @@ impl WalRecord {
             LeaseExpired { .. } => "lease_expired",
             LeaseExtended { .. } => "lease_extended",
             RunReturned { .. } => "run_returned",
+            RunReattached { .. } => "run_reattached",
             TaskCheckpointed { .. } => "task_checkpointed",
             TaskPromoted { .. } => "task_promoted",
             TaskCancelled { .. } => "task_cancelled",

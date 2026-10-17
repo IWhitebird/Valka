@@ -85,6 +85,47 @@ impl DispatcherService {
         valka_core::metrics::set_active_workers(self.workers.len() as f64);
     }
 
+    /// A (re)connecting worker still runs these runs. Each is reattached to this node,
+    /// adopted if its dispatch record was lost, or cancelled on the worker if stale.
+    pub async fn reattach_running(
+        &self,
+        worker_id: &WorkerId,
+        running: &[valka_proto::RunningTask],
+        tx: &mpsc::Sender<WorkerResponse>,
+    ) {
+        let router = self.router();
+        for r in running {
+            if let Some(mut h) = self.workers.get_mut(worker_id.as_ref()) {
+                h.assign_task(r.task_id.clone());
+            }
+            let outcome = router
+                .reattach(&r.task_id, &r.task_run_id, r.attempt_number, &worker_id.0)
+                .await;
+            match outcome {
+                Ok(valka_engine::ReattachOutcome::Stale) => {
+                    info!(worker_id = %worker_id, task_id = %r.task_id, "stale run on reconnect: cancelling it");
+                    if let Some(mut h) = self.workers.get_mut(worker_id.as_ref()) {
+                        h.complete_task(&r.task_id);
+                    }
+                    let cancel = WorkerResponse {
+                        response: Some(worker_response::Response::TaskCancellation(
+                            TaskCancellation {
+                                task_id: r.task_id.clone(),
+                                reason: "stale run: it ended or was superseded".to_string(),
+                            },
+                        )),
+                    };
+                    let _ = tx.send(cancel).await;
+                }
+                Ok(o) => {
+                    debug!(worker_id = %worker_id, task_id = %r.task_id, outcome = ?o, "run reattached")
+                }
+                // Owner unreachable: keep the run; its heartbeats and result retry.
+                Err(e) => warn!(task_id = %r.task_id, error = %e, "reattach failed"),
+            }
+        }
+    }
+
     /// The worker is draining: no new tasks, but its stream stays open for results.
     pub fn stop_dispatching(&self, worker_id: &WorkerId) {
         self.matching.deregister_worker(worker_id);
