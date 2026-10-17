@@ -162,6 +162,9 @@ pub(crate) struct Inner {
     pub(crate) sink: RwLock<Arc<dyn TaskSink>>,
     pub(crate) pending_wake: Notify,
     pub(crate) shutdown: watch::Sender<bool>,
+    /// Stops lease renewal. Separate from `shutdown`: a drain or shutdown keeps renewing
+    /// while it hands shards over, and stops only once the lease is marked dead.
+    pub(crate) lease_stop: watch::Sender<bool>,
     /// Set once when this node must exit: the WAL writer failed or the lease was lost.
     pub(crate) poison: watch::Sender<Option<String>>,
     /// Set once a drain finished: the process should exit (cleanly).
@@ -288,6 +291,7 @@ impl Engine {
             sink: RwLock::new(sink),
             pending_wake: Notify::new(),
             shutdown,
+            lease_stop: watch::Sender::new(false),
             poison: watch::Sender::new(None),
             drained: watch::Sender::new(false),
             started_at: clock_now,
@@ -441,6 +445,7 @@ impl Engine {
             .lease
             .set_state(valka_wal::LeaseState::Dead)
             .await?;
+        let _ = self.inner.lease_stop.send(true);
         Ok(())
     }
 
@@ -488,6 +493,7 @@ impl Engine {
             .lease
             .set_state(valka_wal::LeaseState::Dead)
             .await?;
+        let _ = self.inner.lease_stop.send(true);
         info!(released, "drained");
         self.inner.drained.send_replace(true);
         Ok(())
@@ -513,14 +519,17 @@ impl Engine {
         Ok(self.inner.writer.sync().await?)
     }
 
-    /// Stop background loops without flushing (tests: simulate `kill -9`).
+    /// Stop background loops and lease renewal without flushing (tests: simulate
+    /// `kill -9`).
     pub fn halt(&self) {
         let _ = self.inner.shutdown.send(true);
+        let _ = self.inner.lease_stop.send(true);
     }
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
+        let _ = self.lease_stop.send(true);
     }
 }

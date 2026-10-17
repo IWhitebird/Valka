@@ -312,7 +312,7 @@ async fn run_seed(seed: u64) {
         }
     }
     // G1: every acknowledged create exists; acknowledged ends hold.
-    for (id, _) in &h.created {
+    for id in h.created.keys() {
         let e = owner(&nodes, id).unwrap_or_else(|| panic!("seed {seed}: no owner for {id}"));
         let t = e
             .get_task(id)

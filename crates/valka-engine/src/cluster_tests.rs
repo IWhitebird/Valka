@@ -40,10 +40,14 @@ fn bucket() -> Backing {
 }
 
 async fn start(backing: &Backing, node: &str) -> Node {
-    let (store, faults) = faulty_over(backing.clone(), node.len() as u64);
+    start_with(backing, cfg(node)).await
+}
+
+async fn start_with(backing: &Backing, cfg: EngineConfig) -> Node {
+    let (store, faults) = faulty_over(backing.clone(), cfg.node_id.len() as u64);
     let engine = Engine::open_with(
         store,
-        cfg(node),
+        cfg,
         TokioClock::new(),
         Arc::new(crate::sink::NoopSink),
     )
@@ -329,6 +333,57 @@ async fn drain_hands_shards_over_with_nothing_to_replay() {
             .values()
             .flatten()
             .any(|k| k.ptr == valka_wal::LogPtr::Final)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_drain_slower_than_the_lease_timeout_keeps_its_lease() {
+    // Releasing every shard on a slow bucket takes far longer than the lease timeout. The
+    // draining node must keep renewing its lease meanwhile, or a guardian tombstones it
+    // halfway and the rest of its shards go through a split instead of a handover.
+    let b = bucket();
+    let mut slow = cfg("a");
+    slow.cluster.claim_concurrency = 1;
+    let a = start_with(&b, slow).await;
+    let n2 = start(&b, "b").await;
+    wait_until("converged", 20, || !n2.engine.owned_shards().is_empty()).await;
+    let nodes = [&a.engine, &n2.engine];
+    let mut ids = Vec::new();
+    for _ in 0..20 {
+        ids.push(create_anywhere(&nodes).await);
+    }
+    let owned = a.engine.owned_shards().len();
+    a.faults
+        .latency_ms
+        .store(100, std::sync::atomic::Ordering::Relaxed);
+    let started = tokio::time::Instant::now();
+    a.engine.drain().await.unwrap();
+    let took = started.elapsed();
+    assert!(
+        took > Duration::from_millis(cfg("a").cluster.lease_timeout_ms),
+        "the drain of {owned} shards took {took:?}: not slow enough to test anything"
+    );
+    let l = lease::get(&plain(&b), "a").await.unwrap().unwrap().record;
+    assert_eq!(
+        l.dead_by.as_deref(),
+        Some("a"),
+        "a clean exit, not a tombstone"
+    );
+    wait_until("b serves everything", 30, || {
+        n2.engine.owned_shards().len() == SHARDS as usize
+    })
+    .await;
+    for id in &ids {
+        assert_eq!(n2.engine.get_task(id).unwrap().status, TaskStatus::Pending);
+    }
+    // Every shard a owned was handed over with a final snapshot, none split.
+    let snaps = valka_wal::snapshot::list_all(&plain(&b)).await.unwrap();
+    assert!(
+        !snaps
+            .values()
+            .flatten()
+            .any(|k| k.ptr == valka_wal::LogPtr::Split),
+        "no shard of the draining node was split"
     );
 }
 

@@ -28,7 +28,7 @@ impl Engine {
             self.inner
                 .lease
                 .clone()
-                .run(self.inner.shutdown.subscribe()),
+                .run(self.inner.lease_stop.subscribe()),
         );
     }
 

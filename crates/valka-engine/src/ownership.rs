@@ -320,9 +320,18 @@ impl Engine {
     /// Hand `shards` back (at most `limit`). Returns how many were released.
     pub async fn release_shards(&self, shards: Vec<ShardId>, limit: usize) -> usize {
         let _moves = self.inner.moves.lock().await;
+        // Shards release independently; a drain hands over every shard, so do it in
+        // parallel or it outlasts the lease timeout on a slow bucket.
+        let concurrency = self.inner.cfg.cluster.claim_concurrency.max(1);
+        let results: Vec<(ShardId, Result<bool, ServerError>)> =
+            futures::stream::iter(shards.into_iter().take(limit))
+                .map(|s| async move { (s, self.release_one(s).await) })
+                .buffer_unordered(concurrency)
+                .collect()
+                .await;
         let mut released = 0;
-        for shard in shards.into_iter().take(limit) {
-            match self.release_one(shard).await {
+        for (shard, r) in results {
+            match r {
                 Ok(true) => {
                     released += 1;
                     valka_core::metrics::record_shard_release("released");
