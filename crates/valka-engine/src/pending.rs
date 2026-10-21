@@ -7,7 +7,7 @@ use valka_core::TaskStatus;
 
 use crate::engine::{Engine, PendingKey};
 use crate::sink::{DispatchableTask, OfferOutcome};
-use crate::state::Transition;
+use crate::state::{ShardState, Transition};
 use crate::timers::TimerKind;
 use crate::write_path::{dispatchable, pending_key};
 
@@ -16,6 +16,25 @@ use crate::write_path::{dispatchable, pending_key};
 /// the pending index. A safety net: whatever loses an offer (a fetcher that died, a
 /// dispatch that failed) cannot strand the task.
 pub const OFFER_TTL: Duration = Duration::from_secs(30);
+
+/// A task that left PENDING: its queue, its pending-index key if still known, its id.
+pub(crate) type LeavingPending = (String, Option<PendingKey>, String);
+
+/// The tasks among `transitions` that left PENDING, read from the shard they were applied
+/// to (still locked), so the runnable index can drop them by key.
+pub(crate) fn leaving_pending(st: &ShardState, transitions: &[Transition]) -> Vec<LeavingPending> {
+    transitions
+        .iter()
+        .filter(|t| t.from == Some(TaskStatus::Pending) && t.to != Some(TaskStatus::Pending))
+        .map(|t| {
+            (
+                t.queue_name.clone(),
+                st.tasks.get(&t.task_id).map(pending_key),
+                t.task_id.clone(),
+            )
+        })
+        .collect()
+}
 
 impl Engine {
     pub fn queues(&self) -> Vec<String> {
@@ -170,21 +189,26 @@ impl Engine {
         }
     }
 
-    pub(crate) fn drop_from_pending(&self, transitions: &[Transition]) {
-        let leaving: Vec<&Transition> = transitions
-            .iter()
-            .filter(|t| t.from == Some(TaskStatus::Pending) && t.to != Some(TaskStatus::Pending))
-            .collect();
+    /// Remove tasks that left PENDING from the runnable index. Each comes with its index
+    /// key when the task is still in RAM (looked up by key); a task already gone (deleted)
+    /// is searched for.
+    pub(crate) fn drop_from_pending(&self, leaving: Vec<LeavingPending>) {
         if leaving.is_empty() {
             return;
         }
         let mut p = self.inner.pending.lock();
-        for t in leaving {
-            if let Some(set) = p.get_mut(&t.queue_name) {
-                set.retain(|(_, _, id)| *id != t.task_id);
-                if set.is_empty() {
-                    p.remove(&t.queue_name);
+        for (queue, key, task_id) in leaving {
+            let Some(set) = p.get_mut(&queue) else {
+                continue;
+            };
+            match key {
+                Some(k) => {
+                    set.remove(&k);
                 }
+                None => set.retain(|(_, _, id)| *id != task_id),
+            }
+            if set.is_empty() {
+                p.remove(&queue);
             }
         }
     }
@@ -228,9 +252,13 @@ impl Engine {
         }
         let Some(d) = dispatchable else { return };
         let sink = self.inner.sink.read().clone();
+        // The offer clock starts first: a worker may dispatch the task (which stops the
+        // clock) before `offer` even returns.
+        self.note_offered([task_id.into()]);
         match sink.offer(d) {
-            OfferOutcome::Matched | OfferOutcome::Buffered => self.note_offered([task_id.into()]),
+            OfferOutcome::Matched | OfferOutcome::Buffered => {}
             OfferOutcome::Rejected => {
+                self.inner.offers.lock().remove(task_id);
                 if let Some(t) = self.inner.shards[shard.index()]
                     .lock()
                     .tasks

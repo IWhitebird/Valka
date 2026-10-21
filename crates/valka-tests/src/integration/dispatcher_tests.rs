@@ -615,3 +615,49 @@ async fn test_a_failed_dispatch_hands_the_task_back_at_once() {
         TaskStatus::Running
     );
 }
+
+fn assignments(
+    rx: &mut tokio::sync::mpsc::Receiver<valka_proto::WorkerResponse>,
+) -> Vec<valka_proto::TaskAssignment> {
+    let mut out = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        if let Some(valka_proto::worker_response::Response::TaskAssignment(a)) = msg.response {
+            out.push(a);
+        }
+    }
+    out
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_a_worker_takes_one_task_per_free_slot_and_no_more() {
+    // Found by the benchmark: a worker took one task per round, the feeder offered one
+    // task per waiting worker whatever its free slots, and tasks the feeder had taken but
+    // not offered sat out the 30 s offer lapse.
+    let node = TestNode::new().await;
+    for _ in 0..10 {
+        node.create("q", "t").await;
+    }
+    let (wid, mut rx) = node.register_worker(&["q"], 4).await;
+    let (d, w) = (node.dispatcher.clone(), wid.clone());
+    tokio::spawn(async move { d.run_worker_match_loop(w, vec!["q".to_string()]).await });
+    settle().await;
+    let first = assignments(&mut rx);
+    assert_eq!(first.len(), 4, "one task per free slot");
+    assert_eq!(
+        node.engine.pending_count("q"),
+        6,
+        "the rest stay runnable; none is stranded as offered"
+    );
+
+    // A result frees a slot and the next task follows at once.
+    let a = &first[0];
+    node.dispatcher
+        .handle_task_result(
+            &wid,
+            result(&a.task_id, &a.task_run_id, true, false, "", ""),
+        )
+        .await;
+    settle().await;
+    assert_eq!(assignments(&mut rx).len(), 1);
+    assert_eq!(node.engine.pending_count("q"), 5);
+}

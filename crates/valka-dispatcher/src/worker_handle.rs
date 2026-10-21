@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{Notify, mpsc};
 use valka_core::WorkerId;
 use valka_proto::WorkerResponse;
 
@@ -15,6 +16,8 @@ pub struct WorkerHandle {
     pub last_heartbeat: DateTime<Utc>,
     pub connected_at: DateTime<Utc>,
     pub metadata: String,
+    /// Notified when a task leaves `active_tasks`, so a full worker's match loop resumes.
+    pub slot_freed: Arc<Notify>,
 }
 
 impl WorkerHandle {
@@ -37,6 +40,7 @@ impl WorkerHandle {
             last_heartbeat: now,
             connected_at: now,
             metadata,
+            slot_freed: Arc::new(Notify::new()),
         }
     }
 
@@ -53,7 +57,9 @@ impl WorkerHandle {
     }
 
     pub fn complete_task(&mut self, task_id: &str) {
-        self.active_tasks.remove(task_id);
+        if self.active_tasks.remove(task_id) {
+            self.slot_freed.notify_one();
+        }
     }
 
     pub fn update_heartbeat(&mut self) {

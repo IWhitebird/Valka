@@ -4,7 +4,7 @@ use crate::worker_handle::WorkerHandle;
 use dashmap::DashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 use valka_core::{NodeId, PartitionId, WorkerId};
 use valka_engine::{DispatchInfo, Engine, ResultOutcome, RunResult};
@@ -15,6 +15,9 @@ use valka_proto::{
     TaskCancellation, TaskResult, TaskSignal, WorkerResponse, worker_response,
 };
 use valka_wal::logstore::LogLine;
+
+/// Most slots a worker registers in one round of its match loop.
+const MAX_SLOTS_PER_ROUND: i32 = 32;
 
 /// How long a reattach whose owner is unreachable (its shard is moving) keeps being retried
 /// while the worker still runs the task.
@@ -189,11 +192,21 @@ impl DispatcherService {
         self.matching.deregister_worker(worker_id);
     }
 
-    /// Background loop: register as waiting in matching service, receive tasks, push to worker
+    /// Background loop: register as waiting in matching service, receive tasks, push to worker.
+    ///
+    /// Each round registers one slot per free concurrency slot (up to
+    /// `MAX_SLOTS_PER_ROUND`) on every queue, spread over the partitions, waits for the first
+    /// task, then takes whatever the other slots received in the meantime.
     pub async fn run_worker_match_loop(&self, worker_id: WorkerId, queues: Vec<String>) {
-        use futures::FutureExt;
-
-        let num_partitions = self.matching.config().num_partitions;
+        let num_partitions = self.matching.config().num_partitions.max(1) as usize;
+        let Some(slot_freed) = self
+            .workers
+            .get(worker_id.as_ref())
+            .map(|h| h.slot_freed.clone())
+        else {
+            return;
+        };
+        let mut round = 0usize;
 
         loop {
             let available = {
@@ -203,50 +216,60 @@ impl DispatcherService {
                 }
             };
 
-            if available <= 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            if available <= 0 || queues.is_empty() {
+                // Woken when a result frees a slot; the timeout notices a disconnect.
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(250), slot_freed.notified()).await;
                 continue;
             }
 
-            let mut receivers = Vec::new();
+            let slots = available.min(MAX_SLOTS_PER_ROUND) as usize;
+            let mut receivers: Vec<oneshot::Receiver<TaskEnvelope>> =
+                Vec::with_capacity(slots * queues.len());
             for queue in &queues {
-                for pid in 0..num_partitions {
-                    let partition_id = PartitionId(pid);
-                    let rx = self
-                        .matching
-                        .register_worker(queue, partition_id, worker_id.clone());
-                    receivers.push((queue.clone(), partition_id, rx));
+                for i in 0..slots {
+                    let partition_id = PartitionId(((round + i) % num_partitions) as i32);
+                    receivers.push(self.matching.register_worker(
+                        queue,
+                        partition_id,
+                        worker_id.clone(),
+                    ));
                 }
             }
-
-            if receivers.is_empty() {
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                continue;
-            }
+            round = round.wrapping_add(1);
             // A worker is waiting: let the local feeder offer it pending tasks right away.
             self.engine.wake_feeder();
 
-            let futs: Vec<_> = receivers
-                .into_iter()
-                .map(|(queue, pid, rx)| Box::pin(async move { (queue, pid, rx.await) }))
-                .collect();
-
-            let (first_result, _index, remaining) = futures::future::select_all(futs).await;
-
-            // Tasks matched on the other partitions in the same instant go back to their
-            // owners' pending index (they may be another node's).
-            for fut in remaining {
-                if let Some((_, _, Ok(envelope))) = fut.now_or_never() {
-                    self.router().unoffer(&envelope.task_id).await;
+            let (first, index, _) = futures::future::select_all(receivers.iter_mut()).await;
+            let mut matched: Vec<TaskEnvelope> = first.into_iter().collect();
+            // Close the other slots before reading them, so no task can land in a slot
+            // after it was read and be dropped with it.
+            for (i, rx) in receivers.iter_mut().enumerate() {
+                if i == index {
+                    continue;
+                }
+                rx.close();
+                if let Ok(envelope) = rx.try_recv() {
+                    matched.push(envelope);
                 }
             }
+            drop(receivers);
+            if matched.is_empty() {
+                debug!(worker_id = %worker_id, "Match channel closed");
+                continue;
+            }
 
-            match first_result.2 {
-                Ok(envelope) => {
+            // A worker on several queues may receive more than it has free slots: the
+            // rest go back to their owners' pending index (they may be another node's).
+            for envelope in matched {
+                let free = self
+                    .workers
+                    .get(worker_id.as_ref())
+                    .is_some_and(|h| h.available_slots() > 0);
+                if free {
                     self.dispatch_to_worker(&worker_id, envelope).await;
-                }
-                Err(_) => {
-                    debug!(worker_id = %worker_id, "Match channel closed");
+                } else {
+                    self.router().unoffer(&envelope.task_id).await;
                 }
             }
         }

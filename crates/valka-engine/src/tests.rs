@@ -1529,3 +1529,64 @@ async fn reattach_reattaches_adopts_or_calls_a_run_stale() {
     let gone = valka_core::new_id_in_shard(shard).to_string();
     assert_eq!(e.reattach(&gone, &gone, 1, "w", "n").await.unwrap(), Stale);
 }
+
+/// Says it has room, then refuses every offer: a waiting worker whose slot went away
+/// between the count and the offer.
+struct OvercountingSink;
+
+impl TaskSink for OvercountingSink {
+    fn offer(&self, _task: DispatchableTask) -> OfferOutcome {
+        OfferOutcome::Rejected
+    }
+    fn capacity(&self, _q: &str) -> usize {
+        100
+    }
+}
+
+#[test]
+fn a_refused_offer_strands_nothing_and_the_feeder_does_not_spin() {
+    // Found by the benchmark: the feeder stopped at the first refused offer and dropped
+    // the rest of its batch (out of the index, marked offered, for the 30 s lapse); and
+    // handing the refused task back woke the feeder again at once, a busy loop that
+    // wedged the runtime (the WAL committer, even timers, never ran again). The scenario
+    // runs on its own runtime so a wedged one fails this test instead of hanging it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let seen = rt.block_on(async {
+            let e = Engine::open_with(
+                Store::memory(),
+                EngineConfig::for_tests("node-a"),
+                TokioClock::new(),
+                Arc::new(OvercountingSink),
+            )
+            .await
+            .unwrap();
+            for _ in 0..10 {
+                e.create_task(create("q")).await.unwrap();
+            }
+            // The feeder keeps taking the tasks and handing them back; between two rounds
+            // all ten are in the index (a stranded one would be out of it for 30 s).
+            let mut seen = 0;
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                seen = seen.max(e.pending_count("q"));
+                if seen == 10 {
+                    break;
+                }
+            }
+            // Writes still complete while the feeder keeps being refused.
+            e.create_task(create("q")).await.unwrap();
+            seen
+        });
+        let _ = tx.send(seen);
+    });
+    let seen = rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the engine wedged: the feeder is spinning");
+    assert_eq!(seen, 10, "every refused task is runnable again");
+}

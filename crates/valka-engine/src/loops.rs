@@ -312,12 +312,26 @@ impl Engine {
     async fn feeder(self) {
         let mut shutdown = self.inner.shutdown.subscribe();
         let interval = self.inner.cfg.feeder_interval;
+        let mut rejected = false;
         loop {
-            tokio::select! {
-                r = shutdown.changed() => { if r.is_err() || *shutdown.borrow() { return; } }
-                _ = self.inner.pending_wake.notified() => {}
-                _ = tokio::time::sleep(interval) => {}
+            if rejected {
+                // A task went back because the slot counted for it was gone. Handing it
+                // back woke this loop again: wait the interval rather than spin on it.
+                tokio::select! {
+                    r = shutdown.changed() => { if r.is_err() || *shutdown.borrow() { return; } }
+                    _ = tokio::time::sleep(interval) => {}
+                }
+            } else {
+                tokio::select! {
+                    r = shutdown.changed() => { if r.is_err() || *shutdown.borrow() { return; } }
+                    _ = self.inner.pending_wake.notified() => {}
+                    _ = tokio::time::sleep(interval) => {}
+                }
             }
+            // Wake-ups can arrive faster than rounds finish; let other tasks on this thread
+            // (the WAL committer, a worker's match loop) run between rounds.
+            tokio::task::yield_now().await;
+            rejected = false;
             let queues: Vec<String> = self.inner.pending.lock().keys().cloned().collect();
             if queues.is_empty() {
                 continue;
@@ -328,14 +342,19 @@ impl Engine {
                 if cap == 0 {
                     continue;
                 }
+                let mut refused = false;
                 for task in self.take_pending(&q, cap) {
+                    // After one rejection the rest of the batch goes straight back: each
+                    // was taken out of the index and must not wait for its offer to lapse.
                     let id = task.task_id.clone();
-                    if sink.offer(task) == OfferOutcome::Rejected {
+                    if refused || sink.offer(task) == OfferOutcome::Rejected {
                         self.unoffer(&id);
-                        break;
+                        refused = true;
+                        continue;
                     }
                     valka_core::metrics::record_async_match();
                 }
+                rejected |= refused;
                 valka_core::metrics::set_pending_tasks(&q, self.pending_count(&q) as f64);
             }
         }

@@ -56,7 +56,11 @@ pub struct PartitionQueue {
     pub parent: Option<PartitionId>,
     pub children: Vec<PartitionId>,
     pub max_buffer_size: usize,
+    /// Length of `waiting_workers` at which closed slots are pruned next.
+    prune_at: usize,
 }
+
+const MIN_PRUNE_AT: usize = 64;
 
 impl PartitionQueue {
     pub fn new(
@@ -73,6 +77,7 @@ impl PartitionQueue {
             parent,
             children: Vec::new(),
             max_buffer_size,
+            prune_at: MIN_PRUNE_AT,
         }
     }
 
@@ -104,6 +109,13 @@ impl PartitionQueue {
                     return false;
                 }
             }
+        }
+        // Slots whose worker stopped waiting are skipped when matching; drop them here
+        // too, so a queue that gets no tasks does not collect them. Pruning when the
+        // queue has doubled since the last prune keeps registering O(1) amortized.
+        if self.waiting_workers.len() >= self.prune_at {
+            self.waiting_workers.retain(|s| !s.task_sender.is_closed());
+            self.prune_at = (self.waiting_workers.len() * 2).max(MIN_PRUNE_AT);
         }
         self.waiting_workers.push_back(slot);
         false

@@ -45,7 +45,7 @@ async fn cluster_overview_reports_single_healthy_node() {
     assert_eq!(n["status"], "alive");
     assert_eq!(n["shards_owned"], 256);
     assert_eq!(n["inc"], 1);
-    assert_eq!(n["shards_with_tasks"].as_u64().unwrap() >= 1, true);
+    assert!(n["shards_with_tasks"].as_u64().unwrap() >= 1);
     assert_eq!(n["tasks"]["total"], 2);
     assert_eq!(n["tasks"]["running"], 1);
     assert_eq!(n["tasks"]["pending"], 1);

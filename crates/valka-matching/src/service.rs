@@ -33,20 +33,19 @@ impl MatchingService {
         self.waiting_changed.clone()
     }
 
-    /// Distinct workers currently waiting for a task of `queue`. A worker waits on every
-    /// partition of a queue at once but takes one task per wait.
+    /// Tasks of `queue` the waiting workers can take right now: one per open slot. A
+    /// worker registers one slot per free concurrency slot (up to a batch), so this is
+    /// what a feeder may offer without a rejection.
     pub fn waiting(&self, queue_name: &str) -> usize {
-        let mut workers = std::collections::HashSet::new();
-        for i in 0..self.config.num_partitions {
-            if let Some(p) = self.partitions.get(&(queue_name.to_string(), i)) {
-                for slot in &p.waiting_workers {
-                    if !slot.task_sender.is_closed() {
-                        workers.insert(slot.worker_id.clone());
-                    }
-                }
-            }
-        }
-        workers.len()
+        (0..self.config.num_partitions)
+            .filter_map(|i| self.partitions.get(&(queue_name.to_string(), i)))
+            .map(|p| {
+                p.waiting_workers
+                    .iter()
+                    .filter(|slot| !slot.task_sender.is_closed())
+                    .count()
+            })
+            .sum()
     }
 
     /// Queues with at least one waiting worker.
@@ -128,7 +127,29 @@ impl MatchingService {
         task: TaskEnvelope,
     ) -> Result<(), TaskEnvelope> {
         self.ensure_queue(queue_name);
-        sync_match::try_sync_match(self, queue_name, partition_id, task)
+        let task = match sync_match::try_sync_match(self, queue_name, partition_id, task) {
+            Ok(()) => return Ok(()),
+            Err(task) => task,
+        };
+        // Any slot of the queue will do: a worker of the queue runs tasks of every
+        // partition, and its slots may all sit on other partitions.
+        let mut task = task;
+        for i in 0..self.config.num_partitions {
+            if i == partition_id.0 {
+                continue;
+            }
+            let Some(mut p) = self.get_partition_mut(queue_name, PartitionId(i)) else {
+                continue;
+            };
+            match p.try_match_task(task) {
+                None => {
+                    valka_core::metrics::record_sync_match();
+                    return Ok(());
+                }
+                Some(t) => task = t,
+            }
+        }
+        Err(task)
     }
 
     /// Register a worker as waiting for a task on a given queue/partition.

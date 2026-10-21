@@ -120,9 +120,11 @@ async fn test_multiple_workers_round_robin() {
 
 #[tokio::test]
 async fn test_partition_tree_forwarding() {
-    let mut config = MatchingConfig::default();
-    config.num_partitions = 4;
-    config.branching_factor = 2;
+    let config = MatchingConfig {
+        num_partitions: 4,
+        branching_factor: 2,
+        ..Default::default()
+    };
     let service = MatchingService::new(config);
 
     let queue = "test.queue";
@@ -141,8 +143,10 @@ async fn test_partition_tree_forwarding() {
 
 #[tokio::test]
 async fn test_buffer_overflow() {
-    let mut config = MatchingConfig::default();
-    config.max_buffer_per_partition = 2;
+    let config = MatchingConfig {
+        max_buffer_per_partition: 2,
+        ..Default::default()
+    };
     let service = MatchingService::new(config);
 
     let queue = "test.queue";
@@ -249,9 +253,11 @@ async fn test_buffer_then_multiple_workers() {
 
 #[tokio::test]
 async fn test_tree_forwarding_deep_4_levels() {
-    let mut config = MatchingConfig::default();
-    config.num_partitions = 8;
-    config.branching_factor = 2;
+    let config = MatchingConfig {
+        num_partitions: 8,
+        branching_factor: 2,
+        ..Default::default()
+    };
     let service = MatchingService::new(config);
 
     let queue = "deep.queue";
@@ -272,9 +278,11 @@ async fn test_tree_forwarding_deep_4_levels() {
 
 #[tokio::test]
 async fn test_tree_forwarding_no_match_returns_err() {
-    let mut config = MatchingConfig::default();
-    config.num_partitions = 4;
-    config.branching_factor = 2;
+    let config = MatchingConfig {
+        num_partitions: 4,
+        branching_factor: 2,
+        ..Default::default()
+    };
     let service = MatchingService::new(config);
 
     let queue = "empty.queue";
@@ -294,8 +302,10 @@ async fn test_tree_forwarding_no_match_returns_err() {
 
 #[tokio::test]
 async fn test_deregister_removes_from_all_partitions() {
-    let mut config = MatchingConfig::default();
-    config.num_partitions = 4;
+    let config = MatchingConfig {
+        num_partitions: 4,
+        ..Default::default()
+    };
     let service = MatchingService::new(config);
 
     let queue = "multi.queue";
@@ -324,8 +334,10 @@ async fn test_deregister_removes_from_all_partitions() {
 
 #[tokio::test]
 async fn test_single_partition_no_forwarding() {
-    let mut config = MatchingConfig::default();
-    config.num_partitions = 1;
+    let config = MatchingConfig {
+        num_partitions: 1,
+        ..Default::default()
+    };
     let service = MatchingService::new(config);
 
     let queue = "single.queue";
@@ -522,52 +534,65 @@ async fn test_register_worker_stale_slot_plus_pending_task() {
 // ─── Partition Tree Edge Cases ──────────────────────────────────────
 
 #[tokio::test]
-async fn test_tree_forwarding_worker_at_leaf_task_at_root() {
-    // bf=2, n=8: P7 is a leaf (child of P3), P0 is root
-    // Forwarding is upward only — worker on P7 can't receive task offered at P0
-    let mut config = MatchingConfig::default();
-    config.num_partitions = 8;
-    config.branching_factor = 2;
+async fn test_a_task_reaches_a_worker_on_any_partition_of_its_queue() {
+    // bf=2, n=8: P7 is a leaf (child of P3), P0 is root. The tree is tried first (upward
+    // only), then any other partition of the queue: a worker runs tasks of every
+    // partition, and with few free slots it waits on only some of them.
+    let config = MatchingConfig {
+        num_partitions: 8,
+        branching_factor: 2,
+        ..Default::default()
+    };
     let service = MatchingService::new(config);
     let queue = "tree.queue";
     service.ensure_queue(queue);
 
-    let _rx = service.register_worker(queue, PartitionId(7), WorkerId::new());
-
-    let envelope = make_envelope("root-task", queue);
-    let result = service.offer_task(queue, PartitionId(0), envelope);
-    assert!(
-        result.is_err(),
-        "Task on root should NOT match worker on leaf (forwarding is upward only)"
-    );
-    assert_eq!(result.unwrap_err().task_id, "root-task");
+    let rx = service.register_worker(queue, PartitionId(7), WorkerId::new());
+    assert_eq!(service.waiting(queue), 1);
+    service
+        .offer_task(queue, PartitionId(0), make_envelope("root-task", queue))
+        .expect("a task on the root reaches the worker on a leaf");
+    assert_eq!(rx.await.unwrap().task_id, "root-task");
+    assert_eq!(service.waiting(queue), 0);
 }
 
 #[tokio::test]
-async fn test_tree_forwarding_worker_at_sibling_no_match() {
-    // Default config: n=4, bf=3. P1, P2, P3 are siblings under P0.
-    // Worker on P1, offer on P2. No worker on P0. Should not match.
-    let config = MatchingConfig::default();
-    let service = MatchingService::new(config);
-    let queue = "sibling.queue";
-    service.ensure_queue(queue);
-
-    let _rx = service.register_worker(queue, PartitionId(1), WorkerId::new());
-
-    let envelope = make_envelope("sib-task", queue);
-    let result = service.offer_task(queue, PartitionId(2), envelope);
-    assert!(
-        result.is_err(),
-        "Task on P2 should not match worker on P1 (siblings, no common ancestor worker)"
+async fn test_a_task_never_reaches_a_worker_of_another_queue() {
+    let service = MatchingService::new(MatchingConfig::default());
+    let _rx = service.register_worker("other.queue", PartitionId(1), WorkerId::new());
+    let result = service.offer_task(
+        "sibling.queue",
+        PartitionId(2),
+        make_envelope("sib-task", "sibling.queue"),
     );
+    assert_eq!(result.unwrap_err().task_id, "sib-task");
+}
+
+#[tokio::test]
+async fn test_waiting_counts_open_slots() {
+    let service = MatchingService::new(MatchingConfig::default());
+    let queue = "slots.queue";
+    let w = WorkerId::new();
+    let a = service.register_worker(queue, PartitionId(0), w.clone());
+    let _b = service.register_worker(queue, PartitionId(1), w.clone());
+    let _c = service.register_worker(queue, PartitionId(1), w.clone());
+    assert_eq!(
+        service.waiting(queue),
+        3,
+        "one per slot, not one per worker"
+    );
+    drop(a);
+    assert_eq!(service.waiting(queue), 2, "a closed slot does not count");
 }
 
 #[tokio::test]
 async fn test_tree_forwarding_grandchild_to_root() {
     // bf=2, n=8: P3's parent = P1, P1's parent = P0
-    let mut config = MatchingConfig::default();
-    config.num_partitions = 8;
-    config.branching_factor = 2;
+    let config = MatchingConfig {
+        num_partitions: 8,
+        branching_factor: 2,
+        ..Default::default()
+    };
     let service = MatchingService::new(config);
     let queue = "grandchild.queue";
     service.ensure_queue(queue);
@@ -586,9 +611,11 @@ async fn test_tree_forwarding_grandchild_to_root() {
 #[tokio::test]
 async fn test_large_tree_16_partitions() {
     // bf=4, n=16: P15 → parent P3 → parent P0 (root)
-    let mut config = MatchingConfig::default();
-    config.num_partitions = 16;
-    config.branching_factor = 4;
+    let config = MatchingConfig {
+        num_partitions: 16,
+        branching_factor: 4,
+        ..Default::default()
+    };
     let service = MatchingService::new(config);
     let queue = "large.queue";
     service.ensure_queue(queue);
@@ -606,9 +633,11 @@ async fn test_large_tree_16_partitions() {
 #[tokio::test]
 async fn test_flat_tree_branching_equals_partitions() {
     // bf=4, n=4: All children of root. One hop forwarding.
-    let mut config = MatchingConfig::default();
-    config.num_partitions = 4;
-    config.branching_factor = 4;
+    let config = MatchingConfig {
+        num_partitions: 4,
+        branching_factor: 4,
+        ..Default::default()
+    };
     let service = MatchingService::new(config);
     let queue = "flat.queue";
     service.ensure_queue(queue);
@@ -627,8 +656,10 @@ async fn test_flat_tree_branching_equals_partitions() {
 
 #[tokio::test]
 async fn test_buffer_full_returns_false_task_not_lost() {
-    let mut config = MatchingConfig::default();
-    config.max_buffer_per_partition = 1;
+    let config = MatchingConfig {
+        max_buffer_per_partition: 1,
+        ..Default::default()
+    };
     let service = MatchingService::new(config);
     let queue = "buffer.queue";
     service.ensure_queue(queue);

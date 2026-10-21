@@ -1,11 +1,18 @@
+use std::sync::Arc;
+
 use crate::service::DispatcherService;
 use crate::worker_handle::WorkerHandle;
 use futures::StreamExt;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tonic::Streaming;
 use tracing::{error, info, warn};
 use valka_core::WorkerId;
 use valka_proto::{WorkerRequest, WorkerResponse, worker_request, worker_response};
+
+/// Results and heartbeats one stream may have in progress at once. Each result waits for its
+/// group commit, so handling them one after another would cap a worker at one result per
+/// commit window; past this many the stream stops reading until some finish.
+const MAX_IN_PROGRESS: usize = 1024;
 
 /// Process the bidirectional worker stream. On server shutdown the worker is told to
 /// leave and the stream is closed, so the server can stop without waiting for it.
@@ -73,6 +80,8 @@ pub async fn handle_worker_stream(
             .await;
     });
 
+    let in_progress = Arc::new(Semaphore::new(MAX_IN_PROGRESS));
+
     let server_stopping = async move {
         let _ = shutdown.wait_for(|s| *s).await;
     };
@@ -98,20 +107,35 @@ pub async fn handle_worker_stream(
         match msg {
             Some(Ok(msg)) => match msg.request {
                 Some(worker_request::Request::TaskResult(result)) => {
-                    dispatcher.handle_task_result(&worker_id, result).await;
+                    // Results are idempotent and acknowledged one by one, so they need no
+                    // order; a result whose handling outlives the stream is still applied.
+                    let Ok(permit) = in_progress.clone().acquire_owned().await else {
+                        break;
+                    };
+                    let (dispatcher, worker_id) = (dispatcher.clone(), worker_id.clone());
+                    tokio::spawn(async move {
+                        dispatcher.handle_task_result(&worker_id, result).await;
+                        drop(permit);
+                    });
                 }
                 Some(worker_request::Request::Heartbeat(hb)) => {
-                    dispatcher.handle_heartbeat(&worker_id, hb).await;
-                    let ack = WorkerResponse {
-                        response: Some(worker_response::Response::HeartbeatAck(
-                            valka_proto::HeartbeatAck {
-                                server_timestamp_ms: chrono::Utc::now().timestamp_millis(),
-                            },
-                        )),
-                    };
-                    if response_tx.send(ack).await.is_err() {
+                    let Ok(permit) = in_progress.clone().acquire_owned().await else {
                         break;
-                    }
+                    };
+                    let (dispatcher, worker_id) = (dispatcher.clone(), worker_id.clone());
+                    let response_tx = response_tx.clone();
+                    tokio::spawn(async move {
+                        dispatcher.handle_heartbeat(&worker_id, hb).await;
+                        let ack = WorkerResponse {
+                            response: Some(worker_response::Response::HeartbeatAck(
+                                valka_proto::HeartbeatAck {
+                                    server_timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                                },
+                            )),
+                        };
+                        let _ = response_tx.send(ack).await;
+                        drop(permit);
+                    });
                 }
                 Some(worker_request::Request::LogBatch(batch)) => {
                     dispatcher.handle_log_batch(&worker_id, batch).await;

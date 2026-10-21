@@ -718,3 +718,112 @@ async fn e2e_clients_and_workers_ride_through_a_dead_node_and_a_restart() {
     stop.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
 }
+
+/// Delays every result by `delay` before passing it on, like an owner across the network
+/// or a slow bucket.
+struct SlowResults {
+    inner: Arc<dyn valka_dispatcher::TaskRouter>,
+    delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl valka_dispatcher::TaskRouter for SlowResults {
+    async fn dispatch(
+        &self,
+        task_id: &str,
+        worker_id: &str,
+    ) -> Result<valka_engine::DispatchInfo, valka_core::ServerError> {
+        self.inner.dispatch(task_id, worker_id).await
+    }
+    async fn return_run(&self, task_id: &str, run_id: &str) {
+        self.inner.return_run(task_id, run_id).await
+    }
+    async fn unoffer(&self, task_id: &str) {
+        self.inner.unoffer(task_id).await
+    }
+    async fn report_result(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        result: valka_engine::RunResult,
+    ) -> valka_engine::ResultOutcome {
+        tokio::time::sleep(self.delay).await;
+        self.inner.report_result(task_id, run_id, result).await
+    }
+    async fn heartbeat(&self, task_ids: &[String]) {
+        self.inner.heartbeat(task_ids).await
+    }
+    async fn checkpoint(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        step: &str,
+        output: serde_json::Value,
+    ) -> Result<valka_engine::CheckpointView, valka_core::ServerError> {
+        self.inner.checkpoint(task_id, run_id, step, output).await
+    }
+    async fn signal_delivered(&self, signal_id: &str) {
+        self.inner.signal_delivered(signal_id).await
+    }
+    async fn signal_acked(&self, signal_id: &str) {
+        self.inner.signal_acked(signal_id).await
+    }
+    async fn reset_signals(&self, task_id: &str) {
+        self.inner.reset_signals(task_id).await
+    }
+    async fn reattach(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        attempt: i32,
+        worker_id: &str,
+    ) -> Result<valka_engine::ReattachOutcome, valka_core::ServerError> {
+        self.inner
+            .reattach(task_id, run_id, attempt, worker_id)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn e2e_one_worker_finishes_results_concurrently() {
+    // Found by the benchmark: the server applied a worker's results one after another, each
+    // waiting for its group commit, so one worker finished about 20 tasks a second however
+    // many slots it had.
+    let port = free_port().await;
+    let server = start_server(Store::memory(), "e2e", port).await;
+    let dispatcher = server.node.dispatcher.clone();
+    dispatcher.set_router(Arc::new(SlowResults {
+        inner: dispatcher.router(),
+        delay: Duration::from_millis(500),
+    }));
+
+    let worker = ValkaWorker::builder()
+        .name("wide-worker")
+        .server_addr(&server.addr)
+        .queues(&["wide"])
+        .concurrency(32)
+        .handler(|_ctx| async move { Ok(serde_json::json!({})) })
+        .build()
+        .await
+        .unwrap();
+    let stop = worker.shutdown_handle();
+    let run = tokio::spawn(worker.run());
+
+    let mut client = ValkaClient::connect(&server.addr).await.unwrap();
+    let mut ids = Vec::new();
+    for _ in 0..32 {
+        ids.push(client.create_task("wide", "t", None).await.unwrap().id);
+    }
+    // 32 results at 0.5 s each: 16 s one after another, about 0.5 s together.
+    let started = std::time::Instant::now();
+    for id in &ids {
+        wait_status(&mut client, id, 4, Duration::from_secs(20)).await;
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "32 results took {:?}: they were applied one at a time",
+        started.elapsed()
+    );
+    stop.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+}

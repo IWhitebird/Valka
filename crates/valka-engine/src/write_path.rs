@@ -56,9 +56,10 @@ impl Engine {
         }
         let view = after(&st);
         let durable = self.inner.writer.append(vec![env]);
+        let leaving = crate::pending::leaving_pending(&st, &transitions);
         drop(st);
         // Tasks that left PENDING must leave the runnable index right away.
-        self.drop_from_pending(&transitions);
+        self.drop_from_pending(leaving);
         Ok((durable, transitions, ret, view))
     }
 
