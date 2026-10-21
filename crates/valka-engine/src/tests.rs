@@ -88,11 +88,9 @@ async fn create_get_list_and_idempotency() {
     let mut idem = create("q1");
     idem.idempotency_key = Some("k".into());
     let b = e.create_task(idem.clone()).await.unwrap();
-    let err = e.create_task(idem).await.unwrap_err();
-    assert!(matches!(
-        err,
-        valka_core::ServerError::IdempotencyConflict(_)
-    ));
+    // The same key again answers with the first task (a retried create), not a second one.
+    let again = e.create_task(idem).await.unwrap();
+    assert_eq!(again.id, b.id);
 
     let _c = e.create_task(create("q2")).await.unwrap();
     assert_eq!(e.list_tasks(None, None, 50, 0).len(), 3);

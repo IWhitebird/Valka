@@ -9,7 +9,9 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 use tokio::sync::{Notify, broadcast, watch};
 use tracing::{info, warn};
-use valka_core::{ClusterConfig, SchedulerConfig, ServerError, ShardId, TaskStatus, WalConfig};
+use valka_core::{
+    ClusterConfig, LimitsConfig, SchedulerConfig, ServerError, ShardId, TaskStatus, WalConfig,
+};
 use valka_wal::lease::{LeaseConfig, LeaseKeeper, NodeAdvert};
 use valka_wal::{ClusterMeta, FailureOutcome, Lsn, Store, WalWriter, WalWriterConfig, meta};
 
@@ -31,6 +33,8 @@ pub struct EngineConfig {
     /// Feeder cadence (from `MatchingConfig`).
     pub feeder_interval: Duration,
     pub feeder_batch_size: usize,
+    /// Tasks in RAM and payload sizes.
+    pub limits: LimitsConfig,
 }
 
 impl EngineConfig {
@@ -56,6 +60,7 @@ impl EngineConfig {
             },
             feeder_interval: Duration::from_millis(10),
             feeder_batch_size: 100,
+            limits: LimitsConfig::default(),
         }
     }
 }
@@ -188,6 +193,9 @@ pub(crate) struct Inner {
     /// Offered tasks (local matching or another node's `fetch`) not dispatched yet, with the
     /// time their offer lapses.
     pub(crate) offers: Mutex<HashMap<String, tokio::time::Instant>>,
+    /// Tasks held in RAM over the shards this node serves: sampled every second, bumped by
+    /// each create in between (`LimitsConfig::max_tasks_in_ram`).
+    pub(crate) tasks_in_ram: std::sync::atomic::AtomicUsize,
     /// Woken whenever runnable tasks are added to the pending index (remote fetchers).
     pub(crate) runnable: Notify,
     /// Queue configs (partition counts), cached for `QUEUE_CONFIG_TTL`.
@@ -305,6 +313,7 @@ impl Engine {
             hold_until: Mutex::new(HashMap::new()),
             queues: Mutex::new(HashMap::new()),
             offers: Mutex::new(HashMap::new()),
+            tasks_in_ram: std::sync::atomic::AtomicUsize::new(0),
             runnable: Notify::new(),
         });
         let engine = Engine { inner };

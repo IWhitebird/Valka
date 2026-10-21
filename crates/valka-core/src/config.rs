@@ -10,6 +10,9 @@ pub struct ServerConfig {
     /// Bearer token for the admin API (drain, move shard, set partitions). Unset: the
     /// admin API is disabled.
     pub admin_token: Option<String>,
+    /// API keys for the public REST and gRPC APIs, comma-separated (`VALKA_API_KEYS`).
+    /// Clients send one as `Authorization: Bearer <key>`. Unset: the public API is open.
+    pub api_keys: Option<String>,
     pub grpc_addr: String,
     pub http_addr: String,
     pub web_dir: String,
@@ -19,6 +22,30 @@ pub struct ServerConfig {
     pub matching: MatchingConfig,
     pub scheduler: SchedulerConfig,
     pub log_ingester: LogIngesterConfig,
+    pub limits: LimitsConfig,
+}
+
+/// Bounds that keep one node's memory and log in check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LimitsConfig {
+    /// Tasks a node may hold in RAM (live and recently finished, over the shards it owns).
+    /// Above it, creates are refused with RESOURCE_EXHAUSTED (HTTP 429) until workers drain
+    /// the backlog or finished tasks age out; finished tasks are evicted early under
+    /// pressure. 0 disables the limit.
+    pub max_tasks_in_ram: usize,
+    /// Largest task input, metadata, result or checkpoint output, in bytes of JSON. Larger
+    /// payloads belong in your own storage, passed by reference.
+    pub max_payload_bytes: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_tasks_in_ram: 1_000_000,
+            max_payload_bytes: 1024 * 1024,
+        }
+    }
 }
 
 /// Where the WAL, snapshots and logs live. The bucket is the only durable state.
@@ -156,6 +183,7 @@ impl Default for ServerConfig {
         Self {
             node_id: String::new(),
             admin_token: None,
+            api_keys: None,
             grpc_addr: "0.0.0.0:50051".to_string(),
             http_addr: "0.0.0.0:8989".to_string(),
             web_dir: "web/dist".to_string(),
@@ -165,6 +193,7 @@ impl Default for ServerConfig {
             matching: MatchingConfig::default(),
             scheduler: SchedulerConfig::default(),
             log_ingester: LogIngesterConfig::default(),
+            limits: LimitsConfig::default(),
         }
     }
 }
@@ -315,5 +344,11 @@ mod tests {
         assert_eq!(cfg.cluster.lease_timeout_ms, 10_000);
         assert_eq!(cfg.cluster.min_residency_secs, 300);
         assert_eq!(cfg.wal.log_budget_bytes, 64 * 1024 * 1024);
+        assert_eq!(cfg.limits.max_tasks_in_ram, 1_000_000);
+        assert_eq!(cfg.limits.max_payload_bytes, 1024 * 1024);
+        assert_eq!(
+            cfg.api_keys, None,
+            "the example leaves the keys commented out"
+        );
     }
 }

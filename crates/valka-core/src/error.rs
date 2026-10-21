@@ -36,6 +36,10 @@ pub enum ServerError {
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
 
+    /// The node is at a resource limit (tasks in RAM); retry later or drain the backlog.
+    #[error("Resource exhausted: {0}")]
+    ResourceExhausted(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -69,6 +73,7 @@ impl From<ServerError> for tonic::Status {
                 tonic::Status::unavailable(err.to_string())
             }
             ServerError::InvalidArgument(_) => tonic::Status::invalid_argument(err.to_string()),
+            ServerError::ResourceExhausted(_) => tonic::Status::resource_exhausted(err.to_string()),
             ServerError::Storage(_) | ServerError::Internal(_) => {
                 tonic::Status::internal(err.to_string())
             }

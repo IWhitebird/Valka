@@ -38,6 +38,7 @@ impl Engine {
             self.inner.cfg.scheduler.timer_tick_ms.max(1),
         ));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut sampled = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 r = shutdown.changed() => { if r.is_err() || *shutdown.borrow() { return; } }
@@ -45,9 +46,54 @@ impl Engine {
                     self.fire_due_timers();
                     self.flush_lease_records();
                     self.lapse_offers();
+                    if sampled.elapsed() >= Duration::from_secs(1) {
+                        sampled = tokio::time::Instant::now();
+                        self.sample_tasks_in_ram();
+                    }
                 }
             }
         }
+    }
+
+    /// Count the tasks held in RAM. Near the limit, finished tasks leave RAM early (their
+    /// history stays in the bucket); a minute is kept so that a retried create still finds
+    /// its idempotency key.
+    pub(crate) fn sample_tasks_in_ram(&self) {
+        let cap = self.inner.cfg.limits.max_tasks_in_ram;
+        let count = |me: &Self| -> usize {
+            me.inner
+                .shards
+                .iter()
+                .map(|m| {
+                    let st = m.lock();
+                    if st.serving() { st.tasks.len() } else { 0 }
+                })
+                .sum()
+        };
+        let mut n = count(self);
+        if cap > 0 && n.saturating_mul(10) >= cap.saturating_mul(9) {
+            let cutoff = self.inner.clock.now() - ChronoDuration::seconds(60);
+            let mut evicted = 0;
+            for m in &self.inner.shards {
+                let mut st = m.lock();
+                if st.serving() {
+                    evicted += st.evict_terminal_before(cutoff);
+                }
+            }
+            if evicted > 0 {
+                warn!(
+                    evicted,
+                    tasks = n,
+                    cap,
+                    "near the task limit: evicted finished tasks early"
+                );
+                n = count(self);
+            }
+        }
+        self.inner
+            .tasks_in_ram
+            .store(n, std::sync::atomic::Ordering::Relaxed);
+        valka_core::metrics::set_tasks_in_ram(n as f64);
     }
 
     fn fire_due_timers(&self) {

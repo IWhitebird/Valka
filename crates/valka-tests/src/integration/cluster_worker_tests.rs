@@ -25,6 +25,7 @@ async fn serve_public(c: &Cluster, i: usize) -> String {
         n.api.clone(),
         n.cluster_events.clone(),
         n.logs.clone(),
+        valka_server::auth::ApiKeys::open(),
         c.shutdown.subscribe(),
     ));
     for _ in 0..100 {

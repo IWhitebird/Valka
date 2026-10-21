@@ -20,6 +20,8 @@ RATE=${RATE:-20}
 COMPOSE=(docker compose -f docker-compose.cluster.yml)
 NODES=(valka-1 valka-2 valka-3)
 LOG_DIR=${LOG_DIR:-target/chaos}
+# The compose cluster's API key (docker-compose.cluster.yml); the SDK reads it.
+export VALKA_API_KEY=${VALKA_API_KEY:-change-me-api-key}
 mkdir -p "$LOG_DIR"
 
 log() { echo "[chaos $(date +%H:%M:%S)] $*"; }
@@ -36,7 +38,7 @@ for port in 8981 8982 8983; do
     sleep 1
   done
 done
-log "cluster up: $(curl -s http://localhost:8981/api/v1/cluster | head -c 300)"
+log "cluster up: $(curl -s -H "Authorization: Bearer $VALKA_API_KEY" http://localhost:8981/api/v1/cluster | head -c 300)"
 
 log "building the load generator"
 cargo build -p valka-examples --example chaos >/dev/null
@@ -88,7 +90,8 @@ log "chaos over: $kills kills, $pauses freezes, $restarts restarts; waiting for 
 status=0
 wait "$LOAD" || status=$?
 cat "$LOG_DIR/load.log"
-curl -s http://localhost:8981/api/v1/cluster > "$LOG_DIR/cluster.json" || true
+curl -s -H "Authorization: Bearer $VALKA_API_KEY" http://localhost:8981/api/v1/cluster \
+  > "$LOG_DIR/cluster.json" || true
 "${COMPOSE[@]}" logs --no-color > "$LOG_DIR/cluster.log" 2>&1 || true
 log "logs in $LOG_DIR; exit $status"
 exit $status

@@ -210,12 +210,26 @@ async fn test_rest_create_task_idempotency_conflict() {
         .await
         .unwrap();
     assert_eq!(r1.status(), StatusCode::CREATED);
+    assert_eq!(r1.headers()["idempotent-replayed"], "false");
+    let first = parse_response_json(r1).await;
     let r2 = node
         .router()
         .oneshot(post_json("/api/v1/tasks", body))
         .await
         .unwrap();
-    assert_error_response(r2, StatusCode::CONFLICT, "CONFLICT", "same").await;
+    // The same key again: 200 with the first task, flagged as a replay.
+    assert_eq!(r2.status(), StatusCode::OK);
+    assert_eq!(r2.headers()["idempotent-replayed"], "true");
+    let second = parse_response_json(r2).await;
+    assert_eq!(second["id"], first["id"]);
+    let all = parse_response_json(
+        node.router()
+            .oneshot(get_req("/api/v1/tasks"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(all.as_array().unwrap().len(), 1);
 }
 
 #[tokio::test(start_paused = true)]

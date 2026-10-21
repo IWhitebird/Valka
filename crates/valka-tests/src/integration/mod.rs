@@ -11,6 +11,7 @@ mod dispatcher_tests;
 mod e2e_tests;
 mod lifecycle_tests;
 mod rest_api_tests;
+mod security_limits_tests;
 
 #[cfg(feature = "minio")]
 mod minio_tests;

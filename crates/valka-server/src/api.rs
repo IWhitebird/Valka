@@ -89,10 +89,30 @@ impl Api {
     // ───────────────────────── id-routed ─────────────────────────
 
     pub async fn create_task(&self, req: CreateTask) -> Result<TaskView, ServerError> {
+        Ok(self.create_task_replayed(req).await?.0)
+    }
+
+    /// Create a task. With an idempotency key already in use, the answer is the task that
+    /// key made, and the flag says so (a retried create).
+    pub async fn create_task_replayed(
+        &self,
+        req: CreateTask,
+    ) -> Result<(TaskView, bool), ServerError> {
         let (id, shard) = self.inner.engine.place_task(&req).await?;
-        self.check_previous_partition(&req, shard).await?;
-        match self.route(Command::CreateTask { id, req }).await? {
-            Reply::Task(t) => Ok(t),
+        if let Some(existing) = self.check_previous_partition(&req, shard).await? {
+            return Ok((existing, true));
+        }
+        match self
+            .route(Command::CreateTask {
+                id: id.clone(),
+                req,
+            })
+            .await?
+        {
+            Reply::Task(t) => {
+                let replayed = t.id != id;
+                Ok((t, replayed))
+            }
             r => Err(unexpected(r)),
         }
     }
@@ -104,18 +124,18 @@ impl Api {
         &self,
         req: &CreateTask,
         shard: ShardId,
-    ) -> Result<(), ServerError> {
+    ) -> Result<Option<TaskView>, ServerError> {
         let Some(key) = &req.idempotency_key else {
-            return Ok(());
+            return Ok(None);
         };
         let e = &self.inner.engine;
         let cfg = e.queue_config(&req.queue_name).await?;
         let Some(prev) = cfg.previous else {
-            return Ok(());
+            return Ok(None);
         };
         let window = chrono::Duration::seconds(e.config().wal.completed_retention_secs as i64);
         if e.clock().now() - prev.changed_at > window {
-            return Ok(());
+            return Ok(None);
         }
         let old = valka_core::partition_shard(
             &req.queue_name,
@@ -123,7 +143,7 @@ impl Api {
             e.num_shards(),
         );
         if old == shard {
-            return Ok(());
+            return Ok(None);
         }
         let probe = valka_core::new_id_in_shard(old).to_string();
         match self
@@ -133,8 +153,7 @@ impl Api {
             })
             .await?
         {
-            Reply::MaybeTask(Some(_)) => Err(ServerError::IdempotencyConflict(key.clone())),
-            Reply::MaybeTask(None) => Ok(()),
+            Reply::MaybeTask(found) => Ok(found),
             r => Err(unexpected(r)),
         }
     }
@@ -468,7 +487,12 @@ impl Api {
             }
             Command::FindIdempotent { probe_id, key } => {
                 let shard = self.ensure_readable(&probe_id)?;
-                Ok(Reply::MaybeTask(e.find_by_idempotency_key(shard, &key)))
+                let found = e.find_by_idempotency_key(shard, &key);
+                if found.is_some() {
+                    // It is about to be someone's answer: only once it is durable.
+                    e.sync().await?;
+                }
+                Ok(Reply::MaybeTask(found))
             }
             Command::Dispatch {
                 task_id,

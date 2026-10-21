@@ -35,6 +35,7 @@ pub enum ApiError {
     BadRequest(String),
     Conflict(String),
     Unavailable(String),
+    TooManyRequests(String),
     Internal(String),
 }
 
@@ -49,6 +50,7 @@ impl From<ServerError> for ApiError {
             | ServerError::LeaseExpired(_) => ApiError::InvalidState(e.to_string()),
             ServerError::IdempotencyConflict(_) => ApiError::Conflict(e.to_string()),
             ServerError::InvalidArgument(_) => ApiError::BadRequest(e.to_string()),
+            ServerError::ResourceExhausted(_) => ApiError::TooManyRequests(e.to_string()),
             ServerError::NotOwner(_) | ServerError::Unavailable(_) => {
                 ApiError::Unavailable(e.to_string())
             }
@@ -71,6 +73,9 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "BAD_REQUEST", msg),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, "CONFLICT", msg),
             ApiError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE", msg),
+            ApiError::TooManyRequests(msg) => {
+                (StatusCode::TOO_MANY_REQUESTS, "RESOURCE_EXHAUSTED", msg)
+            }
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", msg),
         };
         (
@@ -118,6 +123,7 @@ pub fn build_api_router(
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     node_info: NodeInfo,
     admin_token: Option<String>,
+    api_keys: crate::auth::ApiKeys,
 ) -> Router {
     let state = AppState {
         engine: api.engine().clone(),
@@ -157,7 +163,8 @@ pub fn build_api_router(
         .allow_methods(Any)
         .allow_headers(Any);
 
-    Router::new()
+    // Public API routes: behind the API keys when they are configured.
+    let public_routes = Router::new()
         .route(
             "/api/v1/tasks",
             post(create_task).get(list_tasks).delete(clear_all_tasks),
@@ -186,6 +193,13 @@ pub fn build_api_router(
         .route("/api/v1/cluster/members", get(cluster::members))
         .route("/api/v1/cluster/placement", get(crate::admin::placement))
         .route("/api/v1/queues", get(crate::admin::list_queues))
+        .route_layer(axum::middleware::from_fn_with_state(
+            api_keys,
+            crate::auth::require_api_key,
+        ));
+
+    Router::new()
+        .merge(public_routes)
         .merge(admin_routes)
         .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
@@ -202,10 +216,19 @@ pub async fn serve_rest(
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     node_info: NodeInfo,
     admin_token: Option<String>,
+    api_keys: crate::auth::ApiKeys,
     web_dir: String,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
-    let api_routes = build_api_router(api, event_tx, logs, metrics_handle, node_info, admin_token);
+    let api_routes = build_api_router(
+        api,
+        event_tx,
+        logs,
+        metrics_handle,
+        node_info,
+        admin_token,
+        api_keys,
+    );
 
     let index_path = format!("{web_dir}/index.html");
     let spa_fallback = ServeDir::new(&web_dir).not_found_service(ServeFile::new(index_path));
@@ -277,9 +300,9 @@ async fn create_task(
                 .map_err(|e| ApiError::BadRequest(format!("Invalid scheduled_at: {e}")))?,
         ),
     };
-    let task = state
+    let (task, replayed) = state
         .api
-        .create_task(CreateTask {
+        .create_task_replayed(CreateTask {
             queue_name: body.queue_name,
             task_name: body.task_name,
             input: body.input,
@@ -291,7 +314,20 @@ async fn create_task(
             scheduled_at,
         })
         .await?;
-    Ok((StatusCode::CREATED, Json(task.to_json())))
+    // A create with an idempotency key already in use answers with that key's task.
+    let status = if replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((
+        status,
+        [(
+            axum::http::HeaderName::from_static("idempotent-replayed"),
+            if replayed { "true" } else { "false" },
+        )],
+        Json(task.to_json()),
+    ))
 }
 
 async fn get_task(

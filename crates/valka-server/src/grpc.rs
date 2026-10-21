@@ -53,9 +53,9 @@ impl api_service_server::ApiService for ApiServiceImpl {
                     .map_err(|e| Status::invalid_argument(format!("Invalid scheduled_at: {e}")))?,
             )
         };
-        let task = self
+        let (task, replayed) = self
             .api
-            .create_task(CreateTask {
+            .create_task_replayed(CreateTask {
                 queue_name: req.queue_name,
                 task_name: req.task_name,
                 input,
@@ -80,9 +80,15 @@ impl api_service_server::ApiService for ApiServiceImpl {
             })
             .await
             .map_err(Status::from)?;
-        Ok(Response::new(CreateTaskResponse {
+        let mut response = Response::new(CreateTaskResponse {
             task: Some(task_to_proto(task)),
-        }))
+        });
+        // A create with an idempotency key already in use answers with that key's task.
+        response.metadata_mut().insert(
+            "idempotent-replayed",
+            tonic::metadata::MetadataValue::from_static(if replayed { "true" } else { "false" }),
+        );
+        Ok(response)
     }
 
     async fn get_task(
@@ -288,6 +294,7 @@ pub async fn serve_grpc(
     api: Api,
     event_tx: broadcast::Sender<TaskEvent>,
     logs: Arc<LogIngester>,
+    api_keys: crate::auth::ApiKeys,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
     let worker_service = WorkerServiceImpl {
@@ -316,10 +323,16 @@ pub async fn serve_grpc(
         .http2_keepalive_timeout(Some(std::time::Duration::from_secs(5)))
         .add_service(health_service)
         .add_service(reflection_service)
-        .add_service(api_service_server::ApiServiceServer::new(api_service))
-        .add_service(worker_service_server::WorkerServiceServer::new(
-            worker_service,
+        .add_service(api_service_server::ApiServiceServer::with_interceptor(
+            api_service,
+            crate::auth::GrpcAuth(api_keys.clone()),
         ))
+        .add_service(
+            worker_service_server::WorkerServiceServer::with_interceptor(
+                worker_service,
+                crate::auth::GrpcAuth(api_keys),
+            ),
+        )
         .serve_with_shutdown(addr, async move {
             let _ = shutdown.changed().await;
         })

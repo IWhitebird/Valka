@@ -325,6 +325,7 @@ pub fn error_to_proto(e: &ServerError, owner_hint: Option<String>) -> valka_prot
         | ServerError::LeaseExpired(_) => "INVALID_STATE",
         ServerError::IdempotencyConflict(_) => "CONFLICT",
         ServerError::InvalidArgument(_) => "BAD_REQUEST",
+        ServerError::ResourceExhausted(_) => "RESOURCE_EXHAUSTED",
         ServerError::Unavailable(_) => "UNAVAILABLE",
         ServerError::Storage(_) | ServerError::Internal(_) => "INTERNAL",
     };

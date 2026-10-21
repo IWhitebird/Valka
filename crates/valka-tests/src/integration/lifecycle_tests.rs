@@ -163,12 +163,10 @@ async fn test_idempotency_key_prevents_duplicate() {
         idempotency_key: Some("k".into()),
         ..task_req("q", "t")
     };
-    node.create_with(req.clone()).await;
-    let err = node.engine.create_task(req).await.unwrap_err();
-    assert!(matches!(
-        err,
-        valka_core::ServerError::IdempotencyConflict(_)
-    ));
+    let first = node.create_with(req.clone()).await;
+    // A second create with the key is answered with the first task.
+    let again = node.engine.create_task(req).await.unwrap();
+    assert_eq!(again.id, first.id);
     assert_eq!(node.engine.list_tasks(None, None, 10, 0).len(), 1);
 }
 

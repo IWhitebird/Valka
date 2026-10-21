@@ -53,6 +53,10 @@ services:
       VALKA_STORAGE__ALLOW_HTTP: ${S3_ALLOW_HTTP:-true}
       VALKA_STORAGE__ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-minioadmin}
       VALKA_STORAGE__SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+      # Comma-separated API keys; empty leaves the public API open (the server warns).
+      VALKA_API_KEYS: ${VALKA_API_KEYS:-}
+      # Enables the admin API (drain, move shards, partitions); empty disables it.
+      VALKA_ADMIN_TOKEN: ${VALKA_ADMIN_TOKEN:-}
       VALKA_GRPC_ADDR: "0.0.0.0:50051"
       VALKA_HTTP_ADDR: "0.0.0.0:8989"
       RUST_LOG: ${RUST_LOG:-valka=info,tower_http=info}

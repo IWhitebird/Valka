@@ -58,6 +58,11 @@ pub fn record_forward_circuit_open(addr: &str) {
 
 // ── cluster (PHASE2 M8) ──
 
+/// Tasks this node holds in RAM (live and recently finished), against `limits.max_tasks_in_ram`.
+pub fn set_tasks_in_ram(count: f64) {
+    gauge!("valka_tasks_in_ram").set(count);
+}
+
 pub fn set_shards_owned(count: f64) {
     gauge!("valka_shards_owned").set(count);
 }

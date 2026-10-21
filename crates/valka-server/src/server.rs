@@ -67,6 +67,7 @@ impl Node {
             },
             feeder_interval: Duration::from_millis(config.matching.feeder_interval_ms.max(1)),
             feeder_batch_size: config.matching.feeder_batch_size.max(1),
+            limits: config.limits.clone(),
         };
         let engine = Engine::open_with(
             store.clone(),

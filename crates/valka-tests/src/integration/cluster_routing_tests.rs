@@ -372,7 +372,8 @@ async fn idempotency_key_dedupes_across_entry_nodes() {
     assert_eq!(status, StatusCode::CREATED);
     for node in &c.nodes[1..] {
         let (status, body) = call(node, post("/api/v1/tasks", req.clone())).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["id"], first["id"], "the key's task, through any node");
     }
     let (_, all) = call(&c.nodes[2], get("/api/v1/tasks?queue_name=orders")).await;
     assert_eq!(all.as_array().unwrap().len(), 1);
@@ -629,9 +630,10 @@ async fn idempotency_holds_across_a_partition_resize() {
         let (status, body) = call(n, post("/api/v1/tasks", req.clone())).await;
         assert_eq!(
             status,
-            StatusCode::CONFLICT,
+            StatusCode::OK,
             "the old partition still dedupes: {body}"
         );
+        assert_eq!(body["id"], first["id"]);
     }
     let fresh =
         serde_json::json!({"queue_name": "orders", "task_name": "t", "idempotency_key": "new-key"});
@@ -651,7 +653,14 @@ async fn grpc_api_routes_like_rest() {
         c.nodes[1].logs.clone(),
         c.shutdown.subscribe(),
     );
-    tokio::spawn(valka_server::grpc::serve_grpc(addr, api, events, logs, rx));
+    tokio::spawn(valka_server::grpc::serve_grpc(
+        addr,
+        api,
+        events,
+        logs,
+        valka_server::auth::ApiKeys::open(),
+        rx,
+    ));
     let mut client = None;
     for _ in 0..50 {
         if let Ok(cl) = valka_sdk::ValkaClient::connect(&format!("http://{addr}")).await {

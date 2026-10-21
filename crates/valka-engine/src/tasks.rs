@@ -121,8 +121,12 @@ impl Engine {
             .shard_of(id)
             .ok_or_else(|| ServerError::InvalidArgument(format!("bad task id {id}")))?;
         if let Some(existing) = self.get_task(id) {
+            // A retried forward of a create that may still be in flight: answer only once
+            // that record is durable.
+            self.sync().await?;
             return Ok(existing);
         }
+        self.check_create_limits(&req)?;
         let now = self.inner.clock.now();
         let id = id.to_string();
         let spec = TaskSpec {
@@ -138,7 +142,7 @@ impl Engine {
             scheduled_at: req.scheduled_at,
             created_at: now,
         };
-        let (durable, transitions, _, view) = self.mutate(
+        let created = self.mutate(
             shard,
             |st| {
                 if let Some(k) = &req.idempotency_key
@@ -149,10 +153,58 @@ impl Engine {
                 Ok((WalRecord::TaskCreated { task: spec.clone() }, ()))
             },
             |st| st.tasks.get(&id).map(|t| t.view()),
-        )?;
+        );
+        let (durable, transitions, _, view) = match created {
+            Err(ServerError::IdempotencyConflict(key)) => {
+                // Same key, same shard: the first task is the answer (a retried create).
+                // It may have been created a moment ago: answer only once it is durable.
+                let existing = self
+                    .find_by_idempotency_key(shard, &key)
+                    .ok_or(ServerError::IdempotencyConflict(key))?;
+                self.sync().await?;
+                return Ok(existing);
+            }
+            other => other?,
+        };
         self.commit(durable, transitions).await?;
+        self.inner
+            .tasks_in_ram
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         valka_core::metrics::record_task_created(&req.queue_name);
         view.ok_or_else(|| ServerError::Internal("task vanished after create".into()))
+    }
+
+    /// Refuse a create that would put this node over its task limit, or whose payloads are
+    /// larger than `limits.max_payload_bytes`.
+    fn check_create_limits(&self, req: &CreateTask) -> Result<(), ServerError> {
+        let limits = &self.inner.cfg.limits;
+        let max = limits.max_payload_bytes;
+        if max > 0 {
+            for (what, value) in [
+                ("input", req.input.as_ref()),
+                ("metadata", Some(&req.metadata)),
+            ] {
+                let size = value.map_or(0, json_size);
+                if size > max {
+                    return Err(ServerError::InvalidArgument(format!(
+                        "{what} is {size} bytes; the limit is {max} (limits.max_payload_bytes). \
+                         Store large data elsewhere and pass a reference"
+                    )));
+                }
+            }
+        }
+        let cap = limits.max_tasks_in_ram;
+        let held = self
+            .inner
+            .tasks_in_ram
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if cap > 0 && held >= cap {
+            return Err(ServerError::ResourceExhausted(format!(
+                "this node holds {held} tasks, its limit (limits.max_tasks_in_ram = {cap}); \
+                 retry once workers have drained the backlog"
+            )));
+        }
+        Ok(())
     }
 
     /// The task holding idempotency key `key` in `shard`, if any.
@@ -757,4 +809,21 @@ impl Engine {
         });
         all.into_iter().skip(offset).take(limit).collect()
     }
+}
+
+/// Bytes of `v` as compact JSON.
+pub(crate) fn json_size(v: &serde_json::Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0 += b.len();
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut c = Count(0);
+    let _ = serde_json::to_writer(&mut c, v);
+    c.0
 }

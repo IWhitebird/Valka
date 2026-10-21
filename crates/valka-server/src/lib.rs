@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod api;
+pub mod auth;
 pub mod cluster;
 pub mod convert;
 pub mod feeder;

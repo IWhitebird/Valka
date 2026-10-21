@@ -74,17 +74,26 @@ async fn main() -> Result<()> {
         })
     });
 
+    let api_keys = valka_server::auth::ApiKeys::parse(config.api_keys.as_deref());
+    if api_keys.is_open() {
+        tracing::warn!(
+            "the public API is OPEN: anyone who can reach the REST and gRPC ports can create, \
+             cancel and delete tasks. Set VALKA_API_KEYS to require API keys."
+        );
+    }
+
     let grpc_addr = config.grpc_addr.parse()?;
     let shutdown_tx_grpc = node.shutdown_tx.clone();
     let grpc_handle = tokio::spawn({
-        let (api, event_tx, logs, shutdown) = (
+        let (api, event_tx, logs, shutdown, keys) = (
             node.api.clone(),
             node.cluster_events.clone(),
             node.logs.clone(),
             node.shutdown_rx.clone(),
+            api_keys.clone(),
         );
         async move {
-            if let Err(e) = grpc::serve_grpc(grpc_addr, api, event_tx, logs, shutdown).await {
+            if let Err(e) = grpc::serve_grpc(grpc_addr, api, event_tx, logs, keys, shutdown).await {
                 tracing::error!(error = %e, "gRPC server failed");
                 let _ = shutdown_tx_grpc.send(true);
             }
@@ -116,6 +125,7 @@ async fn main() -> Result<()> {
                 metrics_handle,
                 node_info,
                 admin_token,
+                api_keys,
                 web_dir,
                 shutdown,
             )

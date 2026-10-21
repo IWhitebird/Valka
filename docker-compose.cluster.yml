@@ -9,7 +9,9 @@
 # Watch a takeover: open http://localhost:8981/cluster, then
 #   docker compose -f docker-compose.cluster.yml kill -s SIGKILL valka-2   (kill -9 a node)
 #   docker compose -f docker-compose.cluster.yml pause valka-3   (freeze: fenced on wake-up)
-# Chaos test: scripts/chaos.sh. Admin API token below: change it.
+# The public API needs an API key (VALKA_API_KEYS below): clients and workers send
+# "Authorization: Bearer change-me-api-key"; the SDKs and the CLI read VALKA_API_KEY.
+# Chaos test: scripts/chaos.sh. Change every token and key below before real use.
 #
 # The object store is pgsty/silo, an S3-compatible MinIO fork (the minio/minio images are
 # no longer published on Docker Hub). In production use a real bucket (S3, GCS, R2, ...)
@@ -39,6 +41,7 @@ x-valka: &valka
     VALKA_CLUSTER__TOKEN: change-me-cluster-token
     VALKA_CLUSTER__INTERNAL_ADDR: "0.0.0.0:50052"
     VALKA_ADMIN_TOKEN: change-me-admin-token
+    VALKA_API_KEYS: change-me-api-key
     VALKA_GRPC_ADDR: "0.0.0.0:50051"
     VALKA_HTTP_ADDR: "0.0.0.0:8989"
     RUST_LOG: valka=info,tower_http=warn
