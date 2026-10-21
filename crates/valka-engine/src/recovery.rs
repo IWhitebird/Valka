@@ -12,7 +12,7 @@ use valka_wal::{Lsn, reader};
 use crate::engine::Engine;
 use crate::state::{RunStatus, ShardPhase, ShardSnapshot, ShardState};
 use crate::timers::TimerKind;
-use crate::write_path::pending_key;
+use crate::write_path::{lease_timer_at, pending_key};
 
 impl Engine {
     /// A shard was just claimed: index its runnable tasks, arm its timers, give its
@@ -57,7 +57,7 @@ impl Engine {
                         {
                             run.lease_until = run.lease_until.max(now + grace);
                             timers.schedule(
-                                run.lease_until,
+                                lease_timer_at(run.lease_until, now),
                                 TimerKind::LeaseExpiry {
                                     task_id,
                                     run_id: run.id.clone(),
@@ -83,20 +83,121 @@ impl Engine {
     }
 
     /// The reconcile grace of a claimed shard ended: its recovered PENDING tasks may run.
-    pub(crate) fn unhold_shard(&self, shard: ShardId) {
-        self.inner.hold_until.lock().remove(&shard);
-        let runnable: Vec<(String, crate::engine::PendingKey)> = {
+    /// A shard mid-release keeps its hold and is looked at again shortly (the release may
+    /// roll back to serving); a shard this node no longer holds just drops it.
+    pub(crate) fn unhold_shard(&self, shard: ShardId, now: DateTime<Utc>) {
+        let instant = tokio::time::Instant::now();
+        let until = self.inner.hold_until.lock().get(&shard).copied();
+        if let Some(until) = until
+            && until > instant
+        {
+            // Armed by an earlier claim; a newer claim's grace is still running.
+            let left = ChronoDuration::from_std(until - instant).unwrap_or_default();
+            self.inner
+                .timers
+                .lock()
+                .schedule(now + left, TimerKind::Unhold { shard: shard.0 });
+            return;
+        }
+        let (phase, runnable): (ShardPhase, Vec<(String, crate::engine::PendingKey)>) = {
+            let st = self.inner.shards[shard.index()].lock();
+            let runnable = if st.serving() {
+                st.tasks
+                    .values()
+                    .filter(|t| t.is_runnable())
+                    .map(|t| (t.spec.queue_name.clone(), pending_key(t)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (st.phase, runnable)
+        };
+        match phase {
+            ShardPhase::Serving => {
+                self.inner.hold_until.lock().remove(&shard);
+                self.add_runnable(runnable);
+            }
+            ShardPhase::Releasing => {
+                self.inner.timers.lock().schedule(
+                    now + ChronoDuration::seconds(1),
+                    TimerKind::Unhold { shard: shard.0 },
+                );
+            }
+            ShardPhase::Loading | ShardPhase::Unowned => {
+                self.inner.hold_until.lock().remove(&shard);
+            }
+        }
+    }
+
+    /// Arm a served shard's timers again from its state and index its runnable tasks:
+    /// after timers were refused (a release rolled back to serving, or the lease was
+    /// renewed late). A duplicate timer is harmless: each re-checks its task when it fires.
+    pub(crate) fn rearm_shard(&self, shard: ShardId) {
+        let now = self.inner.clock.now();
+        let instant = tokio::time::Instant::now();
+        let hold_left = self
+            .inner
+            .hold_until
+            .lock()
+            .get(&shard)
+            .filter(|until| **until > instant)
+            .map(|until| *until - instant);
+        let mut runnable = Vec::new();
+        {
+            let mut timers = self.inner.timers.lock();
             let st = self.inner.shards[shard.index()].lock();
             if !st.serving() {
                 return;
             }
-            st.tasks
-                .values()
-                .filter(|t| t.is_runnable())
-                .map(|t| (t.spec.queue_name.clone(), pending_key(t)))
-                .collect()
-        };
-        self.add_runnable(runnable);
+            for t in st.tasks.values() {
+                match t.status {
+                    TaskStatus::Pending if t.due => {
+                        if !t.offered {
+                            runnable.push((t.spec.queue_name.clone(), pending_key(t)));
+                        }
+                    }
+                    TaskStatus::Pending | TaskStatus::Retry => timers.schedule(
+                        t.next_attempt_at.unwrap_or(now),
+                        TimerKind::Promote {
+                            task_id: t.spec.id.clone(),
+                        },
+                    ),
+                    TaskStatus::Running => {
+                        if let Some(run) =
+                            t.current_run().filter(|r| r.status == RunStatus::Running)
+                        {
+                            timers.schedule(
+                                lease_timer_at(run.lease_until, now),
+                                TimerKind::LeaseExpiry {
+                                    task_id: t.spec.id.clone(),
+                                    run_id: run.id.clone(),
+                                },
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(left) = hold_left {
+                timers.schedule(
+                    now + ChronoDuration::from_std(left).unwrap_or_default(),
+                    TimerKind::Unhold { shard: shard.0 },
+                );
+            }
+        }
+        if hold_left.is_none() {
+            self.add_runnable(runnable);
+        }
+        self.inner.pending_wake.notify_one();
+    }
+
+    /// [`Engine::rearm_shard`] for every shard this node serves.
+    pub(crate) fn rearm_all(&self) {
+        for shard in ShardId::all(self.inner.num_shards) {
+            if self.owns(shard) {
+                self.rearm_shard(shard);
+            }
+        }
     }
 
     pub(crate) async fn snapshotter(self) {
@@ -135,7 +236,12 @@ impl Engine {
     /// Snapshot every serving shard with uncovered records (or, when `force`, every dirty
     /// shard regardless of the record threshold), then truncate this incarnation's log
     /// below the oldest record no snapshot covers.
+    ///
+    /// Rounds run one at a time (snapshotter, admin, shutdown): a round's truncation
+    /// treats every shard it sees as captured as covered, which holds only once that
+    /// shard's snapshot is in the bucket, i.e. when no other round is still writing it.
     pub(crate) async fn snapshot_dirty_shards(&self, force: bool) {
+        let _round = self.inner.snapshot_round.lock().await;
         if force {
             self.inner
                 .log_mark
@@ -199,7 +305,8 @@ impl Engine {
     /// Delete this incarnation's segments below the oldest record no snapshot covers.
     /// The lease's truncation watermark is raised first, so a splitter never mistakes the
     /// hole for the end of the log.
-    async fn truncate_covered_log(&self) {
+    /// Callers hold `snapshot_round`.
+    pub(crate) async fn truncate_covered_log(&self) {
         let durable = self.inner.writer.durable_lsn();
         let mut bound = Lsn::new(durable.inc, durable.seq + 1);
         for m in &self.inner.shards {

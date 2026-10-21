@@ -146,8 +146,9 @@ pub enum ResultOutcome {
     Retry,
 }
 
-/// Runnable tasks ordered by priority desc, then creation order.
-pub(crate) type PendingKey = (i32, i64, String);
+/// Runnable tasks ordered by priority desc, then creation order. `Reverse` rather than a
+/// negated priority: `-i32::MIN` overflows.
+pub(crate) type PendingKey = (std::cmp::Reverse<i32>, i64, String);
 /// task_id -> (shard, run_id, lease_until) awaiting a coalesced `LeaseExtended` record.
 pub(crate) type LeaseDirty = HashMap<String, (ShardId, String, DateTime<Utc>)>;
 
@@ -176,6 +177,10 @@ pub(crate) struct Inner {
     pub(crate) drained: watch::Sender<bool>,
     pub(crate) started_at: DateTime<Utc>,
     pub(crate) last_snapshot_round: Mutex<Option<DateTime<Utc>>>,
+    /// Serialises snapshot rounds (capture → write → truncate) and the drain's final
+    /// truncation: a round must never truncate below a snapshot another round has
+    /// captured but not yet written.
+    pub(crate) snapshot_round: tokio::sync::Mutex<()>,
     /// Writer bytes committed when the last full snapshot round started.
     pub(crate) log_mark: AtomicU64,
     pub(crate) membership: Membership,
@@ -269,6 +274,10 @@ impl Engine {
         )
         .await?;
         let inc = lease.inc();
+        // Renew from now on: splitting this node id's old logs below can take longer than
+        // the lease timeout, and a lease left unrenewed meanwhile gets tombstoned.
+        let lease_stop = watch::Sender::new(false);
+        tokio::spawn(lease.clone().run(lease_stop.subscribe()));
         let writer = WalWriter::start(
             store.clone(),
             node_id.clone(),
@@ -300,11 +309,12 @@ impl Engine {
             sink: RwLock::new(sink),
             pending_wake: Notify::new(),
             shutdown,
-            lease_stop: watch::Sender::new(false),
+            lease_stop,
             poison: watch::Sender::new(None),
             drained: watch::Sender::new(false),
             started_at: clock_now,
             last_snapshot_round: Mutex::new(None),
+            snapshot_round: tokio::sync::Mutex::new(()),
             log_mark: AtomicU64::new(0),
             membership,
             moves: tokio::sync::Mutex::new(()),
@@ -479,8 +489,14 @@ impl Engine {
         let _ = self.inner.shutdown.send(true);
         self.flush_lease_records();
         self.inner.writer.sync().await?;
+        // Hold `moves` for the whole drain, and take the shard list under it: a claim that
+        // started before the lease said Draining would otherwise finish meanwhile and
+        // serve a shard whose records the final truncation below deletes. Hold the
+        // snapshot lock too, so no snapshot round captured before the drain lands later.
+        let _moves = self.inner.moves.lock().await;
+        let _snapshots = self.inner.snapshot_round.lock().await;
         let shards = self.owned_shards();
-        let released = self.release_shards(shards.clone(), usize::MAX).await;
+        let released = self.release_shards_locked(shards.clone(), usize::MAX).await;
         if released < shards.len() {
             warn!(
                 released,
@@ -488,16 +504,27 @@ impl Engine {
                 "drain released only some shards"
             );
         }
-        // Everything this incarnation wrote is covered by final snapshots now.
+        // Truncate everything only when this node holds no shard at all (every record it
+        // wrote is then covered by a final snapshot); otherwise only below the oldest
+        // record no snapshot covers.
         let next = self.inner.writer.next_lsn().seq;
-        if released == shards.len() && self.inner.lease.raise_trunc(next).await.is_ok() {
-            let _ = valka_wal::reader::truncate_before(
-                &self.inner.store,
-                self.node_id(),
-                self.incarnation(),
-                next,
-            )
-            .await;
+        let holds_none = self
+            .inner
+            .shards
+            .iter()
+            .all(|m| m.lock().phase == ShardPhase::Unowned);
+        if holds_none {
+            if self.inner.lease.raise_trunc(next).await.is_ok() {
+                let _ = valka_wal::reader::truncate_before(
+                    &self.inner.store,
+                    self.node_id(),
+                    self.incarnation(),
+                    next,
+                )
+                .await;
+            }
+        } else {
+            self.truncate_covered_log().await;
         }
         self.inner
             .lease

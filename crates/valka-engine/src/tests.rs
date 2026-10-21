@@ -1590,3 +1590,469 @@ fn a_refused_offer_strands_nothing_and_the_feeder_does_not_spin() {
         .expect("the engine wedged: the feeder is spinning");
     assert_eq!(seen, 10, "every refused task is runnable again");
 }
+
+// ───────────── regression tests for the engine review (timers, snapshots, keys, …) ─────────────
+
+async fn open_cfg(store: &Store, cfg: EngineConfig) -> Engine {
+    Engine::open_with(
+        store.clone(),
+        cfg,
+        TokioClock::new(),
+        Arc::new(crate::sink::NoopSink),
+    )
+    .await
+    .unwrap()
+}
+
+/// Advance paused time in small steps, letting loops and spawned hooks run in between.
+async fn run_for(d: Duration) {
+    let step = Duration::from_millis(250);
+    let mut left = d;
+    while !left.is_zero() {
+        let s = step.min(left);
+        tokio::time::advance(s).await;
+        tokio::task::yield_now().await;
+        left -= s;
+    }
+    settle().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn timers_refused_while_the_lease_is_stale_fire_once_it_renews() {
+    // Found by review: a promote or lease-expiry timer that fired while the lease was too
+    // old to serve (the bucket slow for a few seconds) was refused and dropped, so the
+    // RETRY task never ran again and the RUNNING task of a dead worker never expired.
+    let (store, faults) = faulty_over(Arc::new(object_store::memory::InMemory::new()), 4);
+    let mut cfg = EngineConfig::for_tests("node-a");
+    cfg.cluster.lease_interval_ms = 2_000;
+    cfg.cluster.lease_timeout_ms = 10_000;
+    cfg.cluster.lease_safety_margin_ms = 3_000; // serves for 7 s after a renewal
+    cfg.scheduler.retry_base_delay_secs = 5; // first retry 10 s after the failure
+    let e = open_cfg(&store, cfg).await;
+
+    let retry = e.create_task(create("q")).await.unwrap();
+    let d = e.dispatch(&retry.id, "w").unwrap();
+    let mut short = create("q");
+    short.timeout_seconds = 0; // lease = 30 s grace
+    let running = e.create_task(short).await.unwrap();
+    e.dispatch(&running.id, "w").unwrap();
+    e.fail_run(&retry.id, &d.run_id, "boom", true)
+        .await
+        .unwrap();
+    e.sync().await.unwrap();
+
+    // The bucket fails: renewals fail, the lease goes stale, and both timers come due.
+    faults.set_fail_rate(1000);
+    run_for(Duration::from_secs(40)).await;
+    assert!(!e.is_serving());
+    assert_eq!(e.get_task(&retry.id).unwrap().status, TaskStatus::Retry);
+    assert_eq!(e.get_task(&running.id).unwrap().status, TaskStatus::Running);
+
+    // The bucket is back: the next renewal serves again and the refused timers fire.
+    faults.set_fail_rate(0);
+    run_for(Duration::from_secs(6)).await;
+    assert!(e.is_serving());
+    assert_eq!(e.get_task(&retry.id).unwrap().status, TaskStatus::Pending);
+    assert_eq!(e.get_task(&running.id).unwrap().status, TaskStatus::Retry);
+}
+
+#[tokio::test(start_paused = true)]
+async fn timers_refused_while_a_release_is_in_flight_fire_after_it_rolls_back() {
+    let store = Store::memory();
+    let e = open(&store).await;
+    let t = e.create_task(create("q")).await.unwrap();
+    let d = e.dispatch(&t.id, "w").unwrap();
+    e.fail_run(&t.id, &d.run_id, "boom", true).await.unwrap(); // retry in 2 s
+    let shard = e.shard_of(&t.id).unwrap();
+
+    // The promote comes due while the shard is being handed over...
+    e.inner.shards[shard.index()].lock().phase = crate::state::ShardPhase::Releasing;
+    run_for(Duration::from_secs(3)).await;
+    assert_eq!(e.get_task(&t.id).unwrap().status, TaskStatus::Retry);
+    // ...and the hand-over fails: the shard serves again, and the timer was kept.
+    e.inner.shards[shard.index()].lock().phase = crate::state::ShardPhase::Serving;
+    run_for(Duration::from_secs(2)).await;
+    assert_eq!(e.get_task(&t.id).unwrap().status, TaskStatus::Pending);
+}
+
+#[tokio::test(start_paused = true)]
+async fn snapshot_rounds_run_one_at_a_time() {
+    // Found by review: a round (shutdown's, or the admin's) that ran during another one saw
+    // the other's captured shards as clean and truncated the log below them while their
+    // snapshots were still being written; a stop then lost those records (and the next
+    // start's split failed on the gap).
+    let store = Store::memory();
+    let e = open(&store).await;
+    for _ in 0..5 {
+        e.create_task(create("q")).await.unwrap();
+    }
+    e.sync().await.unwrap();
+    let in_flight = e.inner.snapshot_round.lock().await;
+    let round = {
+        let e = e.clone();
+        tokio::spawn(async move { e.snapshot_now().await })
+    };
+    let stop = {
+        let e = e.clone();
+        tokio::spawn(async move { e.shutdown().await })
+    };
+    run_for(Duration::from_secs(2)).await;
+    assert!(!round.is_finished() && !stop.is_finished(), "they wait");
+    assert_eq!(snapshots_with_records(&store).await, 0);
+    drop(in_flight);
+    round.await.unwrap();
+    stop.await.unwrap().unwrap();
+    assert!(snapshots_with_records(&store).await >= 1);
+    let e2 = open(&store).await;
+    assert_eq!(e2.list_tasks(None, None, 100, 0).len(), 5);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_key_freed_by_eviction_keeps_its_new_task_through_a_crash() {
+    // Found by review: eviction is not in the WAL, so replay over a snapshot that still
+    // held the evicted task treated a later create reusing its key as a duplicate and
+    // dropped it: an acknowledged task vanished after a crash.
+    let store = Store::memory();
+    let clock = TokioClock::new();
+    let open_now = || {
+        Engine::open_with(
+            store.clone(),
+            EngineConfig::for_tests("node-a"),
+            clock.clone(),
+            Arc::new(crate::sink::NoopSink),
+        )
+    };
+    let mut keyed = create("q");
+    keyed.idempotency_key = Some("order-1".into());
+    let first = {
+        let e = open_now().await.unwrap();
+        let t = e.create_task(keyed.clone()).await.unwrap();
+        let run = e.dispatch(&t.id, "w").unwrap();
+        e.complete_run(&t.id, &run.run_id, None).await.unwrap();
+        e.sync().await.unwrap();
+        e.halt();
+        t.id
+    };
+    tokio::time::advance(Duration::from_secs(25 * 3600)).await;
+    // The restart's claim snapshots the shard (still holding the old task), then evicts
+    // it; the key is free and a new task takes it. Then the node is killed.
+    let second = {
+        let e = open_now().await.unwrap();
+        assert!(e.get_task(&first).is_none());
+        let t = e.create_task(keyed.clone()).await.unwrap();
+        assert_ne!(t.id, first);
+        e.sync().await.unwrap();
+        e.halt();
+        t.id
+    };
+    let e = open_now().await.unwrap();
+    let got = e
+        .get_task(&second)
+        .expect("the acknowledged task survives replay");
+    assert_eq!(got.status, TaskStatus::Pending);
+    assert!(e.get_task(&first).is_none());
+    // And the key still answers with it.
+    assert_eq!(e.create_task(keyed).await.unwrap().id, second);
+}
+
+#[tokio::test(start_paused = true)]
+async fn idempotency_keys_are_per_queue_even_on_one_shard() {
+    // Found by review: the shard's key map ignored the queue, so a key used by two queues
+    // that landed on one shard answered the second create with the first queue's task.
+    let store = Store::memory();
+    let e = open(&store).await;
+    let shard = valka_core::ShardId(7);
+    let id = || valka_core::new_id_in_shard(shard).to_string();
+    let keyed = |queue: &str| {
+        let mut r = create(queue);
+        r.idempotency_key = Some("order-1".into());
+        r
+    };
+    let a = e.create_task_at(&id(), keyed("emails")).await.unwrap();
+    let b = e.create_task_at(&id(), keyed("invoices")).await.unwrap();
+    assert_ne!(a.id, b.id);
+    assert_eq!(b.queue_name, "invoices");
+    // The same queue and key again is a retried create.
+    assert_eq!(
+        e.create_task_at(&id(), keyed("emails")).await.unwrap().id,
+        a.id
+    );
+    assert_eq!(
+        e.find_idempotent(shard, "invoices", "order-1").unwrap().id,
+        b.id
+    );
+    // Both survive a crash.
+    e.sync().await.unwrap();
+    e.halt();
+    let e2 = open(&store).await;
+    assert_eq!(
+        e2.find_idempotent(shard, "emails", "order-1").unwrap().id,
+        a.id
+    );
+    assert_eq!(
+        e2.find_idempotent(shard, "invoices", "order-1").unwrap().id,
+        b.id
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn queue_names_are_validated_on_create() {
+    let store = Store::memory();
+    let e = open(&store).await;
+    for bad in ["a/b", ".hidden", "with space", &"q".repeat(200)] {
+        let err = e.create_task(create(bad)).await.unwrap_err();
+        assert!(
+            matches!(err, valka_core::ServerError::InvalidArgument(_)),
+            "{bad}: {err}"
+        );
+        let id = valka_core::new_id_in_shard(valka_core::ShardId(1)).to_string();
+        assert!(e.create_task_at(&id, create(bad)).await.is_err(), "{bad}");
+    }
+    e.create_task(create("emails.v2:eu@prod_1-a"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn retention_evicts_finished_tasks_and_their_dead_letters_without_a_restart() {
+    // Found by review: the retention sweep's timer was never armed, so finished tasks (and
+    // dead letters, which nothing ever removed) stayed in RAM until a restart.
+    let store = Store::memory();
+    let mut cfg = EngineConfig::for_tests("node-a");
+    cfg.wal.completed_retention_secs = 120;
+    let e = open_cfg(&store, cfg).await;
+    let done = e.create_task(create("q")).await.unwrap();
+    let run = e.dispatch(&done.id, "w").unwrap();
+    e.complete_run(&done.id, &run.run_id, None).await.unwrap();
+    let mut once = create("q");
+    once.max_retries = 1;
+    let dead = e.create_task(once).await.unwrap();
+    let run = e.dispatch(&dead.id, "w").unwrap();
+    e.fail_run(&dead.id, &run.run_id, "boom", true)
+        .await
+        .unwrap();
+    assert_eq!(e.get_task(&dead.id).unwrap().status, TaskStatus::DeadLetter);
+    assert_eq!(e.list_dead_letters(None, 10, 0).len(), 1);
+    let live = e.create_task(create("q")).await.unwrap();
+
+    run_for(Duration::from_secs(60)).await;
+    assert!(e.get_task(&done.id).is_some(), "kept within retention");
+    run_for(Duration::from_secs(150)).await;
+    assert!(e.get_task(&done.id).is_none());
+    assert!(e.get_task(&dead.id).is_none());
+    assert!(e.list_dead_letters(None, 10, 0).is_empty());
+    assert_eq!(e.get_task(&live.id).unwrap().status, TaskStatus::Pending);
+}
+
+#[tokio::test(start_paused = true)]
+async fn deleting_a_task_removes_its_dead_letter_even_after_the_task_left_ram() {
+    let store = Store::memory();
+    let e = open(&store).await;
+    let mut once = create("q");
+    once.max_retries = 1;
+    let t = e.create_task(once).await.unwrap();
+    let run = e.dispatch(&t.id, "w").unwrap();
+    e.fail_run(&t.id, &run.run_id, "boom", true).await.unwrap();
+    // The task leaves RAM (as an eviction of an older version would leave it) but its
+    // dead letter stays.
+    let shard = e.shard_of(&t.id).unwrap();
+    e.inner.shards[shard.index()].lock().tasks.remove(&t.id);
+    assert_eq!(e.list_dead_letters(None, 10, 0).len(), 1);
+    assert!(e.delete_task(&t.id).await.unwrap());
+    assert!(e.list_dead_letters(None, 10, 0).is_empty());
+    assert!(!e.delete_task(&t.id).await.unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn list_pages_match_a_full_sort() {
+    let store = Store::memory();
+    let e = open(&store).await;
+    let mut all = Vec::new();
+    for i in 0..60 {
+        let q = if i % 3 == 0 { "a" } else { "b" };
+        all.push(e.create_task(create(q)).await.unwrap());
+        if i % 7 == 0 {
+            tokio::time::advance(Duration::from_millis(3)).await;
+        }
+    }
+    for t in all.iter().step_by(4) {
+        let d = e.dispatch(&t.id, "w").unwrap();
+        e.complete_run(&t.id, &d.run_id, None).await.unwrap();
+    }
+    let full = |queue: Option<&str>, status: Option<TaskStatus>| {
+        let mut v: Vec<_> = all
+            .iter()
+            .map(|t| e.get_task(&t.id).unwrap())
+            .filter(|t| {
+                queue.is_none_or(|q| q == t.queue_name) && status.is_none_or(|s| s == t.status)
+            })
+            .collect();
+        v.sort_by(|a, b| (b.created_at, &b.id).cmp(&(a.created_at, &a.id)));
+        v
+    };
+    for (queue, status) in [
+        (None, None),
+        (Some("a"), None),
+        (None, Some(TaskStatus::Completed)),
+        (Some("b"), Some(TaskStatus::Pending)),
+    ] {
+        let expected = full(queue, status);
+        for (limit, offset) in [(10, 0), (7, 5), (100, 0), (5, 55), (0, 3), (3, 100)] {
+            let got = e.list_tasks(queue, status, limit, offset);
+            let want: Vec<_> = expected.iter().skip(offset).take(limit).cloned().collect();
+            assert_eq!(
+                got, want,
+                "queue {queue:?} status {status:?} {limit}/{offset}"
+            );
+        }
+    }
+
+    // Dead letters page the same way.
+    let mut dead = Vec::new();
+    for _ in 0..8 {
+        let mut once = create("a");
+        once.max_retries = 1;
+        let t = e.create_task(once).await.unwrap();
+        let d = e.dispatch(&t.id, "w").unwrap();
+        e.fail_run(&t.id, &d.run_id, "x", true).await.unwrap();
+        dead.push(t.id);
+        tokio::time::advance(Duration::from_millis(2)).await;
+    }
+    let page: Vec<String> = e
+        .list_dead_letters(None, 3, 2)
+        .into_iter()
+        .map(|d| d.task_id)
+        .collect();
+    let want: Vec<String> = dead.iter().rev().skip(2).take(3).cloned().collect();
+    assert_eq!(page, want);
+}
+
+#[tokio::test(start_paused = true)]
+async fn clearing_shards_empties_the_runnable_index_of_every_queue() {
+    let store = Store::memory();
+    let e = open(&store).await;
+    let mut ids = Vec::new();
+    for i in 0..300 {
+        ids.push(
+            e.create_task(create(if i % 2 == 0 { "a" } else { "b" }))
+                .await
+                .unwrap()
+                .id,
+        );
+    }
+    assert_eq!(e.pending_count("a") + e.pending_count("b"), 300);
+    assert!(e.delete_task(&ids[0]).await.unwrap());
+    assert_eq!(e.pending_count("a"), 149);
+    assert_eq!(e.clear_all_tasks().await.unwrap(), 299);
+    assert_eq!(e.pending_count("a"), 0);
+    assert_eq!(e.pending_count("b"), 0);
+    // The index keeps working afterwards.
+    e.create_task(create("a")).await.unwrap();
+    assert_eq!(e.pending_count("a"), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_heartbeat_extends_only_the_runs_of_the_worker_sending_it() {
+    let store = Store::memory();
+    let e = open(&store).await;
+    let t = e.create_task(create("q")).await.unwrap();
+    let d = e.dispatch(&t.id, "w2").unwrap();
+    let lease = |e: &Engine| e.runs_for_task(&t.id).unwrap()[0].lease_expires_at;
+    let before = lease(&e);
+    tokio::time::advance(Duration::from_secs(20)).await;
+    // A worker whose own run of this task expired earlier keeps heartbeating it.
+    e.heartbeat_from("w1", std::slice::from_ref(&t.id));
+    assert_eq!(lease(&e), before);
+    e.heartbeat_from("w2", std::slice::from_ref(&t.id));
+    assert!(lease(&e) > before);
+    let _ = d;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_ended_run_leaves_no_long_lived_lease_timer() {
+    let store = Store::memory();
+    let e = open(&store).await;
+    let before = e.inner.timers.lock().len();
+    let mut long = create("q");
+    long.timeout_seconds = 86_400;
+    let t = e.create_task(long).await.unwrap();
+    let d = e.dispatch(&t.id, "w").unwrap();
+    e.complete_run(&t.id, &d.run_id, None).await.unwrap();
+    assert_eq!(e.inner.timers.lock().len(), before + 1);
+    // Checked within the horizon, found ended, gone; not kept for the whole day.
+    run_for(Duration::from_secs(
+        crate::write_path::LEASE_CHECK_HORIZON_SECS as u64 + 1,
+    ))
+    .await;
+    assert_eq!(e.inner.timers.lock().len(), before);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_long_running_run_is_still_expired_at_its_lease_end() {
+    let store = Store::memory();
+    let e = open(&store).await;
+    let mut long = create("q");
+    long.timeout_seconds = 300;
+    let t = e.create_task(long).await.unwrap();
+    e.dispatch(&t.id, "w").unwrap();
+    run_for(Duration::from_secs(300)).await;
+    assert_eq!(e.get_task(&t.id).unwrap().status, TaskStatus::Running);
+    run_for(Duration::from_secs(31)).await; // 300 s timeout + 30 s grace
+    assert_eq!(e.get_task(&t.id).unwrap().status, TaskStatus::Retry);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_lowest_priority_sorts_last() {
+    let store = Store::memory();
+    let e = open(&store).await;
+    let mut low = create("q");
+    low.priority = i32::MIN;
+    let low = e.create_task(low).await.unwrap();
+    let mut high = create("q");
+    high.priority = i32::MAX;
+    let high = e.create_task(high).await.unwrap();
+    let normal = e.create_task(create("q")).await.unwrap();
+    let order: Vec<String> = e
+        .take_pending("q", 10)
+        .into_iter()
+        .map(|t| t.task_id)
+        .collect();
+    assert_eq!(order, vec![high.id, normal.id, low.id]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn log_ingester_keeps_draining_while_the_bucket_is_slow() {
+    // Found by review: the ingester wrote one chunk per run, one after another, inside its
+    // receive loop; with a slow bucket the channel filled and the worker streams blocked
+    // on it (and stopped reading heartbeats).
+    use valka_wal::logstore::LogLine;
+    let (store, faults) = faulty_over(Arc::new(object_store::memory::InMemory::new()), 5);
+    faults.set_latency(Duration::from_millis(100));
+    let ingester = crate::LogIngester::new(store, 10, Duration::from_millis(500));
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let (stop, stop_rx) = tokio::sync::watch::channel(false);
+    let running = tokio::spawn(ingester.clone().run(rx, stop_rx));
+    let started = tokio::time::Instant::now();
+    for i in 0..2000i64 {
+        tx.send(LogLine {
+            task_run_id: format!("run-{}", i % 200),
+            timestamp_ms: i,
+            level: "INFO".into(),
+            message: format!("line {i}"),
+            metadata: None,
+        })
+        .await
+        .unwrap();
+    }
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(3), "senders waited {took:?}");
+    stop.send(true).unwrap(); // lines still queued are written too
+    running.await.unwrap();
+    faults.set_latency(Duration::ZERO);
+    for r in 0..200 {
+        let lines = ingester.read(&format!("run-{r}"), 1000).await;
+        let ts: Vec<i64> = lines.iter().map(|l| l.timestamp_ms).collect();
+        let want: Vec<i64> = (0..10).map(|k| r + 200 * k).collect();
+        assert_eq!(ts, want, "run-{r}: every line, in order");
+    }
+}

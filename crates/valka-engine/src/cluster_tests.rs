@@ -659,3 +659,37 @@ async fn a_node_announces_in_its_lease_when_it_is_settled() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(settled().await, Some(true));
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_drain_also_hands_over_a_shard_whose_claim_was_in_flight() {
+    // Found by the ownership review: a drain took its shard list before waiting for the
+    // claim/release lock, so a claim in flight finished after the list was taken; that
+    // shard stayed served by the draining node, and the drain's final truncation deleted
+    // the records written to it.
+    let b = bucket();
+    let a = start(&b, "a").await;
+    let shard = ShardId(5);
+    assert_eq!(a.engine.release_shards(vec![shard], 1).await, 1);
+    assert!(!a.engine.owns(shard));
+    // A slow bucket: the claim below is still running when the drain starts.
+    a.faults
+        .latency_ms
+        .store(300, std::sync::atomic::Ordering::Relaxed);
+    let claim = {
+        let e = a.engine.clone();
+        tokio::spawn(async move { e.claim_shards(vec![shard]).await })
+    };
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    a.engine.drain().await.unwrap();
+    assert_eq!(claim.await.unwrap(), 1, "the claim went through first");
+    assert!(
+        a.engine.owned_shards().is_empty(),
+        "a drained node serves nothing"
+    );
+    let rec = owners::get(&plain(&b), shard)
+        .await
+        .unwrap()
+        .unwrap()
+        .record;
+    assert_eq!(rec.state, OwnerState::Released, "{rec:?}");
+}

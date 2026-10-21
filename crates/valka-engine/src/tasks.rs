@@ -9,10 +9,10 @@ use crate::engine::{
     CreateTask, DispatchInfo, Engine, FailResult, ReattachOutcome, ResultOutcome, RunLocation,
     RunResult,
 };
-use crate::state::{RunEnd, RunStatus, SignalStatus};
+use crate::state::{RunEnd, RunStatus, SignalStatus, idem_key};
 use crate::timers::TimerKind;
 use crate::view::{DeadLetterView, RunView, TaskView};
-use crate::write_path::{decide_outcome, dispatchable, ensure_running};
+use crate::write_path::{decide_outcome, dispatchable, ensure_running, lease_timer_at};
 
 /// How long a node trusts its cached copy of a queue's partition count.
 const QUEUE_CONFIG_TTL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -79,11 +79,7 @@ impl Engine {
     /// one shard and dedupes there. Without one, a partition this node serves is
     /// preferred (no hop), otherwise a random one.
     pub async fn place_task(&self, req: &CreateTask) -> Result<(String, ShardId), ServerError> {
-        if req.queue_name.is_empty() || req.task_name.is_empty() {
-            return Err(ServerError::InvalidArgument(
-                "queue_name and task_name are required".into(),
-            ));
-        }
+        validate_create(req)?;
         if !self.is_serving() {
             return Err(ServerError::Unavailable(
                 "this node's lease is not current; retry".into(),
@@ -112,17 +108,18 @@ impl Engine {
     /// node). Creating the same id again returns the existing task, so a forwarded create
     /// can be retried safely.
     pub async fn create_task_at(&self, id: &str, req: CreateTask) -> Result<TaskView, ServerError> {
-        if req.queue_name.is_empty() || req.task_name.is_empty() {
-            return Err(ServerError::InvalidArgument(
-                "queue_name and task_name are required".into(),
-            ));
-        }
+        validate_create(&req)?;
         let shard = self
             .shard_of(id)
             .ok_or_else(|| ServerError::InvalidArgument(format!("bad task id {id}")))?;
-        if let Some(existing) = self.get_task(id) {
-            // A retried forward of a create that may still be in flight: answer only once
-            // that record is durable.
+        let replay = match &req.idempotency_key {
+            Some(k) => self.find_idempotent(shard, &req.queue_name, k),
+            None => None,
+        };
+        if let Some(existing) = self.get_task(id).or(replay) {
+            // A retried create (same forwarded id, or same key) that may still be in
+            // flight: answer only once that record is durable. Checked before the limits:
+            // a retry must find its task even when the node is full.
             self.sync().await?;
             return Ok(existing);
         }
@@ -146,7 +143,7 @@ impl Engine {
             shard,
             |st| {
                 if let Some(k) = &req.idempotency_key
-                    && st.idempotency.contains_key(k)
+                    && st.idempotency.contains_key(&idem_key(&req.queue_name, k))
                 {
                     return Err(ServerError::IdempotencyConflict(k.clone()));
                 }
@@ -156,10 +153,11 @@ impl Engine {
         );
         let (durable, transitions, _, view) = match created {
             Err(ServerError::IdempotencyConflict(key)) => {
-                // Same key, same shard: the first task is the answer (a retried create).
-                // It may have been created a moment ago: answer only once it is durable.
+                // Same queue and key, same shard: the first task is the answer (a retried
+                // create). It may have been created a moment ago: answer only once it is
+                // durable.
                 let existing = self
-                    .find_by_idempotency_key(shard, &key)
+                    .find_idempotent(shard, &req.queue_name, &key)
                     .ok_or(ServerError::IdempotencyConflict(key))?;
                 self.sync().await?;
                 return Ok(existing);
@@ -207,11 +205,24 @@ impl Engine {
         Ok(())
     }
 
-    /// The task holding idempotency key `key` in `shard`, if any.
+    /// The task of `queue` holding idempotency key `key` in `shard`, if any.
+    pub fn find_idempotent(&self, shard: ShardId, queue: &str, key: &str) -> Option<TaskView> {
+        let st = self.inner.shards.get(shard.index())?.lock();
+        let id = st.idempotency.get(&idem_key(queue, key))?;
+        st.tasks.get(id).map(|t| t.view())
+    }
+
+    /// A task holding idempotency key `key` in `shard`, in any queue (the newest if
+    /// several queues use the key). Kept for callers that do not pass the queue; prefer
+    /// [`Engine::find_idempotent`], since keys are per queue.
     pub fn find_by_idempotency_key(&self, shard: ShardId, key: &str) -> Option<TaskView> {
         let st = self.inner.shards.get(shard.index())?.lock();
-        let id = st.idempotency.get(key)?;
-        st.tasks.get(id).map(|t| t.view())
+        st.idempotency
+            .iter()
+            .filter(|((_, k), _)| k == key)
+            .filter_map(|(_, id)| st.tasks.get(id))
+            .max_by(|a, b| (a.spec.created_at, &a.spec.id).cmp(&(b.spec.created_at, &b.spec.id)))
+            .map(|t| t.view())
     }
 
     pub fn get_task(&self, task_id: &str) -> Option<TaskView> {
@@ -230,28 +241,39 @@ impl Engine {
         limit: usize,
         offset: usize,
     ) -> Vec<TaskView> {
-        let mut all: Vec<TaskView> = Vec::new();
+        let matches = |t: &crate::state::TaskState| {
+            queue.is_none_or(|q| q == t.spec.queue_name) && status.is_none_or(|s| s == t.status)
+        };
+        // Newest first by (created_at, id). Pick the page's keys first, then clone only
+        // the page: a view carries the task's input, metadata and output.
+        let mut top = TopKeys::new(offset.saturating_add(limit));
         for m in &self.inner.shards {
             let st = m.lock();
             if !st.serving() {
                 continue;
             }
             for t in st.tasks.values() {
-                if queue.is_some_and(|q| q != t.spec.queue_name) {
-                    continue;
+                if matches(t)
+                    && top.admits(|(c, id): &(chrono::DateTime<chrono::Utc>, String)| {
+                        (t.spec.created_at, &t.spec.id) > (*c, id)
+                    })
+                {
+                    top.push((t.spec.created_at, t.spec.id.clone()));
                 }
-                if status.is_some_and(|s| s != t.status) {
-                    continue;
-                }
-                all.push(t.view());
             }
         }
-        all.sort_by(|a, b| {
-            b.created_at
-                .cmp(&a.created_at)
-                .then_with(|| b.id.cmp(&a.id))
-        });
-        all.into_iter().skip(offset).take(limit).collect()
+        top.into_desc()
+            .into_iter()
+            .skip(offset)
+            .filter_map(|(_, id)| {
+                let shard = self.shard_of(&id)?;
+                let st = self.inner.shards[shard.index()].lock();
+                st.tasks
+                    .get(&id)
+                    .filter(|t| st.serving() && matches(t))
+                    .map(|t| t.view())
+            })
+            .collect()
     }
 
     pub fn count_tasks(&self, queue: Option<&str>, status: Option<TaskStatus>) -> usize {
@@ -343,7 +365,11 @@ impl Engine {
         let res = self.mutate(
             shard,
             |st| {
-                if !st.tasks.contains_key(task_id) {
+                // A dead letter outlives nothing it should: deleting the task of one whose
+                // task already left RAM still removes the entry.
+                if !st.tasks.contains_key(task_id)
+                    && !st.dead_letters.values().any(|d| d.task_id == task_id)
+                {
                     return Err(ServerError::TaskNotFound(task_id.into()));
                 }
                 Ok((
@@ -473,7 +499,7 @@ impl Engine {
         )?;
         self.inner.offers.lock().remove(task_id);
         self.inner.timers.lock().schedule(
-            info.lease_until,
+            lease_timer_at(info.lease_until, now),
             TimerKind::LeaseExpiry {
                 task_id: task_id.into(),
                 run_id: info.run_id.clone(),
@@ -510,7 +536,14 @@ impl Engine {
             lease_until: r.lease_until,
             task: dispatchable(t, r.attempt_number),
             checkpoints: t.checkpoint_views(),
-            pending_signals: Vec::new(),
+            // A retried dispatch whose first answer was lost: its signals still need
+            // delivering.
+            pending_signals: st
+                .signals
+                .values()
+                .filter(|s| s.task_id == task_id && s.status == SignalStatus::Pending)
+                .map(|s| s.view())
+                .collect(),
         })
     }
 
@@ -743,7 +776,21 @@ impl Engine {
     }
 
     /// Extend leases in RAM now; the WAL record is coalesced by the ticker.
+    ///
+    /// Extends whichever run of each task is current, whoever runs it: prefer
+    /// [`Engine::heartbeat_from`], which only extends runs of the worker that sends it.
     pub fn heartbeat(&self, task_ids: &[String]) {
+        self.extend_leases(None, task_ids);
+    }
+
+    /// A worker's heartbeat: extend the leases of the runs of `task_ids` that this worker
+    /// holds. A worker still busy with a run that expired (and went to another worker) must
+    /// not keep the newer run alive: if that one's worker dies, its lease has to lapse.
+    pub fn heartbeat_from(&self, worker_id: &str, task_ids: &[String]) {
+        self.extend_leases(Some(worker_id), task_ids);
+    }
+
+    fn extend_leases(&self, worker_id: Option<&str>, task_ids: &[String]) {
         let now = self.inner.clock.now();
         let lease = now + ChronoDuration::seconds(self.inner.cfg.scheduler.heartbeat_lease_secs);
         for task_id in task_ids {
@@ -760,7 +807,7 @@ impl Engine {
             let Some(run) = t.current_run_mut() else {
                 continue;
             };
-            if run.status != RunStatus::Running {
+            if run.status != RunStatus::Running || worker_id.is_some_and(|w| w != run.worker_id) {
                 continue;
             }
             run.lease_until = run.lease_until.max(lease);
@@ -789,25 +836,85 @@ impl Engine {
         limit: usize,
         offset: usize,
     ) -> Vec<DeadLetterView> {
-        let mut all: Vec<DeadLetterView> = Vec::new();
-        for m in &self.inner.shards {
+        // As `list_tasks`: pick the page's keys, then clone only those entries.
+        type Key = (chrono::DateTime<chrono::Utc>, String, usize);
+        let mut top: TopKeys<Key> = TopKeys::new(offset.saturating_add(limit));
+        for (i, m) in self.inner.shards.iter().enumerate() {
             let st = m.lock();
             if !st.serving() {
                 continue;
             }
-            all.extend(
-                st.dead_letters
-                    .values()
-                    .filter(|d| queue.is_none_or(|q| q == d.queue_name))
-                    .map(|d| d.view()),
-            );
+            for d in st.dead_letters.values() {
+                if queue.is_none_or(|q| q == d.queue_name)
+                    && top.admits(|(c, id, _): &Key| (d.created_at, &d.id) > (*c, id))
+                {
+                    top.push((d.created_at, d.id.clone(), i));
+                }
+            }
         }
-        all.sort_by(|a, b| {
-            b.created_at
-                .cmp(&a.created_at)
-                .then_with(|| b.id.cmp(&a.id))
-        });
-        all.into_iter().skip(offset).take(limit).collect()
+        top.into_desc()
+            .into_iter()
+            .skip(offset)
+            .filter_map(|(created_at, id, i)| {
+                let st = self.inner.shards[i].lock();
+                st.dead_letters
+                    .get(&crate::state::ShardState::dl_key_of(created_at, &id))
+                    .filter(|_| st.serving())
+                    .map(|d| d.view())
+            })
+            .collect()
+    }
+}
+
+/// What every create must satisfy, wherever it is placed or executed.
+fn validate_create(req: &CreateTask) -> Result<(), ServerError> {
+    if req.queue_name.is_empty() || req.task_name.is_empty() {
+        return Err(ServerError::InvalidArgument(
+            "queue_name and task_name are required".into(),
+        ));
+    }
+    valka_core::validate_queue_name(&req.queue_name).map_err(ServerError::InvalidArgument)
+}
+
+/// The `keep` greatest keys seen so far: a newest-first page without sorting, or
+/// cloning, everything else.
+struct TopKeys<K: Ord> {
+    keep: usize,
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<K>>,
+}
+
+impl<K: Ord> TopKeys<K> {
+    fn new(keep: usize) -> Self {
+        Self {
+            keep,
+            heap: std::collections::BinaryHeap::new(),
+        }
+    }
+
+    /// Whether a key would be kept; `beats(min)` tells whether it is greater than the
+    /// smallest key kept. Asked before building the (owned) key.
+    fn admits(&self, beats: impl FnOnce(&K) -> bool) -> bool {
+        if self.heap.len() < self.keep {
+            return true;
+        }
+        self.keep > 0 && self.heap.peek().is_some_and(|min| beats(&min.0))
+    }
+
+    fn push(&mut self, k: K) {
+        self.heap.push(std::cmp::Reverse(k));
+        if self.heap.len() > self.keep {
+            self.heap.pop();
+        }
+    }
+
+    /// Greatest first.
+    fn into_desc(self) -> Vec<K> {
+        // Ascending in `Reverse<K>` is descending in `K`.
+        self.heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|r| r.0)
+            .collect()
     }
 }
 

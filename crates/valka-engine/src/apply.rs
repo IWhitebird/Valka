@@ -9,7 +9,7 @@ use valka_wal::{Envelope, FailureOutcome, WalRecord};
 
 use crate::state::{
     CheckpointState, DeadLetterEntry, RunEnd, RunState, RunStatus, ShardState, SignalState,
-    SignalStatus, TaskState, Transition,
+    SignalStatus, TaskState, Transition, idem_key,
 };
 
 impl ShardState {
@@ -36,10 +36,18 @@ impl ShardState {
                     return out;
                 }
                 if let Some(k) = &task.idempotency_key {
-                    if self.idempotency.contains_key(k) {
-                        return out;
+                    let key = idem_key(&task.queue_name, k);
+                    // The live path refuses a create whose key is held (under the shard
+                    // lock), so a key held here was freed by an eviction, which is not in
+                    // the WAL, before this record was written: the record wins, and the
+                    // evicted holder that replay brought back goes again.
+                    if let Some(held) = self.idempotency.get(&key).cloned()
+                        && held != task.id
+                        && self.tasks.get(&held).is_some_and(|t| t.is_terminal())
+                    {
+                        self.remove_task(&held);
                     }
-                    self.idempotency.insert(k.clone(), task.id.clone());
+                    self.idempotency.insert(key, task.id.clone());
                 }
                 let due = task.scheduled_at.is_none_or(|t| t <= now);
                 let st = TaskState {
@@ -202,7 +210,9 @@ impl ShardState {
                         t.status = TaskStatus::DeadLetter;
                         t.error_message = Some(error.clone());
                         let entry = DeadLetterEntry {
-                            id: uuid::Uuid::now_v7().to_string(),
+                            // From the record, so replay rebuilds the same entry: a run
+                            // ends once, so its id names at most one dead letter.
+                            id: run_id.clone(),
                             task_id: task_id.clone(),
                             queue_name: t.spec.queue_name.clone(),
                             task_name: t.spec.task_name.clone(),
@@ -402,16 +412,11 @@ impl ShardState {
             }
 
             WalRecord::TaskDeleted { task_id } => {
-                let Some(t) = self.tasks.remove(task_id) else {
+                // Also removes the dead-letter entries of a task already evicted.
+                let Some(t) = self.remove_task(task_id) else {
+                    self.dead_letters.retain(|_, d| d.task_id != *task_id);
                     return out;
                 };
-                if let Some(k) = &t.spec.idempotency_key {
-                    self.idempotency.remove(k);
-                }
-                for sid in &t.signals {
-                    self.signals.remove(sid);
-                }
-                self.dead_letters.retain(|_, d| d.task_id != *task_id);
                 out.push(Transition {
                     task_id: task_id.clone(),
                     queue_name: t.spec.queue_name.clone(),
@@ -674,21 +679,78 @@ mod tests {
     }
 
     #[test]
-    fn idempotency_key_dedupes_within_shard() {
+    fn idempotency_keys_are_per_queue_and_a_logged_create_wins_over_an_evicted_holder() {
         let mut s = ShardState::new(ShardId(0));
         let mut a = spec("a");
         a.idempotency_key = Some("k".into());
-        let mut b = spec("b");
-        b.idempotency_key = Some("k".into());
         assert_eq!(
             s.apply(&mut env(WalRecord::TaskCreated { task: a })).len(),
             1
         );
-        assert!(
-            s.apply(&mut env(WalRecord::TaskCreated { task: b }))
-                .is_empty()
+        // The same key in another queue is another task.
+        let mut other = spec("other");
+        other.queue_name = "q2".into();
+        other.idempotency_key = Some("k".into());
+        assert_eq!(
+            s.apply(&mut env(WalRecord::TaskCreated { task: other }))
+                .len(),
+            1
         );
-        assert_eq!(s.tasks.len(), 1);
+        assert_eq!(s.idempotency[&crate::state::idem_key("q", "k")], "a");
+        assert_eq!(s.idempotency[&crate::state::idem_key("q2", "k")], "other");
+
+        // `a` ends and is evicted live (not in the WAL); a create reusing its key is
+        // logged. Replayed over a base that still holds `a`, the logged create wins.
+        s.apply(&mut env(WalRecord::TaskCancelled {
+            task_id: "a".into(),
+            reason: "x".into(),
+        }));
+        let mut b = spec("b");
+        b.idempotency_key = Some("k".into());
+        assert_eq!(
+            s.apply(&mut env(WalRecord::TaskCreated { task: b })).len(),
+            1
+        );
+        assert!(!s.tasks.contains_key("a"), "the evicted holder goes again");
+        assert_eq!(s.idempotency[&crate::state::idem_key("q", "k")], "b");
+        assert_eq!(s.tasks.len(), 2);
+    }
+
+    #[test]
+    fn dead_letter_ids_come_from_the_record_and_leave_with_their_task() {
+        let build = || {
+            let mut s = ShardState::new(ShardId(0));
+            s.apply(&mut env(WalRecord::TaskCreated { task: spec("a") }));
+            dispatched(&mut s, "a", "r1", 1);
+            s.apply(&mut env(WalRecord::RunFailed {
+                task_id: "a".into(),
+                run_id: "r1".into(),
+                error: "boom".into(),
+                outcome: FailureOutcome::DeadLetter,
+            }));
+            s
+        };
+        let (one, two) = (build(), build());
+        let ids = |s: &ShardState| {
+            s.dead_letters
+                .values()
+                .map(|d| d.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&one), vec!["r1".to_string()]);
+        assert_eq!(ids(&one), ids(&two), "replay rebuilds the same entry");
+
+        // Evicting the task evicts its entry; deleting an evicted task's entry works too.
+        let mut evicted = build();
+        evicted.evict_terminal_before(Utc::now() + chrono::Duration::seconds(1));
+        assert!(evicted.tasks.is_empty() && evicted.dead_letters.is_empty());
+        let mut orphan = build();
+        orphan.tasks.remove("a");
+        assert_eq!(orphan.dead_letters.len(), 1);
+        orphan.apply(&mut env(WalRecord::TaskDeleted {
+            task_id: "a".into(),
+        }));
+        assert!(orphan.dead_letters.is_empty());
     }
 
     #[test]

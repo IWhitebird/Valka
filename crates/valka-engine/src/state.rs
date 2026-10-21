@@ -319,6 +319,13 @@ impl ShardPhase {
     }
 }
 
+/// An idempotency key within its queue.
+pub type IdemKey = (String, String);
+
+pub fn idem_key(queue: &str, key: &str) -> IdemKey {
+    (queue.to_string(), key.to_string())
+}
+
 /// The in-RAM state of one shard.
 #[derive(Debug)]
 pub struct ShardState {
@@ -330,7 +337,10 @@ pub struct ShardState {
     pub shard_seq: u64,
     pub tasks: HashMap<String, TaskState>,
     pub signals: HashMap<String, SignalState>,
-    pub idempotency: HashMap<String, String>,
+    /// (queue, idempotency key) -> task id. Keys are per queue: a create is placed by
+    /// (queue, key), so the same key in two queues names two tasks, wherever they land.
+    /// Not serialized: rebuilt from the tasks when a snapshot is loaded.
+    pub idempotency: HashMap<IdemKey, String>,
     /// Ordered newest-first by insertion (BTreeMap on a reverse key).
     pub dead_letters: BTreeMap<String, DeadLetterEntry>,
     /// Records applied since the last snapshot.
@@ -375,7 +385,18 @@ impl ShardState {
         s.snapshot_at = snap.taken_at;
         for t in snap.tasks {
             if let Some(k) = &t.spec.idempotency_key {
-                s.idempotency.insert(k.clone(), t.spec.id.clone());
+                // Normally one task per key. Should a snapshot hold two (one evicted live,
+                // brought back by an older base), the newest holds the key, whatever the
+                // order the tasks come in.
+                let newer = |held: &String| {
+                    s.tasks.get(held).is_none_or(|h| {
+                        (h.spec.created_at, &h.spec.id) < (t.spec.created_at, &t.spec.id)
+                    })
+                };
+                let key = idem_key(&t.spec.queue_name, k);
+                if s.idempotency.get(&key).is_none_or(newer) {
+                    s.idempotency.insert(key, t.spec.id.clone());
+                }
             }
             s.tasks.insert(t.spec.id.clone(), t);
         }
@@ -410,16 +431,19 @@ impl ShardState {
     }
 
     pub(crate) fn dl_key(d: &DeadLetterEntry) -> String {
-        // Reverse-chronological: newer entries sort first.
-        format!(
-            "{:020}-{}",
-            i64::MAX - d.created_at.timestamp_millis(),
-            d.id
-        )
+        Self::dl_key_of(d.created_at, &d.id)
     }
 
-    /// Drop terminal tasks older than `cutoff`. Not a WAL operation: it is a cache
-    /// eviction re-applied identically after recovery.
+    pub(crate) fn dl_key_of(created_at: DateTime<Utc>, id: &str) -> String {
+        // Reverse-chronological: newer entries sort first.
+        format!("{:020}-{}", i64::MAX - created_at.timestamp_millis(), id)
+    }
+
+    /// Drop terminal tasks older than `cutoff`, with their signals and dead-letter
+    /// entries (and dead-letter entries older than `cutoff` whose task is already gone).
+    /// Not a WAL operation: it is a cache eviction re-applied after recovery. Replay may
+    /// bring an evicted task back; `apply` of a create that reuses its key then evicts it
+    /// again (see `WalRecord::TaskCreated`).
     pub fn evict_terminal_before(&mut self, cutoff: DateTime<Utc>) -> usize {
         let victims: Vec<String> = self
             .tasks
@@ -428,15 +452,37 @@ impl ShardState {
             .map(|t| t.spec.id.clone())
             .collect();
         for id in &victims {
-            if let Some(t) = self.tasks.remove(id) {
-                if let Some(k) = &t.spec.idempotency_key {
-                    self.idempotency.remove(k);
-                }
-                for sid in &t.signals {
-                    self.signals.remove(sid);
-                }
-            }
+            self.remove_task_keep_dead_letters(id);
+        }
+        // One pass for every victim's entries (a dead-letter entry is as old as its task's
+        // last update) and for entries whose task is already gone.
+        if !self.dead_letters.is_empty() {
+            let tasks = &self.tasks;
+            self.dead_letters
+                .retain(|_, d| tasks.contains_key(&d.task_id) || d.created_at >= cutoff);
         }
         victims.len()
+    }
+
+    /// Remove a task with everything that hangs off it: its idempotency key (if it still
+    /// names this task), its signals, its dead-letter entries.
+    pub(crate) fn remove_task(&mut self, task_id: &str) -> Option<TaskState> {
+        let t = self.remove_task_keep_dead_letters(task_id);
+        self.dead_letters.retain(|_, d| d.task_id != task_id);
+        t
+    }
+
+    fn remove_task_keep_dead_letters(&mut self, task_id: &str) -> Option<TaskState> {
+        let t = self.tasks.remove(task_id)?;
+        if let Some(k) = &t.spec.idempotency_key {
+            let key = idem_key(&t.spec.queue_name, k);
+            if self.idempotency.get(&key).is_some_and(|id| id == task_id) {
+                self.idempotency.remove(&key);
+            }
+        }
+        for sid in &t.signals {
+            self.signals.remove(sid);
+        }
+        Some(t)
     }
 }

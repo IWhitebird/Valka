@@ -118,7 +118,9 @@ impl Engine {
             }
             for t in st.tasks.values() {
                 tasks.add(t.status);
-                queues.insert(t.spec.queue_name.clone());
+                if !queues.contains(&t.spec.queue_name) {
+                    queues.insert(t.spec.queue_name.clone());
+                }
             }
             if st.records_since_snapshot > 0 {
                 dirty_shards += 1;

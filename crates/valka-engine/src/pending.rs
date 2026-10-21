@@ -1,6 +1,6 @@
 //! The runnable-task index and the hand-off to the matching layer.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 use tracing::debug;
 use valka_core::TaskStatus;
@@ -43,7 +43,9 @@ impl Engine {
             let st = m.lock();
             if st.serving() {
                 for t in st.tasks.values() {
-                    qs.insert(t.spec.queue_name.clone());
+                    if !qs.contains(&t.spec.queue_name) {
+                        qs.insert(t.spec.queue_name.clone());
+                    }
                 }
             }
         }
@@ -196,19 +198,32 @@ impl Engine {
         if leaving.is_empty() {
             return;
         }
+        // Tasks without a key (deleted, or a whole shard cleared) are searched for with one
+        // pass per queue, not one pass per task: clearing a shard must not be quadratic in
+        // the queue's backlog.
+        let mut unkeyed: HashMap<String, HashSet<String>> = HashMap::new();
         let mut p = self.inner.pending.lock();
         for (queue, key, task_id) in leaving {
-            let Some(set) = p.get_mut(&queue) else {
-                continue;
-            };
             match key {
                 Some(k) => {
-                    set.remove(&k);
+                    if let Some(set) = p.get_mut(&queue) {
+                        set.remove(&k);
+                        if set.is_empty() {
+                            p.remove(&queue);
+                        }
+                    }
                 }
-                None => set.retain(|(_, _, id)| *id != task_id),
+                None => {
+                    unkeyed.entry(queue).or_default().insert(task_id);
+                }
             }
-            if set.is_empty() {
-                p.remove(&queue);
+        }
+        for (queue, ids) in unkeyed {
+            if let Some(set) = p.get_mut(&queue) {
+                set.retain(|(_, _, id)| !ids.contains(id));
+                if set.is_empty() {
+                    p.remove(&queue);
+                }
             }
         }
     }

@@ -9,13 +9,24 @@ use valka_wal::{Envelope, WalRecord};
 
 use crate::engine::{Engine, LeaseDirty};
 use crate::sink::OfferOutcome;
-use crate::state::RunStatus;
+use crate::state::{RunStatus, ShardPhase};
 use crate::timers::TimerKind;
-use crate::write_path::decide_outcome;
+use crate::write_path::{decide_outcome, lease_timer_at};
 use valka_core::ShardId;
 
+/// How often the retention sweep runs.
+pub(crate) const EVICT_EVERY_SECS: i64 = 60;
+/// A timer whose command was refused for a passing reason fires again this much later.
+const REFUSED_TIMER_RETRY_MS: i64 = 1_000;
+
 impl Engine {
+    /// Start the background loops. Lease renewal is started earlier, by `open_with`.
     pub(crate) fn spawn_loops(&self) {
+        // The retention sweep re-arms itself each time it runs; arm its first run.
+        self.inner.timers.lock().schedule(
+            self.inner.clock.now() + ChronoDuration::seconds(EVICT_EVERY_SECS),
+            TimerKind::Evict,
+        );
         let me = self.clone();
         tokio::spawn(async move { me.ticker().await });
         let me = self.clone();
@@ -24,12 +35,49 @@ impl Engine {
         tokio::spawn(async move { me.snapshotter().await });
         let me = self.clone();
         tokio::spawn(async move { me.control_loop().await });
-        tokio::spawn(
-            self.inner
-                .lease
-                .clone()
-                .run(self.inner.lease_stop.subscribe()),
-        );
+        let me = self.clone();
+        tokio::spawn(async move { me.rearm_when_serving_resumes().await });
+    }
+
+    /// The lease went stale and was renewed again: arm every served shard's timers anew,
+    /// in case one was refused meanwhile. (Refused timers also retry on their own; this
+    /// covers anything that slipped through.)
+    async fn rearm_when_serving_resumes(self) {
+        let mut shutdown = self.inner.shutdown.subscribe();
+        let mut serving = self.inner.lease.serving_watch();
+        let mut was = *serving.borrow_and_update();
+        loop {
+            tokio::select! {
+                r = shutdown.changed() => { if r.is_err() || *shutdown.borrow() { return; } }
+                r = serving.changed() => {
+                    if r.is_err() {
+                        return;
+                    }
+                    let now = *serving.borrow_and_update();
+                    if now && !was {
+                        self.rearm_all();
+                    }
+                    was = now;
+                }
+            }
+        }
+    }
+
+    /// Whether a timer whose command failed with `e` must fire again later rather than be
+    /// dropped: the lease is renewed late (`Unavailable`), or the shard is mid-release
+    /// (which may roll back to serving). A shard this node no longer holds drops it: its
+    /// next owner arms its own timers.
+    fn timer_refused_for_now(&self, shard: ShardId, e: &ServerError) -> bool {
+        matches!(e, ServerError::Unavailable(_) | ServerError::NotOwner(_))
+            && matches!(
+                self.shard_phase(shard),
+                Some(ShardPhase::Serving | ShardPhase::Releasing)
+            )
+    }
+
+    fn retry_timer_later(&self, kind: TimerKind) {
+        let at = self.inner.clock.now() + ChronoDuration::milliseconds(REFUSED_TIMER_RETRY_MS);
+        self.inner.timers.lock().schedule(at, kind);
     }
 
     async fn ticker(self) {
@@ -105,7 +153,7 @@ impl Engine {
                 TimerKind::LeaseExpiry { task_id, run_id } => {
                     self.expire_lease(&task_id, &run_id, now)
                 }
-                TimerKind::Unhold { shard } => self.unhold_shard(ShardId(shard)),
+                TimerKind::Unhold { shard } => self.unhold_shard(ShardId(shard), now),
                 TimerKind::Evict => {
                     let retention =
                         ChronoDuration::seconds(self.inner.cfg.wal.completed_retention_secs as i64);
@@ -119,10 +167,10 @@ impl Engine {
                     if n > 0 {
                         debug!(evicted = n, "retention sweep");
                     }
-                    self.inner
-                        .timers
-                        .lock()
-                        .schedule(now + ChronoDuration::seconds(60), TimerKind::Evict);
+                    self.inner.timers.lock().schedule(
+                        now + ChronoDuration::seconds(EVICT_EVERY_SECS),
+                        TimerKind::Evict,
+                    );
                 }
             }
         }
@@ -173,6 +221,11 @@ impl Engine {
                         },
                     );
                 }
+            }
+            Err(e) if self.timer_refused_for_now(shard, &e) => {
+                self.retry_timer_later(TimerKind::Promote {
+                    task_id: task_id.into(),
+                });
             }
             Err(_) => {}
         }
@@ -230,14 +283,22 @@ impl Engine {
             Err(ServerError::Internal(m)) if m.starts_with("rearm:") => {
                 let ms: i64 = m[6..].parse().unwrap_or(0);
                 if let Some(at) = DateTime::from_timestamp_millis(ms) {
+                    // Checked again within the horizon rather than at a far-off lease end,
+                    // so a run that ends early leaves no long-lived timer behind.
                     self.inner.timers.lock().schedule(
-                        at,
+                        lease_timer_at(at, now),
                         TimerKind::LeaseExpiry {
                             task_id: task_id.into(),
                             run_id: run_id.into(),
                         },
                     );
                 }
+            }
+            Err(e) if self.timer_refused_for_now(shard, &e) => {
+                self.retry_timer_later(TimerKind::LeaseExpiry {
+                    task_id: task_id.into(),
+                    run_id: run_id.into(),
+                });
             }
             Err(_) => {}
         }

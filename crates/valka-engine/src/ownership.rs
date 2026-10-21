@@ -95,6 +95,11 @@ impl Engine {
             return 0;
         }
         let _moves = self.inner.moves.lock().await;
+        // A drain may have run while this waited for the lock: a draining or dead node
+        // must not take shards it would never hand over.
+        if !self.is_serving() || self.inner.lease.record().state != valka_wal::LeaseState::Alive {
+            return 0;
+        }
         let cache = tokio::sync::Mutex::new(IncCache::default());
         let concurrency = self.inner.cfg.cluster.claim_concurrency.max(1);
         let results: Vec<(ShardId, Result<(), ClaimRefused>)> = futures::stream::iter(shards)
@@ -325,6 +330,11 @@ impl Engine {
     /// Hand `shards` back (at most `limit`). Returns how many were released.
     pub async fn release_shards(&self, shards: Vec<ShardId>, limit: usize) -> usize {
         let _moves = self.inner.moves.lock().await;
+        self.release_shards_locked(shards, limit).await
+    }
+
+    /// [`Engine::release_shards`] for a caller that already holds `moves` (a drain).
+    pub(crate) async fn release_shards_locked(&self, shards: Vec<ShardId>, limit: usize) -> usize {
         // Shards release independently; a drain hands over every shard, so do it in
         // parallel or it outlasts the lease timeout on a slow bucket.
         let concurrency = self.inner.cfg.cluster.claim_concurrency.max(1);
@@ -366,10 +376,14 @@ impl Engine {
         // Coalesced heartbeats for this shard go into the WAL before the final snapshot.
         self.flush_lease_records_for(Some(shard));
         let back_to_serving = |e: ServerError| {
-            let mut st = self.inner.shards[shard.index()].lock();
-            if st.phase == ShardPhase::Releasing {
-                st.phase = ShardPhase::Serving;
+            {
+                let mut st = self.inner.shards[shard.index()].lock();
+                if st.phase == ShardPhase::Releasing {
+                    st.phase = ShardPhase::Serving;
+                }
             }
+            // Timers that fired while it was releasing were refused: arm them again.
+            self.rearm_shard(shard);
             e
         };
         self.inner

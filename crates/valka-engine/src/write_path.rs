@@ -174,10 +174,20 @@ impl Engine {
 
 pub(crate) fn pending_key(t: &crate::state::TaskState) -> PendingKey {
     (
-        -t.spec.priority,
+        std::cmp::Reverse(t.spec.priority),
         t.spec.created_at.timestamp_millis(),
         t.spec.id.clone(),
     )
+}
+
+/// The longest a lease-expiry timer waits before it re-checks its run. A run's timer is
+/// re-armed at each check while the run lasts; one that ended leaves at most this long in
+/// the timer heap, instead of its whole (possibly day-long) timeout.
+pub(crate) const LEASE_CHECK_HORIZON_SECS: i64 = 60;
+
+/// When to check a run whose lease ends at `lease_until`.
+pub(crate) fn lease_timer_at(lease_until: DateTime<Utc>, now: DateTime<Utc>) -> DateTime<Utc> {
+    lease_until.min(now + chrono::Duration::seconds(LEASE_CHECK_HORIZON_SECS))
 }
 
 pub(crate) fn dispatchable(t: &crate::state::TaskState, attempt: i32) -> DispatchableTask {
