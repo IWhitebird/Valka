@@ -102,6 +102,7 @@ jobs:
       - name: TypeScript tarball
         working-directory: sdks/typescript
         run: |
+          mkdir -p ../../dist
           npm ci
           npm run build
           npm pack --pack-destination ../../dist
