@@ -661,3 +661,25 @@ async fn test_a_worker_takes_one_task_per_free_slot_and_no_more() {
     assert_eq!(assignments(&mut rx).len(), 1);
     assert_eq!(node.engine.pending_count("q"), 5);
 }
+
+#[tokio::test(start_paused = true)]
+async fn test_a_draining_worker_gets_no_new_tasks() {
+    let node = TestNode::new().await;
+    let (wid, mut rx) = node.register_worker(&["q"], 4).await;
+    let (d, w) = (node.dispatcher.clone(), wid.clone());
+    tokio::spawn(async move { d.run_worker_match_loop(w, vec!["q".to_string()]).await });
+    settle().await;
+    node.dispatcher.stop_dispatching(&wid);
+    let task = node.create("q", "t").await;
+    settle().await;
+    assert!(assignments(&mut rx).is_empty());
+    assert_eq!(
+        node.engine.get_task(&task.id).unwrap().status,
+        TaskStatus::Pending
+    );
+    assert_eq!(
+        node.engine.pending_count("q"),
+        1,
+        "still runnable for other workers"
+    );
+}

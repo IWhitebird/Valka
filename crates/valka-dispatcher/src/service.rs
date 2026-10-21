@@ -2,6 +2,7 @@ use crate::heartbeat;
 use crate::router::{LocalRouter, TaskRouter};
 use crate::worker_handle::WorkerHandle;
 use dashmap::DashMap;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -18,6 +19,9 @@ use valka_wal::logstore::LogLine;
 
 /// Most slots a worker registers in one round of its match loop.
 const MAX_SLOTS_PER_ROUND: i32 = 32;
+
+/// How long a task whose dispatch was refused waits before it is offered again.
+const REFUSED_DISPATCH_PAUSE: Duration = Duration::from_millis(50);
 
 /// How long a reattach whose owner is unreachable (its shard is moving) keeps being retried
 /// while the worker still runs the task.
@@ -189,6 +193,9 @@ impl DispatcherService {
 
     /// The worker is draining: no new tasks, but its stream stays open for results.
     pub fn stop_dispatching(&self, worker_id: &WorkerId) {
+        if let Some(mut handle) = self.workers.get_mut(worker_id.as_ref()) {
+            handle.draining = true;
+        }
         self.matching.deregister_worker(worker_id);
     }
 
@@ -206,13 +213,17 @@ impl DispatcherService {
         else {
             return;
         };
+        let in_flight = Arc::new(AtomicI32::new(0));
         let mut round = 0usize;
 
         loop {
+            // Dispatches still in flight hold a slot each until the task is assigned.
             let available = {
                 match self.workers.get(worker_id.as_ref()) {
-                    Some(handle) => handle.available_slots(),
-                    None => return, // Worker disconnected
+                    // Disconnected, or draining: no more tasks for this worker.
+                    None => return,
+                    Some(handle) if handle.draining => return,
+                    Some(handle) => handle.available_slots() - in_flight.load(Ordering::SeqCst),
                 }
             };
 
@@ -259,17 +270,26 @@ impl DispatcherService {
                 continue;
             }
 
-            // A worker on several queues may receive more than it has free slots: the
-            // rest go back to their owners' pending index (they may be another node's).
+            // Dispatches run concurrently (each may be a call to another node) while this
+            // loop goes straight back to waiting with the slots left. A worker on several
+            // queues may receive more than it has free slots: the rest go back to their
+            // owners' pending index (they may be another node's).
+            let mut free = available;
             for envelope in matched {
-                let free = self
-                    .workers
-                    .get(worker_id.as_ref())
-                    .is_some_and(|h| h.available_slots() > 0);
-                if free {
-                    self.dispatch_to_worker(&worker_id, envelope).await;
+                let me = self.clone();
+                if free > 0 {
+                    free -= 1;
+                    in_flight.fetch_add(1, Ordering::SeqCst);
+                    let (worker_id, in_flight, slot_freed) =
+                        (worker_id.clone(), in_flight.clone(), slot_freed.clone());
+                    tokio::spawn(async move {
+                        me.dispatch_to_worker(&worker_id, envelope).await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        // A dispatch that failed gave its slot back.
+                        slot_freed.notify_one();
+                    });
                 } else {
-                    self.router().unoffer(&envelope.task_id).await;
+                    tokio::spawn(async move { me.router().unoffer(&envelope.task_id).await });
                 }
             }
         }
@@ -277,8 +297,13 @@ impl DispatcherService {
 
     async fn dispatch_to_worker(&self, worker_id: &WorkerId, envelope: TaskEnvelope) {
         let router = self.router();
-        // Is the worker still here? If not, hand the task back before recording anything.
-        if !self.workers.contains_key(worker_id.as_ref()) {
+        // Is the worker still here and taking work? If not, hand the task back before
+        // recording anything.
+        if !self
+            .workers
+            .get(worker_id.as_ref())
+            .is_some_and(|h| !h.draining)
+        {
             router.unoffer(&envelope.task_id).await;
             return;
         }
@@ -288,8 +313,10 @@ impl DispatcherService {
             Ok(info) => info,
             Err(e) => {
                 // Cancelled / deleted / already running / owner briefly not serving: hand the
-                // offer back so a PENDING task is runnable again now (a no-op otherwise).
+                // offer back so a PENDING task is runnable again (a no-op otherwise). After a
+                // short pause: an owner that is not serving would refuse it again at once.
                 debug!(task_id = %envelope.task_id, error = %e, "dispatch refused");
+                tokio::time::sleep(REFUSED_DISPATCH_PAUSE).await;
                 router.unoffer(&envelope.task_id).await;
                 return;
             }

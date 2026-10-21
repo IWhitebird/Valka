@@ -18,6 +18,8 @@ pub struct WorkerHandle {
     pub metadata: String,
     /// Notified when a task leaves `active_tasks`, so a full worker's match loop resumes.
     pub slot_freed: Arc<Notify>,
+    /// The worker asked to drain: it finishes what it runs and gets nothing new.
+    pub draining: bool,
 }
 
 impl WorkerHandle {
@@ -41,6 +43,7 @@ impl WorkerHandle {
             connected_at: now,
             metadata,
             slot_freed: Arc::new(Notify::new()),
+            draining: false,
         }
     }
 
