@@ -61,13 +61,13 @@ POST /api/v1/tasks
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `queue_name` | string | Yes | - | Queue to place the task in |
+| `queue_name` | string | Yes | - | Queue to place the task in: letters, digits and `. _ - : @`, at most 128 characters |
 | `task_name` | string | Yes | - | Human-readable task identifier |
 | `input` | JSON | No | `null` | Task payload (any valid JSON, up to `limits.max_payload_bytes`, 1 MiB by default) |
 | `priority` | integer | No | `0` | Higher = higher priority |
 | `max_retries` | integer | No | `3` | Attempt limit: a failure on this attempt dead-letters the task |
 | `timeout_seconds` | integer | No | `300` | Lease timeout per attempt |
-| `idempotency_key` | string | No | `null` | One task per key: a repeated create returns the first task |
+| `idempotency_key` | string | No | `null` | One task per key and queue: a repeated create returns the first task |
 | `metadata` | JSON | No | `{}` | Arbitrary metadata |
 | `scheduled_at` | RFC 3339 | No | `null` | Delayed execution time |
 
@@ -90,7 +90,7 @@ The response is sent once the task is durable in the bucket.
 }
 ```
 
-A create whose `idempotency_key` is already in use returns the task that key made, with
+A create whose `idempotency_key` is already in use in its queue returns the task that key made, with
 `200 OK` instead of `201` and the header `idempotent-replayed: true` (`false` on a new task). That
 makes a create safe to retry after a timeout or a lost response: the SDK clients attach a
 generated key (`auto-…`) to every create that has none for this reason.

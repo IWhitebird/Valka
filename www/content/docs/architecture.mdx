@@ -334,7 +334,7 @@ The full protocol, configuration and operations are on the [Clustering](/docs/cl
 
 | What happens | What the cluster does | What you see |
 |--------------|----------------------|--------------|
-| `kill -9` on a node | After 10 s its guardian tombstones it, splits its log (about 1 s), and the new owners claim its shards | Its shards are unavailable until claimed: 13–27 s in the [failover benchmark](/docs/benchmarks), where claiming dominates on a slow bucket (`UNAVAILABLE`, clients retry). Its workers reconnect and reattach. Nothing acknowledged is lost |
+| `kill -9` on a node | After 10 s its guardian tombstones it, splits its log (about 1 s), and the new owners claim its shards | Its shards are unavailable until claimed: 12–28 s in the [failover benchmark](/docs/benchmarks), where claiming dominates on a slow bucket (`UNAVAILABLE`, clients retry). Its workers reconnect and reattach. Nothing acknowledged is lost |
 | Node frozen 30 s, then wakes up | Taken over while frozen. On waking, its own-lease check fails: it exits and restarts as a new incarnation | Requests it held fail; clients retry |
 | Node cut off from the bucket | It acknowledges nothing. After 7 s it stops serving; after 10 s it is tombstoned and its shards move | About 15 s of unavailability for its shards |
 | Network split between nodes, bucket reachable | No takeover: leases keep renewing. Forwarding across the split fails | Cross-side requests get `UNAVAILABLE` until it heals |
@@ -353,8 +353,9 @@ Guaranteed under every failure above:
 - **One history per shard.** Two nodes never write diverging histories of the same shard.
 - **Bounded recovery.** At most 64 MiB of log per node to replay or split.
 - **Failover.** A dead node's shards are served again within the lease timeout plus the
-  claims (13–27 s measured), as long as some node can reach the bucket.
-- **Exact idempotency.** Two creates with the same idempotency key produce one task.
+  claims (12–28 s measured), as long as some node can reach the bucket.
+- **Exact idempotency.** Two creates with the same idempotency key in the same queue
+  produce one task.
 
 Not guaranteed, by design:
 

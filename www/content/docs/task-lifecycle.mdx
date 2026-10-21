@@ -235,7 +235,7 @@ curl -X POST http://localhost:8989/api/v1/tasks \
   }'
 ```
 
-If a task with the same idempotency key already exists, no second task is made: the create
+If a task with the same idempotency key already exists in the same queue, no second task is made: the create
 returns the existing task (REST `200 OK` with `idempotent-replayed: true` instead of `201`). So a
 create is safe to retry after a timeout, and the SDK clients give every keyless create a
 generated key for exactly that reason. A key always maps to the same queue partition,

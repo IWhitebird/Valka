@@ -27,12 +27,12 @@ that every acknowledged task ran.
 
 | In flight | Creates/s | Ack p50 | Ack p99 | Pickup p50 | Pickup p99 | Ran |
 |---:|---:|---:|---:|---:|---:|---|
-| 64 | 1,218 | 52.5 ms | 54.2 ms | 53.3 ms | 55.1 ms | all 36,544 |
-| 256 | 4,669 | 54.7 ms | 60.6 ms | 59.5 ms | 81.6 ms | all 140,288 |
-| 1,024 | 17,730 | 57.4 ms | 75.0 ms | 84.0 ms | 353 ms | all 532,940 |
+| 64 | 1,225 | 52.2 ms | 53.8 ms | 52.9 ms | 54.8 ms | all 36,800 |
+| 256 | 4,661 | 54.8 ms | 61.1 ms | 59.6 ms | 81.5 ms | all 140,032 |
+| 1,024 | 17,830 | 56.9 ms | 75.1 ms | 80.8 ms | 307 ms | all 535,955 |
 
-A clean stop after each run (final snapshots of every dirty shard) took 0.4 s, 0.9 s and
-3.0 s. The server held 533k tasks in 1.7 GB of RAM at the end of the largest run.
+A clean stop after each run (final snapshots of every dirty shard) took 0.3 s, 0.8 s and
+2.9 s. The server held 536k tasks in 1.7 GB of RAM at the end of the largest run.
 
 ### Three nodes, MinIO
 
@@ -41,33 +41,45 @@ worker per node; a task is run by whichever node's worker takes it first.
 
 | In flight | Creates/s | Ack p50 | Ack p99 | Pickup p50 | Pickup p99 | Ran |
 |---:|---:|---:|---:|---:|---:|---|
-| 64 | 1,144 | 55.2 ms | 99.0 ms | 54.9 ms | 97.8 ms | all 34,390 |
-| 256 | 4,589 | 54.5 ms | 101.4 ms | 54.8 ms | 104.4 ms | all 137,931 |
-| 1,024 | 16,063 | 62.2 ms | 157.2 ms | 62.6 ms | 150.1 ms | all 483,645 |
+| 64 | 1,146 | 55.3 ms | 99.2 ms | 54.2 ms | 79.3 ms | all 34,454 |
+| 256 | 4,528 | 55.1 ms | 103.0 ms | 54.9 ms | 105.9 ms | all 136,223 |
+| 1,024 | 15,613 | 63.0 ms | 131.5 ms | 63.5 ms | 131.9 ms | all 469,656 |
+
+About two thirds of the creates reach a node that does not own their shard and are
+forwarded, which adds one hop and the owner's commit window to their acknowledgement.
 
 ### Failover (three nodes in Docker, MinIO)
 
 `scripts/bench-failover.sh` kills a node with `kill -9` and polls another node for when the
 dead node is **detected** (its lease tombstoned) and when the cluster has **recovered**
-(every shard served by a live node again). Six trials, a different node each time:
+(every shard served by a live node again). Six trials per setup, a different node each
+time: once as `docker-compose.cluster.yml` ships (no CPU limits), once with every node and
+MinIO limited to 1.5 CPUs.
 
-| Of six trials | Detected | Recovered |
-|---|---:|---:|
-| fastest | 9.9 s | 13.5 s |
-| median | 13.5 s | 22.3 s |
-| slowest | 15.1 s | 26.7 s |
+| Six trials | Detected | Recovered (no limits) | Recovered (1.5 CPUs each) |
+|---|---:|---:|---:|
+| fastest | 9.4 s | 11.8 s | 17.9 s |
+| median | 13.4 s | 15.0 s | 24.6 s |
+| slowest | 15.4 s | 17.4 s | 27.8 s |
 
 Detection is the lease timeout (10 s) plus up to one membership listing (3 s). Recovery
 then takes one placement round and the claims themselves: about five object-store requests
-per shard, here for ~1,400 shards per surviving node against a single MinIO limited to 1.5
-CPUs. Workers keep running their tasks meanwhile and reattach them; creates and results for
-the dead node's shards get `UNAVAILABLE` and the SDKs retry them.
+per shard, for ~1,400 shards per surviving node, so it is bounded by how many requests the
+bucket serves at once — here a single MinIO process. Workers keep running their tasks
+meanwhile and reattach them; creates and results for the dead node's shards get
+`UNAVAILABLE` and the SDKs retry them.
+
+A five-minute chaos run on the same cluster (11 random `kill -9`s, freezes and SIGTERM
+restarts under load, `scripts/chaos.sh`) acknowledged 5,476 tasks and completed all of them,
+with none lost and no idempotency key used twice; 278 ran more than once, as at-least-once
+delivery allows around failures.
 
 ## What bounds what
 
 - **Ack latency** is the group-commit window (50 ms) plus one PUT and one conditional GET
-  of the node's lease. `VALKA_WAL__FLUSH_INTERVAL_MS=10` gave 12 ms p50 acks on one node at
-  64 in flight (5,222 creates/s), at five times the PUT count.
+  of the node's lease. `VALKA_WAL__FLUSH_INTERVAL_MS=10` gave 12.4 ms p50 and 14.1 ms p99
+  acks on one node at 64 in flight (5,168 creates/s, pickup p99 15.7 ms), at four times the
+  PUT count (2,423 segments in 30 s instead of 575).
 - **Throughput** is bounded by CPU (JSON encoding and compression of segments, gRPC), not by
   PUT latency: up to four segments are in flight per node and each holds every record of
   its window.
