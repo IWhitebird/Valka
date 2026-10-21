@@ -21,7 +21,7 @@ class RetryPolicy:
 
     def next_delay(self) -> float:
         """Calculate and return the next delay in milliseconds."""
-        delay = self.initial_delay_ms * (self.multiplier ** self._attempt)
+        delay = self.initial_delay_ms * (self.multiplier**self._attempt)
         capped = min(delay, self.max_delay_ms)
         jitter = capped * 0.1 * random.random()
         self._attempt += 1

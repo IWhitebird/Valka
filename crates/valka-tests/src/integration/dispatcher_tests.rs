@@ -440,8 +440,14 @@ struct FlakyReattach {
 
 fn take_failure(n: &std::sync::atomic::AtomicU32) -> bool {
     use std::sync::atomic::Ordering;
-    n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-        .is_ok()
+    let mut cur = n.load(Ordering::SeqCst);
+    while cur > 0 {
+        match n.compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(seen) => cur = seen,
+        }
+    }
+    false
 }
 
 #[async_trait::async_trait]

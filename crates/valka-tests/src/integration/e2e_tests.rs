@@ -24,12 +24,21 @@ async fn free_port() -> u16 {
 }
 
 async fn start_server(store: Store, node_id: &str, port: u16) -> RunningServer {
+    start_server_with_keys(store, node_id, port, valka_server::auth::ApiKeys::open()).await
+}
+
+async fn start_server_with_keys(
+    store: Store,
+    node_id: &str,
+    port: u16,
+    keys: valka_server::auth::ApiKeys,
+) -> RunningServer {
     let node = TestNode::on_store(store, node_id).await;
     let (shutdown, rx) = watch::channel(false);
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let (api, event_tx, logs) = (node.api.clone(), node.event_tx.clone(), node.logs.clone());
     let handle = tokio::spawn(async move {
-        valka_server::grpc::serve_grpc(addr, api, event_tx, logs, rx)
+        valka_server::grpc::serve_grpc(addr, api, event_tx, logs, keys, rx)
             .await
             .expect("grpc server");
     });
@@ -585,4 +594,127 @@ async fn e2e_reconnecting_worker_adopts_a_run_whose_dispatch_was_lost() {
     let _ = tokio::time::timeout(Duration::from_secs(5), worker_task).await;
     let _ = server.shutdown.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), server.handle).await;
+}
+
+#[tokio::test]
+async fn e2e_api_keys_protect_the_grpc_api() {
+    let port = free_port().await;
+    let server = start_server_with_keys(
+        Store::memory(),
+        "keys",
+        port,
+        valka_server::auth::ApiKeys::parse(Some("k1")),
+    )
+    .await;
+
+    // Without the key: refused, and not retried (it would never succeed).
+    let mut anon = ValkaClient::builder()
+        .addr(&server.addr)
+        .api_key("")
+        .connect()
+        .await
+        .unwrap();
+    match anon.create_task("q", "t", None).await.unwrap_err() {
+        valka_sdk::SdkError::Grpc(s) => assert_eq!(s.code(), tonic::Code::Unauthenticated),
+        other => panic!("expected Unauthenticated, got {other}"),
+    }
+
+    // With the key: the client creates, and a worker with the key runs the task, steps
+    // (the unary Checkpoint call) included.
+    let mut client = ValkaClient::builder()
+        .addr(&server.addr)
+        .api_key("k1")
+        .connect()
+        .await
+        .unwrap();
+    let t = client.create_task("q", "t", None).await.unwrap();
+    let worker = ValkaWorker::builder()
+        .server_addr(&server.addr)
+        .api_key("k1")
+        .queues(&["q"])
+        .handler(|ctx| async move {
+            let n: i64 = ctx.step("one", || async { Ok::<_, String>(1) }).await?;
+            Ok(serde_json::json!({ "n": n }))
+        })
+        .build()
+        .await
+        .unwrap();
+    let stop = worker.shutdown_handle();
+    let run = tokio::spawn(worker.run());
+    let done = wait_status(&mut client, &t.id, 4, Duration::from_secs(10)).await;
+    assert_eq!(done.output, r#"{"n":1}"#);
+    assert_eq!(
+        server.node.engine.checkpoints_for_task(&t.id).unwrap()[0].step,
+        "one"
+    );
+    stop.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+}
+
+#[tokio::test]
+async fn e2e_clients_and_workers_ride_through_a_dead_node_and_a_restart() {
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let store = Store::wrap(backing.clone(), "", true, "shared-memory");
+    let port = free_port().await;
+    let server = start_server(store.clone(), "retry", port).await;
+    // Nothing listens on the first address: the client and the worker skip it.
+    let dead = format!("http://127.0.0.1:{}", free_port().await);
+    let addrs = [dead.clone(), server.addr.clone()];
+    let mut client = ValkaClient::builder()
+        .addrs(&addrs)
+        .connect()
+        .await
+        .unwrap();
+    let a = client.create_task("q", "t", None).await.unwrap();
+    assert!(
+        a.idempotency_key.starts_with("auto-"),
+        "every create carries a key, so a retry cannot make a second task"
+    );
+    // An explicit key twice: one task.
+    let keyed = valka_proto::CreateTaskRequest {
+        queue_name: "q".into(),
+        task_name: "t".into(),
+        idempotency_key: "order-7".into(),
+        ..Default::default()
+    };
+    let k1 = client.create_task_request(keyed.clone()).await.unwrap();
+    let k2 = client.create_task_request(keyed).await.unwrap();
+    assert_eq!(k1.id, k2.id);
+    server.node.engine.sync().await.unwrap();
+
+    // The node crashes and comes back a second later on the same bucket and port. A create
+    // issued meanwhile is retried until it lands, once.
+    let _ = server.shutdown.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), server.handle).await;
+    drop(server.node);
+    let restart = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            start_server(store, "retry", port).await
+        })
+    };
+    let b = client.create_task("q", "t", None).await.unwrap();
+    let server = restart.await.unwrap();
+    let all = server.node.engine.list_tasks(None, None, 10, 0);
+    assert_eq!(all.len(), 3, "a, the keyed task and b: {all:?}");
+    assert!(all.iter().any(|t| t.id == b.id));
+
+    // A worker given both addresses runs them all.
+    let worker = ValkaWorker::builder()
+        .server_addrs(&addrs)
+        .queues(&["q"])
+        .concurrency(4)
+        .handler(|_ctx| async move { Ok(serde_json::json!({})) })
+        .build()
+        .await
+        .unwrap();
+    let stop = worker.shutdown_handle();
+    let run = tokio::spawn(worker.run());
+    for id in [&a.id, &k1.id, &b.id] {
+        wait_status(&mut client, id, 4, Duration::from_secs(15)).await;
+    }
+    stop.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
 }

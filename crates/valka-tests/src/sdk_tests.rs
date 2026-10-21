@@ -167,7 +167,10 @@ fn make_context_with(
         assignment,
         request_tx,
         signal_rx,
-        WorkerServiceClient::new(unreachable),
+        WorkerServiceClient::with_interceptor(
+            unreachable,
+            valka_sdk::transport::ApiKeyAuth::default(),
+        ),
     );
     (ctx, signal_tx, request_rx)
 }

@@ -1,4 +1,4 @@
-module github.com/valka-queue/valka/sdks/go
+module github.com/IWhitebird/Valka/sdks/go
 
 go 1.21
 

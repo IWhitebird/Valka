@@ -13,7 +13,7 @@ OUT_DIR="$SCRIPT_DIR/proto/valkav1"
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 
-GO_MODULE="github.com/valka-queue/valka/sdks/go"
+GO_MODULE="github.com/IWhitebird/Valka/sdks/go"
 
 # Use a temp dir for generation, then flatten the output
 TMPDIR="$(mktemp -d)"

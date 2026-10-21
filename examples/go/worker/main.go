@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	valka "github.com/valka-queue/valka/sdks/go"
+	valka "github.com/IWhitebird/Valka/sdks/go"
 )
 
 func main() {

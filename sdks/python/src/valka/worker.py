@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import signal
 import time
 import uuid
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 import grpc
 import grpc.aio
@@ -52,10 +54,16 @@ class ValkaWorker:
         concurrency: int,
         metadata: dict[str, Any] | None,
         handler: TaskHandler,
+        server_addrs: list[str] | None = None,
+        api_key: str | None = None,
     ) -> None:
         self._worker_id = worker_id
         self._name = name
-        self._server_addr = server_addr
+        # Several nodes of one cluster: connect to one, move to the next when it drops.
+        self._server_addrs = server_addrs or [server_addr]
+        self._next_addr = 0
+        key = api_key if api_key is not None else os.environ.get("VALKA_API_KEY", "")
+        self._call_metadata = (("authorization", f"Bearer {key}"),) if key else ()
         self._queues = queues
         self._concurrency = concurrency
         self._metadata = metadata
@@ -85,6 +93,8 @@ class ValkaWorker:
         *,
         name: str = "",
         server_addr: str = "localhost:50051",
+        server_addrs: list[str] | None = None,
+        api_key: str | None = None,
         queues: list[str],
         concurrency: int = 1,
         metadata: dict[str, Any] | None = None,
@@ -96,6 +106,8 @@ class ValkaWorker:
             worker_id=worker_id,
             name=name or f"python-worker-{worker_id[:8]}",
             server_addr=server_addr,
+            server_addrs=server_addrs,
+            api_key=api_key,
             queues=queues,
             concurrency=concurrency,
             metadata=metadata,
@@ -115,6 +127,8 @@ class ValkaWorker:
             except Exception as exc:
                 if self._shutting_down:
                     break
+                # Next time, try the next node: any node takes any worker.
+                self._next_addr += 1
                 delay = retry.next_delay_seconds()
                 logger.warning("Connection lost (%s), reconnecting in %.1fs", exc, delay)
                 await asyncio.sleep(delay)
@@ -161,7 +175,7 @@ class ValkaWorker:
         from valka._proto.valka.v1 import worker_pb2, worker_pb2_grpc
 
         channel = grpc.aio.insecure_channel(
-            self._server_addr,
+            self._server_addrs[self._next_addr % len(self._server_addrs)],
             options=[
                 ("grpc.keepalive_time_ms", 10_000),
                 ("grpc.keepalive_timeout_ms", 5_000),
@@ -170,7 +184,7 @@ class ValkaWorker:
 
         try:
             self._stub = worker_pb2_grpc.WorkerServiceStub(channel)
-            self._stream = self._stub.Session()
+            self._stream = self._stub.Session(metadata=self._call_metadata)
 
             await self._stream.write(self._hello())
             for result in list(self._unacked.values()):
@@ -330,7 +344,8 @@ class ValkaWorker:
                     task_run_id=assignment.task_run_id,
                     step=step,
                     output=output,
-                )
+                ),
+                metadata=self._call_metadata,
             )
 
         ctx = TaskContext(
@@ -389,7 +404,8 @@ class ValkaWorkerBuilder:
 
     def __init__(self) -> None:
         self._name: str = ""
-        self._server_addr: str = "localhost:50051"
+        self._server_addrs: list[str] = ["localhost:50051"]
+        self._api_key: str | None = None
         self._queues: list[str] = []
         self._concurrency: int = 1
         self._metadata: dict[str, Any] | None = None
@@ -402,7 +418,22 @@ class ValkaWorkerBuilder:
 
     def server_addr(self, addr: str) -> ValkaWorkerBuilder:
         """Set the gRPC server address (host:port)."""
-        self._server_addr = addr
+        self._server_addrs = [addr]
+        return self
+
+    def server_addrs(self, addrs: list[str]) -> ValkaWorkerBuilder:
+        """Set several nodes of one cluster (host:port each). The worker connects to one and
+        moves to the next when its connection drops; running tasks reattach wherever it
+        lands."""
+        if not addrs:
+            raise ValueError("At least one server address is required")
+        self._server_addrs = list(addrs)
+        return self
+
+    def api_key(self, key: str) -> ValkaWorkerBuilder:
+        """Set the API key, sent as ``authorization: Bearer <key>`` (default: the
+        ``VALKA_API_KEY`` environment variable)."""
+        self._api_key = key
         return self
 
     def queues(self, queues: list[str]) -> ValkaWorkerBuilder:
@@ -436,7 +467,9 @@ class ValkaWorkerBuilder:
         return ValkaWorker(
             worker_id=worker_id,
             name=self._name or f"python-worker-{worker_id[:8]}",
-            server_addr=self._server_addr,
+            server_addr=self._server_addrs[0],
+            server_addrs=self._server_addrs,
+            api_key=self._api_key,
             queues=self._queues,
             concurrency=self._concurrency,
             metadata=self._metadata,

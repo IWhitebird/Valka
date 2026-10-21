@@ -143,9 +143,7 @@ def test_hello_lists_runs_still_executing():
     async def run():
         w = make_worker(handler)
         assert list(w._hello().hello.running) == []
-        assignment = worker_pb2.TaskAssignment(
-            task_id="a", task_run_id="a-run", attempt_number=3
-        )
+        assignment = worker_pb2.TaskAssignment(task_id="a", task_run_id="a-run", attempt_number=3)
         await w._handle_task_assignment(assignment)
         running = w._hello().hello.running
         assert [(r.task_id, r.task_run_id, r.attempt_number) for r in running] == [

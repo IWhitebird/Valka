@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { ApiError } from "./errors.js";
 import type {
   Task,
@@ -13,24 +14,55 @@ import type {
   ValkaClientConfig,
 } from "./types.js";
 
+/** Answers that may succeed on a retry, possibly on another node. */
+const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
+
+function envApiKey(): string | undefined {
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process
+    ?.env;
+  return env?.VALKA_API_KEY || undefined;
+}
+
+/**
+ * REST client for the Valka API.
+ *
+ * Give it every node's URL (`baseUrls`): any node takes any request, so when one goes away
+ * the client moves to the next. Creates carry an idempotency key (generated when you set
+ * none), so a create retried after a lost response returns the task it already made. Reads
+ * are retried the same way; cancels and signals are not.
+ */
 export class ValkaClient {
-  private baseUrl: string;
-  private headers: Record<string, string>;
+  private readonly baseUrls: string[];
+  private next = 0;
+  private readonly headers: Record<string, string>;
+  private readonly attempts: number;
+  private readonly timeoutMs: number;
+  private readonly autoIdempotency: boolean;
 
   constructor(config: ValkaClientConfig | string) {
-    if (typeof config === "string") {
-      this.baseUrl = config.replace(/\/$/, "");
-      this.headers = {};
-    } else {
-      this.baseUrl = config.baseUrl.replace(/\/$/, "");
-      this.headers = config.headers ?? {};
-    }
+    const c: ValkaClientConfig = typeof config === "string" ? { baseUrl: config } : config;
+    this.baseUrls = [c.baseUrl, ...(c.baseUrls ?? [])].map((u) => u.replace(/\/$/, ""));
+    this.headers = { ...(c.headers ?? {}) };
+    const apiKey = c.apiKey ?? envApiKey();
+    if (apiKey) this.headers.Authorization = `Bearer ${apiKey}`;
+    this.attempts = Math.max(1, c.attempts ?? 6);
+    this.timeoutMs = c.timeoutMs ?? 10_000;
+    this.autoIdempotency = c.autoIdempotency ?? true;
+  }
+
+  private get baseUrl(): string {
+    return this.baseUrls[this.next % this.baseUrls.length];
   }
 
   // -- Task CRUD --
 
+  /** Create a task. A second create with the same idempotency key returns the first task. */
   async createTask(options: CreateTaskOptions): Promise<Task> {
-    return this.post<Task>("/api/v1/tasks", options);
+    const body = { ...options };
+    if (!body.idempotency_key && this.autoIdempotency) {
+      body.idempotency_key = `auto-${randomUUID()}`;
+    }
+    return this.request<Task>("POST", "/api/v1/tasks", body, Boolean(body.idempotency_key));
   }
 
   async getTask(taskId: string): Promise<Task> {
@@ -47,8 +79,9 @@ export class ValkaClient {
     return this.get<Task[]>(`/api/v1/tasks${qs ? `?${qs}` : ""}`);
   }
 
+  /** Cancel a task (sent once: a cancel is not idempotent). */
   async cancelTask(taskId: string): Promise<Task> {
-    return this.post<Task>(`/api/v1/tasks/${taskId}/cancel`);
+    return this.request<Task>("POST", `/api/v1/tasks/${taskId}/cancel`, undefined, false);
   }
 
   // -- Task Runs & Logs --
@@ -95,10 +128,12 @@ export class ValkaClient {
     signalName: string,
     payload?: unknown,
   ): Promise<{ signal_id: string; delivered: boolean }> {
-    return this.post(`/api/v1/tasks/${taskId}/signal`, {
-      signal_name: signalName,
-      payload: payload ?? null,
-    });
+    return this.request(
+      "POST",
+      `/api/v1/tasks/${taskId}/signal`,
+      { signal_name: signalName, payload: payload ?? null },
+      false,
+    );
   }
 
   async listSignals(
@@ -114,7 +149,7 @@ export class ValkaClient {
   // -- Health --
 
   async healthCheck(): Promise<string> {
-    const res = await this.fetchRaw("/healthz");
+    const res = await this.send("GET", "/healthz", undefined, true);
     return res.text();
   }
 
@@ -171,34 +206,60 @@ export class ValkaClient {
 
   // -- Internal helpers --
 
-  private async fetchRaw(path: string, init: RequestInit = {}): Promise<Response> {
-    return fetch(`${this.baseUrl}${path}`, {
-      ...init,
-      headers: {
-        "Content-Type": "application/json",
-        ...this.headers,
-        ...(init.headers as Record<string, string> | undefined),
-      },
-    });
-  }
-
   private async get<T>(path: string): Promise<T> {
-    const res = await this.fetchRaw(path);
-    if (!res.ok) {
-      throw new ApiError(res.status, await this.extractErrorMessage(res));
-    }
+    return this.request<T>("GET", path, undefined, true);
+  }
+
+  private async request<T>(
+    method: string,
+    path: string,
+    body: unknown,
+    retry: boolean,
+  ): Promise<T> {
+    const res = await this.send(method, path, body, retry);
     return res.json() as Promise<T>;
   }
 
-  private async post<T>(path: string, body?: unknown): Promise<T> {
-    const res = await this.fetchRaw(path, {
-      method: "POST",
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    if (!res.ok) {
-      throw new ApiError(res.status, await this.extractErrorMessage(res));
+  /** Send one request; a retryable failure moves to the next node and tries again. */
+  private async send(
+    method: string,
+    path: string,
+    body: unknown,
+    retry: boolean,
+  ): Promise<Response> {
+    const attempts = retry ? this.attempts : 1;
+    let delay = 100;
+    let last: unknown = new Error("no attempt made");
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (attempt > 0) {
+        await new Promise((r) => setTimeout(r, delay));
+        delay = Math.min(delay * 2, 3_000);
+      }
+      const node = this.next;
+      let res: Response;
+      try {
+        res = await fetch(`${this.baseUrls[node % this.baseUrls.length]}${path}`, {
+          method,
+          headers: { "Content-Type": "application/json", ...this.headers },
+          body: body === undefined ? undefined : JSON.stringify(body),
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+      } catch (err) {
+        // Connection refused, reset, or no answer in time.
+        last = err;
+        this.advance(node);
+        continue;
+      }
+      if (res.ok) return res;
+      last = new ApiError(res.status, await this.extractErrorMessage(res));
+      if (!RETRYABLE_STATUS.has(res.status)) throw last;
+      this.advance(node);
     }
-    return res.json() as Promise<T>;
+    throw last;
+  }
+
+  private advance(node: number): void {
+    if (this.next === node) this.next = node + 1;
   }
 
   private async extractErrorMessage(res: Response): Promise<string> {

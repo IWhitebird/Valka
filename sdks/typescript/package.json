@@ -26,7 +26,8 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {
     "nice-grpc": "^2.1.10",

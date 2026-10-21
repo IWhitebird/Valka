@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	pb "github.com/valka-queue/valka/sdks/go/proto/valkav1"
+	pb "github.com/IWhitebird/Valka/sdks/go/proto/valkav1"
 )
 
 // SignalData holds the data from a received signal.

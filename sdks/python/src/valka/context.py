@@ -6,8 +6,9 @@ import asyncio
 import inspect
 import json
 import time
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Callable, Awaitable, Mapping, TypeVar, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, TypeVar
 
 if TYPE_CHECKING:
     from valka._proto.valka.v1 import worker_pb2
@@ -171,9 +172,7 @@ class TaskContext:
     async def _send_signal_ack(self, signal_id: str) -> None:
         from valka._proto.valka.v1 import worker_pb2
 
-        request = worker_pb2.WorkerRequest(
-            signal_ack=worker_pb2.SignalAck(signal_id=signal_id)
-        )
+        request = worker_pb2.WorkerRequest(signal_ack=worker_pb2.SignalAck(signal_id=signal_id))
         await self._send_fn(request)
 
     async def _log_at_level(self, level: int, message: str) -> None:
@@ -185,7 +184,5 @@ class TaskContext:
             level=level,
             message=message,
         )
-        request = worker_pb2.WorkerRequest(
-            log_batch=worker_pb2.LogBatch(entries=[entry])
-        )
+        request = worker_pb2.WorkerRequest(log_batch=worker_pb2.LogBatch(entries=[entry]))
         await self._send_fn(request)

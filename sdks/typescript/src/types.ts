@@ -129,12 +129,26 @@ export interface GetRunLogsOptions {
 
 export interface ValkaClientConfig {
   baseUrl: string;
+  /** More nodes of the same cluster: when one goes away the client moves to the next. */
+  baseUrls?: string[];
+  /** API key, sent as `Authorization: Bearer <key>` (default: `VALKA_API_KEY`). */
+  apiKey?: string;
   headers?: Record<string, string>;
+  /** Attempts per call for retryable failures (default 6; 1 disables retries). */
+  attempts?: number;
+  /** Time limit for one attempt, in milliseconds (default 10000). */
+  timeoutMs?: number;
+  /** Generate an idempotency key for creates that have none (default true). */
+  autoIdempotency?: boolean;
 }
 
 export interface ValkaWorkerOptions {
   name?: string;
   serverAddr?: string;
+  /** Several nodes of one cluster: the worker moves to the next when its connection drops. */
+  serverAddrs?: string[];
+  /** API key, sent as `authorization: Bearer <key>` (default: `VALKA_API_KEY`). */
+  apiKey?: string;
   queues: string[];
   concurrency?: number;
   metadata?: Record<string, unknown>;

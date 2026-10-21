@@ -25,3 +25,11 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/valka"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["src/valka/_proto"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

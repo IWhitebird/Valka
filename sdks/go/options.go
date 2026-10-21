@@ -1,13 +1,17 @@
 package valka
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+)
 
 // WorkerOption configures a ValkaWorker via the functional options pattern.
 type WorkerOption func(*workerConfig) error
 
 type workerConfig struct {
 	name        string
-	serverAddr  string
+	serverAddrs []string
+	apiKey      string
 	queues      []string
 	concurrency int
 	metadata    map[string]interface{}
@@ -16,7 +20,8 @@ type workerConfig struct {
 
 func defaultConfig() *workerConfig {
 	return &workerConfig{
-		serverAddr:  "localhost:50051",
+		serverAddrs: []string{"localhost:50051"},
+		apiKey:      os.Getenv("VALKA_API_KEY"),
 		concurrency: 1,
 	}
 }
@@ -45,7 +50,29 @@ func WithName(name string) WorkerOption {
 // WithServerAddr sets the gRPC server address (host:port).
 func WithServerAddr(addr string) WorkerOption {
 	return func(c *workerConfig) error {
-		c.serverAddr = addr
+		c.serverAddrs = []string{addr}
+		return nil
+	}
+}
+
+// WithServerAddrs sets several nodes of one cluster (host:port each). The worker connects to
+// one and moves to the next when its connection drops; running tasks reattach wherever it
+// lands.
+func WithServerAddrs(addrs ...string) WorkerOption {
+	return func(c *workerConfig) error {
+		if len(addrs) == 0 {
+			return fmt.Errorf("at least one server address is required")
+		}
+		c.serverAddrs = addrs
+		return nil
+	}
+}
+
+// WithAPIKey sets the API key, sent as "authorization: Bearer <key>" (default: the
+// VALKA_API_KEY environment variable).
+func WithAPIKey(key string) WorkerOption {
+	return func(c *workerConfig) error {
+		c.apiKey = key
 		return nil
 	}
 }

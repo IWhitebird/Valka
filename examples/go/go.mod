@@ -1,8 +1,8 @@
-module github.com/valka-queue/valka/examples/go
+module github.com/IWhitebird/Valka/examples/go
 
 go 1.21
 
-require github.com/valka-queue/valka/sdks/go v0.0.0
+require github.com/IWhitebird/Valka/sdks/go v0.0.0
 
 require (
 	golang.org/x/net v0.28.0 // indirect
@@ -13,4 +13,4 @@ require (
 	google.golang.org/protobuf v1.35.2 // indirect
 )
 
-replace github.com/valka-queue/valka/sdks/go => ../../sdks/go
+replace github.com/IWhitebird/Valka/sdks/go => ../../sdks/go

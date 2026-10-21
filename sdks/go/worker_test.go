@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/valka-queue/valka/sdks/go/proto/valkav1"
+	pb "github.com/IWhitebird/Valka/sdks/go/proto/valkav1"
 )
 
 func newTestWorker(t *testing.T) *ValkaWorker {

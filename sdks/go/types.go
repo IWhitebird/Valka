@@ -6,15 +6,15 @@ import "encoding/json"
 type TaskStatus int
 
 const (
-	TaskStatusUnspecified  TaskStatus = 0
-	TaskStatusPending      TaskStatus = 1
-	TaskStatusDispatching  TaskStatus = 2
-	TaskStatusRunning      TaskStatus = 3
-	TaskStatusCompleted    TaskStatus = 4
-	TaskStatusFailed       TaskStatus = 5
-	TaskStatusRetry        TaskStatus = 6
-	TaskStatusDeadLetter   TaskStatus = 7
-	TaskStatusCancelled    TaskStatus = 8
+	TaskStatusUnspecified TaskStatus = 0
+	TaskStatusPending     TaskStatus = 1
+	TaskStatusDispatching TaskStatus = 2
+	TaskStatusRunning     TaskStatus = 3
+	TaskStatusCompleted   TaskStatus = 4
+	TaskStatusFailed      TaskStatus = 5
+	TaskStatusRetry       TaskStatus = 6
+	TaskStatusDeadLetter  TaskStatus = 7
+	TaskStatusCancelled   TaskStatus = 8
 )
 
 // LogLevel represents log severity.

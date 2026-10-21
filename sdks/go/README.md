@@ -5,7 +5,7 @@ Go SDK for the [Valka](https://github.com/your-org/valka) distributed task queue
 ## Installation
 
 ```bash
-go get github.com/valka-queue/valka/sdks/go
+go get github.com/IWhitebird/Valka/sdks/go
 ```
 
 ## Quick Start
@@ -19,7 +19,7 @@ import (
     "fmt"
     "log"
 
-    valka "github.com/valka-queue/valka/sdks/go"
+    valka "github.com/IWhitebird/Valka/sdks/go"
 )
 
 func main() {
@@ -54,7 +54,7 @@ import (
     "context"
     "log"
 
-    valka "github.com/valka-queue/valka/sdks/go"
+    valka "github.com/IWhitebird/Valka/sdks/go"
 )
 
 func main() {

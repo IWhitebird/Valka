@@ -9,10 +9,11 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
-	pb "github.com/valka-queue/valka/sdks/go/proto/valkav1"
+	pb "github.com/IWhitebird/Valka/sdks/go/proto/valkav1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
@@ -25,7 +26,9 @@ type TaskHandler func(ctx *TaskContext) (interface{}, error)
 type ValkaWorker struct {
 	workerID    string
 	name        string
-	serverAddr  string
+	serverAddrs []string
+	nextAddr    atomic.Uint64
+	apiKey      string
 	queues      []string
 	concurrency int
 	metadata    map[string]interface{}
@@ -66,7 +69,8 @@ func NewWorker(opts ...WorkerOption) (*ValkaWorker, error) {
 	return &ValkaWorker{
 		workerID:    workerID,
 		name:        name,
-		serverAddr:  cfg.serverAddr,
+		serverAddrs: cfg.serverAddrs,
+		apiKey:      cfg.apiKey,
 		queues:      cfg.queues,
 		concurrency: cfg.concurrency,
 		metadata:    cfg.metadata,
@@ -111,6 +115,8 @@ func (w *ValkaWorker) Run(ctx context.Context) error {
 			return nil
 		}
 
+		// Next time, try the next node: any node takes any worker.
+		w.nextAddr.Add(1)
 		delay := retry.NextDelay()
 		log.Printf("[valka] Connection lost (%v), reconnecting in %v", err, delay)
 		select {
@@ -242,14 +248,18 @@ func (w *ValkaWorker) handleResultAck(ack *pb.ResultAck) {
 }
 
 func (w *ValkaWorker) session(ctx context.Context) error {
-	conn, err := grpc.NewClient(
-		w.serverAddr,
+	addr := w.serverAddrs[w.nextAddr.Load()%uint64(len(w.serverAddrs))]
+	dialOpts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:    10 * time.Second,
 			Timeout: 5 * time.Second,
 		}),
-	)
+	}
+	if w.apiKey != "" {
+		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(apiKeyCreds(w.apiKey)))
+	}
+	conn, err := grpc.NewClient(addr, dialOpts...)
 	if err != nil {
 		return NewConnectionError("failed to connect", err)
 	}
@@ -530,3 +540,13 @@ func (w *ValkaWorker) helloRequest() *pb.WorkerRequest {
 		},
 	}
 }
+
+// apiKeyCreds sends the API key with every call. Valka's public port is plain gRPC unless
+// a proxy terminates TLS in front of it, so the key is allowed over an insecure transport.
+type apiKeyCreds string
+
+func (k apiKeyCreds) GetRequestMetadata(_ context.Context, _ ...string) (map[string]string, error) {
+	return map[string]string{"authorization": "Bearer " + string(k)}, nil
+}
+
+func (apiKeyCreds) RequireTransportSecurity() bool { return false }

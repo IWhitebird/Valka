@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createChannel, createClient, type Channel } from "nice-grpc";
+import { createChannel, createClient, Metadata, type Channel } from "nice-grpc";
 import { TaskContext } from "./context.js";
 import { ConnectionError, HandlerError } from "./errors.js";
 import {
@@ -69,7 +69,9 @@ const RESULT_RETRY_DELAY_MS = 1_000;
 export class ValkaWorker {
   private readonly workerId: string;
   private readonly name: string;
-  private readonly serverAddr: string;
+  private readonly serverAddrs: string[];
+  private nextAddr = 0;
+  private readonly apiKey: string | undefined;
   private readonly queues: string[];
   private readonly concurrency: number;
   private readonly handler: TaskHandler;
@@ -93,7 +95,14 @@ export class ValkaWorker {
   private constructor(options: ValkaWorkerOptions) {
     this.workerId = randomUUID();
     this.name = options.name ?? `worker-${randomUUID().slice(0, 8)}`;
-    this.serverAddr = options.serverAddr ?? "localhost:50051";
+    this.serverAddrs = options.serverAddrs?.length
+      ? options.serverAddrs
+      : [options.serverAddr ?? "localhost:50051"];
+    this.apiKey =
+      options.apiKey ??
+      ((globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env
+        ?.VALKA_API_KEY ||
+        undefined);
     this.queues = options.queues;
     this.concurrency = options.concurrency ?? 1;
     this.handler = options.handler;
@@ -181,6 +190,8 @@ export class ValkaWorker {
         console.log("[valka] Worker disconnected gracefully");
         return;
       } catch (err) {
+        // Next time, try the next node: any node takes any worker.
+        this.nextAddr++;
         const delay = retryPolicy.nextDelay();
         console.warn(
           `[valka] Connection lost: ${err instanceof Error ? err.message : err}. ` +
@@ -192,8 +203,14 @@ export class ValkaWorker {
   }
 
   private async connectAndRun(retryPolicy: RetryPolicy): Promise<void> {
-    const channel: Channel = createChannel(this.serverAddr);
-    const client = createClient(WorkerServiceDefinition, channel);
+    const channel: Channel = createChannel(
+      this.serverAddrs[this.nextAddr % this.serverAddrs.length],
+    );
+    const client = createClient(
+      WorkerServiceDefinition,
+      channel,
+      this.apiKey ? { "*": { metadata: Metadata({ authorization: `Bearer ${this.apiKey}` }) } } : {},
+    );
     const requests = createMessageChannel<DeepPartial<WorkerRequest>>();
 
     retryPolicy.reset();
@@ -381,6 +398,18 @@ export class ValkaWorkerBuilder {
 
   serverAddr(addr: string): this {
     this.options.serverAddr = addr;
+    return this;
+  }
+
+  /** Several nodes of one cluster; the worker moves to the next when its connection drops. */
+  serverAddrs(addrs: string[]): this {
+    this.options.serverAddrs = addrs;
+    return this;
+  }
+
+  /** API key, sent as `authorization: Bearer <key>` (default: `VALKA_API_KEY`). */
+  apiKey(key: string): this {
+    this.options.apiKey = key;
     return this;
   }
 

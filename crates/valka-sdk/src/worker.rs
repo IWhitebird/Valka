@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
 use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::Channel;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -18,6 +18,7 @@ use valka_proto::{worker_request, worker_response};
 use crate::context::TaskContext;
 use crate::error::SdkError;
 use crate::retry::RetryPolicy;
+use crate::transport::{ApiKeyAuth, AuthChannel, api_key_from_env, connect_channel};
 
 pub type TaskHandler = Arc<
     dyn Fn(TaskContext) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send>>
@@ -28,7 +29,8 @@ pub type TaskHandler = Arc<
 /// Builder for creating a ValkaWorker.
 pub struct ValkaWorkerBuilder {
     name: String,
-    server_addr: String,
+    server_addrs: Vec<String>,
+    api_key: Option<String>,
     queues: Vec<String>,
     concurrency: i32,
     handler: Option<TaskHandler>,
@@ -39,7 +41,8 @@ impl ValkaWorkerBuilder {
     pub fn new() -> Self {
         Self {
             name: format!("worker-{}", &Uuid::now_v7().to_string()[..8]),
-            server_addr: "http://127.0.0.1:50051".to_string(),
+            server_addrs: Vec::new(),
+            api_key: None,
             queues: vec![],
             concurrency: 1,
             handler: None,
@@ -52,8 +55,22 @@ impl ValkaWorkerBuilder {
         self
     }
 
+    /// The node to connect to (default `http://127.0.0.1:50051`).
     pub fn server_addr(mut self, addr: &str) -> Self {
-        self.server_addr = addr.to_string();
+        self.server_addrs = vec![addr.to_string()];
+        self
+    }
+
+    /// Several nodes of one cluster: the worker connects to one and moves to the next when
+    /// its connection drops. Its running tasks reattach on whichever node it reaches.
+    pub fn server_addrs<S: AsRef<str>>(mut self, addrs: &[S]) -> Self {
+        self.server_addrs = addrs.iter().map(|a| a.as_ref().to_string()).collect();
+        self
+    }
+
+    /// The API key sent as `authorization: Bearer <key>`. Defaults to `VALKA_API_KEY`.
+    pub fn api_key(mut self, key: &str) -> Self {
+        self.api_key = Some(key.to_string());
         self
     }
 
@@ -86,10 +103,17 @@ impl ValkaWorkerBuilder {
             .handler
             .ok_or_else(|| SdkError::Handler("No handler provided".to_string()))?;
 
+        let server_addrs = if self.server_addrs.is_empty() {
+            vec!["http://127.0.0.1:50051".to_string()]
+        } else {
+            self.server_addrs
+        };
         Ok(ValkaWorker {
             worker_id: Uuid::now_v7().to_string(),
             name: self.name,
-            server_addr: self.server_addr,
+            server_addrs,
+            next_addr: AtomicUsize::new(0),
+            auth: ApiKeyAuth::new(self.api_key.or_else(api_key_from_env).as_deref())?,
             queues: self.queues,
             concurrency: self.concurrency,
             handler,
@@ -122,7 +146,9 @@ impl ShutdownHandle {
 pub struct ValkaWorker {
     worker_id: String,
     name: String,
-    server_addr: String,
+    server_addrs: Vec<String>,
+    next_addr: AtomicUsize,
+    auth: ApiKeyAuth,
     queues: Vec<String>,
     concurrency: i32,
     handler: TaskHandler,
@@ -219,6 +245,8 @@ impl ValkaWorker {
                     return Ok(());
                 }
                 Err(e) => {
+                    // Try the next node next time (any node takes any worker).
+                    self.next_addr.fetch_add(1, Ordering::Relaxed);
                     let delay = retry_policy.next_delay();
                     warn!(
                         error = %e,
@@ -232,15 +260,11 @@ impl ValkaWorker {
     }
 
     async fn connect_and_run(&self, retry_policy: &mut RetryPolicy) -> Result<(), SdkError> {
-        let channel = Channel::from_shared(self.server_addr.clone())
-            .map_err(|e| SdkError::Connection(e.to_string()))?
-            .http2_keep_alive_interval(Duration::from_secs(10))
-            .keep_alive_timeout(Duration::from_secs(5))
-            .keep_alive_while_idle(true)
-            .connect()
-            .await?;
+        let addr =
+            &self.server_addrs[self.next_addr.load(Ordering::Relaxed) % self.server_addrs.len()];
+        let channel = connect_channel(addr, Duration::from_secs(10)).await?;
 
-        let mut client = WorkerServiceClient::new(channel);
+        let mut client = WorkerServiceClient::with_interceptor(channel, self.auth.clone());
         let (request_tx, request_rx) = mpsc::channel::<WorkerRequest>(256);
         let response = client.session(ReceiverStream::new(request_rx)).await?;
         let mut inbound = response.into_inner();
@@ -369,7 +393,7 @@ impl ValkaWorker {
 
     /// Run the handler without ever blocking the receive loop: the slot is taken inside
     /// the spawned task, so cancels, signals and acks keep flowing at full capacity.
-    async fn start_task(&self, assignment: TaskAssignment, rpc: WorkerServiceClient<Channel>) {
+    async fn start_task(&self, assignment: TaskAssignment, rpc: WorkerServiceClient<AuthChannel>) {
         let task_id = assignment.task_id.clone();
         self.session.running.lock().await.insert(
             task_id.clone(),

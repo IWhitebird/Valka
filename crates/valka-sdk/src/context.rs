@@ -6,7 +6,6 @@ use std::sync::Mutex;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
-use tonic::transport::Channel;
 use valka_proto::worker_service_client::WorkerServiceClient;
 use valka_proto::{
     CheckpointRequest, LogEntry, SignalAck, TaskAssignment, TaskSignal, WorkerRequest,
@@ -14,6 +13,7 @@ use valka_proto::{
 };
 
 use crate::error::SdkError;
+use crate::transport::AuthChannel;
 
 /// Data from a received signal.
 pub struct SignalData {
@@ -41,7 +41,7 @@ pub struct TaskContext {
     request_tx: mpsc::Sender<WorkerRequest>,
     signal_rx: mpsc::Receiver<TaskSignal>,
     signal_buffer: VecDeque<TaskSignal>,
-    worker: WorkerServiceClient<Channel>,
+    worker: WorkerServiceClient<AuthChannel>,
     checkpoints: Mutex<HashMap<String, String>>,
 }
 
@@ -50,7 +50,7 @@ impl TaskContext {
         assignment: TaskAssignment,
         request_tx: mpsc::Sender<WorkerRequest>,
         signal_rx: mpsc::Receiver<TaskSignal>,
-        worker: WorkerServiceClient<Channel>,
+        worker: WorkerServiceClient<AuthChannel>,
     ) -> Self {
         let checkpoints = assignment
             .checkpoints
