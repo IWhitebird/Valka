@@ -59,7 +59,7 @@ const capabilities = [
   ['Signals', 'Send messages to a running task and get acknowledgements.'],
   ['Retries and dead letters', 'Exponential backoff, then a dead-letter queue.'],
   ['Scheduled tasks', 'Run no earlier than a given time.'],
-  ['Idempotency keys', 'One task per key, exact across the whole cluster.'],
+  ['Idempotency keys', 'One task per key and queue, on whichever node you ask.'],
   ['Queue partitions', 'Spread a hot queue over nodes; resize online.'],
   ['Dashboard and CLI', 'Tasks, workers, shard map, drains and shard moves.'],
   ['Metrics and runbooks', 'Prometheus metrics, alert rules, what to do when they fire.'],
