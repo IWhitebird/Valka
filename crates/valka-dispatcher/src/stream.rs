@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::service::DispatcherService;
-use crate::worker_handle::WorkerHandle;
+use crate::worker_handle::{Latch, WorkerHandle};
 use futures::StreamExt;
 use tokio::sync::{Semaphore, mpsc, watch};
 use tonic::Streaming;
@@ -14,14 +14,30 @@ use valka_proto::{WorkerRequest, WorkerResponse, worker_request, worker_response
 /// commit window; past this many the stream stops reading until some finish.
 const MAX_IN_PROGRESS: usize = 1024;
 
+/// Closes the connection's latch however the handler ends, so the response stream (and
+/// with it the worker's connection) ends too.
+struct CloseOnDrop(Latch);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 /// Process the bidirectional worker stream. On server shutdown the worker is told to
 /// leave and the stream is closed, so the server can stop without waiting for it.
+///
+/// `closer` ends this connection: the transport ends the response stream once it is
+/// closed, and closing it from elsewhere (the heartbeat checker, a reconnect of the same
+/// worker) stops this handler. The handler closes it when it returns.
 pub async fn handle_worker_stream(
     dispatcher: DispatcherService,
     mut inbound: Streaming<WorkerRequest>,
     response_tx: mpsc::Sender<WorkerResponse>,
     mut shutdown: watch::Receiver<bool>,
+    closer: Latch,
 ) {
+    let _close = CloseOnDrop(closer.clone());
     // First message must be WorkerHello
     let hello = match inbound.next().await {
         Some(Ok(msg)) => match msg.request {
@@ -59,7 +75,9 @@ pub async fn handle_worker_stream(
         hello.concurrency,
         response_tx.clone(),
         hello.metadata,
-    );
+    )
+    .with_closer(closer.clone());
+    let conn_id = handle.conn_id;
 
     dispatcher.register_worker(handle).await;
     // Runs the worker kept running across a reconnect: reattach, adopt or cancel each,
@@ -69,12 +87,14 @@ pub async fn handle_worker_stream(
             .reattach_running(&worker_id, &hello.running, &response_tx)
             .await;
     }
+    dispatcher.connection_ready(&worker_id, conn_id);
 
-    // Start background task matching loop for this worker
+    // Start background task matching loop for this worker. It ends by itself when this
+    // connection drains or goes away, handing back whatever it already received.
     let dispatcher_clone = dispatcher.clone();
     let worker_id_clone = worker_id.clone();
     let queues = hello.queues.clone();
-    let match_handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         dispatcher_clone
             .run_worker_match_loop(worker_id_clone, queues)
             .await;
@@ -101,6 +121,10 @@ pub async fn handle_worker_stream(
                 };
                 let _ = response_tx.send(bye).await;
                 info!(worker_id = %worker_id, "Server shutting down; closing worker stream");
+                break;
+            }
+            _ = closer.closed() => {
+                info!(worker_id = %worker_id, "Worker connection closed by the server");
                 break;
             }
         };
@@ -146,13 +170,13 @@ pub async fn handle_worker_stream(
                 Some(worker_request::Request::Shutdown(shutdown)) => {
                     // Stop dispatching, but keep the stream: the worker still sends results
                     // for in-flight tasks and waits for their acks, then closes the stream.
+                    // The match loop hands back what it holds and ends.
                     info!(
                         worker_id = %worker_id,
                         reason = %shutdown.reason,
                         "Worker draining"
                     );
-                    match_handle.abort();
-                    dispatcher.stop_dispatching(&worker_id);
+                    dispatcher.stop_dispatching_connection(&worker_id, conn_id);
                 }
                 None => {
                     warn!(worker_id = %worker_id, "Empty worker request");
@@ -170,7 +194,7 @@ pub async fn handle_worker_stream(
         }
     }
 
-    // Cleanup
-    match_handle.abort();
-    dispatcher.deregister_worker(&worker_id).await;
+    // Cleanup: this connection only (the worker may already have reconnected).
+    closer.close();
+    dispatcher.deregister_connection(&worker_id, conn_id).await;
 }

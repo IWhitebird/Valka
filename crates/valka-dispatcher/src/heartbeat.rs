@@ -31,11 +31,23 @@ pub fn check_heartbeat(handle: &WorkerHandle) -> WorkerStatus {
     }
 }
 
-/// Background task that periodically checks heartbeats and removes dead workers
+/// A connection whose worker stopped heartbeating. The checker has already closed it;
+/// whoever receives this deregisters that connection (and only that one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadWorker {
+    pub worker_id: WorkerId,
+    pub conn_id: u64,
+}
+
+/// Background task that periodically checks heartbeats. A worker silent for too long has
+/// its connection closed (its stream ends, so a worker that is in fact alive reconnects)
+/// and is reported on `on_worker_dead`. Its handle stays in `workers`: removing it here
+/// would leave its stream open with no handle (a worker that gets nothing and is never
+/// told) and skip the cleanup that resets its delivered signals.
 pub async fn heartbeat_checker(
     workers: Arc<DashMap<String, WorkerHandle>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-    on_worker_dead: tokio::sync::mpsc::Sender<WorkerId>,
+    on_worker_dead: tokio::sync::mpsc::Sender<DeadWorker>,
 ) {
     let mut interval = time::interval(time::Duration::from_secs(5));
 
@@ -51,20 +63,24 @@ pub async fn heartbeat_checker(
                 let mut dead_workers = Vec::new();
 
                 for entry in workers.iter() {
-                    let status = check_heartbeat(entry.value());
-                    match status {
+                    let handle = entry.value();
+                    match check_heartbeat(handle) {
                         WorkerStatus::Dead => {
                             warn!(
-                                worker_id = %entry.value().worker_id,
-                                worker_name = %entry.value().worker_name,
-                                "Worker heartbeat timeout - marking as dead"
+                                worker_id = %handle.worker_id,
+                                worker_name = %handle.worker_name,
+                                "Worker heartbeat timeout - closing its connection"
                             );
-                            dead_workers.push(entry.key().clone());
+                            handle.close();
+                            dead_workers.push(DeadWorker {
+                                worker_id: handle.worker_id.clone(),
+                                conn_id: handle.conn_id,
+                            });
                         }
                         WorkerStatus::Suspect => {
                             warn!(
-                                worker_id = %entry.value().worker_id,
-                                worker_name = %entry.value().worker_name,
+                                worker_id = %handle.worker_id,
+                                worker_name = %handle.worker_name,
                                 "Worker heartbeat suspect"
                             );
                         }
@@ -72,10 +88,8 @@ pub async fn heartbeat_checker(
                     }
                 }
 
-                for worker_key in dead_workers {
-                    if let Some((_, handle)) = workers.remove(&worker_key) {
-                        let _ = on_worker_dead.send(handle.worker_id).await;
-                    }
+                for dead in dead_workers {
+                    let _ = on_worker_dead.send(dead).await;
                 }
             }
         }

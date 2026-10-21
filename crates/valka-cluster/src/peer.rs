@@ -5,6 +5,7 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
@@ -18,6 +19,34 @@ use crate::rpc::{Command, Query, Reply, RpcError, ScatterReply, error_from_proto
 const FAILURES_TO_OPEN: u32 = 3;
 /// How long an open circuit fails calls fast before letting one through.
 const OPEN_FOR: Duration = Duration::from_secs(3);
+
+/// The largest gRPC message a node sends or accepts, for every server and client of the
+/// cluster (public, worker and internal), given `limits.max_payload_bytes`: a task's input
+/// and metadata (up to that much each) plus every checkpoint it may hold, with room for
+/// the envelope. tonic's default (4 MiB) is far below that. 0 (no payload limit) means no
+/// message limit either.
+pub fn max_message_bytes(max_payload_bytes: usize) -> usize {
+    if max_payload_bytes == 0 {
+        return usize::MAX;
+    }
+    let checkpoints = valka_engine::MAX_CHECKPOINTS_PER_TASK
+        * (valka_engine::MAX_CHECKPOINT_BYTES + valka_engine::MAX_STEP_NAME_LEN + 64);
+    max_payload_bytes
+        .saturating_mul(2)
+        .saturating_add(checkpoints)
+        .saturating_add(4 * 1024 * 1024)
+}
+
+/// Whether a failed call says the peer could not be reached (and so counts toward its
+/// circuit). A message over the size limit, a refused token or a malformed request say
+/// nothing about the peer's health: counting them would cut a healthy peer off.
+fn unreachable(code: tonic::Code) -> bool {
+    use tonic::Code;
+    matches!(
+        code,
+        Code::Unavailable | Code::Cancelled | Code::DeadlineExceeded | Code::Unknown
+    )
+}
 
 #[derive(Default)]
 struct Circuit {
@@ -37,6 +66,8 @@ struct Inner {
     call_timeout: Duration,
     channels: Mutex<HashMap<String, Channel>>,
     circuits: Mutex<HashMap<String, Circuit>>,
+    /// See [`max_message_bytes`].
+    max_message_bytes: AtomicUsize,
 }
 
 impl PeerClients {
@@ -58,8 +89,21 @@ impl PeerClients {
                 call_timeout,
                 channels: Mutex::new(HashMap::new()),
                 circuits: Mutex::new(HashMap::new()),
+                max_message_bytes: AtomicUsize::new(max_message_bytes(
+                    valka_core::LimitsConfig::default().max_payload_bytes,
+                )),
             }),
         }
+    }
+
+    /// Size the messages of every call to `bytes` (see [`max_message_bytes`]); peers must
+    /// use the same.
+    pub fn set_max_message_bytes(&self, bytes: usize) {
+        self.inner.max_message_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    fn max_message(&self) -> usize {
+        self.inner.max_message_bytes.load(Ordering::Relaxed)
     }
 
     fn channel(&self, addr: &str) -> Result<Channel, RpcError> {
@@ -111,15 +155,17 @@ impl PeerClients {
             .map(|t| MetadataValue::try_from(format!("Bearer {t}")))
             .transpose()
             .map_err(|e| RpcError::Transport(format!("bad token: {e}")))?;
-        Ok(InternalServiceClient::with_interceptor(
-            ch,
-            move |mut req: tonic::Request<()>| {
+        let max = self.max_message();
+        Ok(
+            InternalServiceClient::with_interceptor(ch, move |mut req: tonic::Request<()>| {
                 if let Some(a) = &auth {
                     req.metadata_mut().insert("authorization", a.clone());
                 }
                 Ok(req)
-            },
-        ))
+            })
+            .max_decoding_message_size(max)
+            .max_encoding_message_size(max),
+        )
     }
 
     fn admit(&self, addr: &str) -> Result<(), RpcError> {
@@ -153,7 +199,9 @@ impl PeerClients {
     }
 
     fn transport(&self, addr: &str, s: tonic::Status) -> RpcError {
-        self.record(addr, false);
+        if unreachable(s.code()) {
+            self.record(addr, false);
+        }
         RpcError::Transport(format!("{addr}: {}: {}", s.code(), s.message()))
     }
 
@@ -233,13 +281,16 @@ impl PeerClients {
             .map(|t| MetadataValue::try_from(format!("Bearer {t}")))
             .transpose()
             .map_err(|e| RpcError::Transport(format!("bad token: {e}")))?;
+        let max = self.max_message();
         let mut client =
             InternalServiceClient::with_interceptor(ch, move |mut req: tonic::Request<()>| {
                 if let Some(a) = &auth {
                     req.metadata_mut().insert("authorization", a.clone());
                 }
                 Ok(req)
-            });
+            })
+            .max_decoding_message_size(max)
+            .max_encoding_message_size(max);
         let s = client
             .events(valka_proto::EventsRequest {
                 from_node: from.to_string(),

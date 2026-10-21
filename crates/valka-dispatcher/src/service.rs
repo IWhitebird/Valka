@@ -1,6 +1,6 @@
-use crate::heartbeat;
+use crate::heartbeat::{self, DeadWorker};
 use crate::router::{LocalRouter, TaskRouter};
-use crate::worker_handle::WorkerHandle;
+use crate::worker_handle::{WorkerHandle, slot_owner};
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
@@ -26,6 +26,10 @@ const REFUSED_DISPATCH_PAUSE: Duration = Duration::from_millis(50);
 /// How long a reattach whose owner is unreachable (its shard is moving) keeps being retried
 /// while the worker still runs the task.
 const REATTACH_RETRY_FOR: Duration = Duration::from_secs(60);
+
+/// How long a cancel or signal waits for room in a worker's response channel. A worker
+/// that does not read its stream must not hold up the caller (an owner's RPC).
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The dispatcher manages all connected workers and their gRPC streams.
 #[derive(Clone)]
@@ -73,28 +77,75 @@ impl DispatcherService {
         self.router.read().unwrap().clone()
     }
 
+    /// Register a worker's connection. A worker that reconnects before its previous
+    /// connection was cleaned up supersedes it: that connection is closed, and its late
+    /// cleanup leaves this one alone (see [`DispatcherService::deregister_connection`]).
     pub async fn register_worker(&self, handle: WorkerHandle) {
         let worker_id = handle.worker_id.clone();
-        self.workers.insert(worker_id.0.clone(), handle);
+        if let Some(old) = self.workers.insert(worker_id.0.clone(), handle) {
+            info!(
+                worker_id = %worker_id,
+                "worker reconnected: closing its previous connection"
+            );
+            old.close();
+            self.matching.deregister_worker(&old.slot_owner());
+        }
         valka_core::metrics::set_active_workers(self.workers.len() as f64);
     }
 
+    /// Remove whichever connection `worker_id` has (tests and tools; a connection's own
+    /// cleanup uses [`DispatcherService::deregister_connection`]).
     pub async fn deregister_worker(&self, worker_id: &WorkerId) {
+        self.matching.deregister_worker(worker_id);
         if let Some((_, handle)) = self.workers.remove(worker_id.as_ref()) {
-            self.matching.deregister_worker(worker_id);
-            // Delivered-but-unacked signals go back to PENDING for redelivery.
-            let router = self.router();
-            for task_id in &handle.active_tasks {
-                router.reset_signals(task_id).await;
-            }
-            info!(
-                worker_id = %worker_id,
-                active_tasks = handle.active_tasks.len(),
-                "Worker deregistered"
-            );
-            // Active tasks are reclaimed by lease expiry in the engine.
+            self.matching.deregister_worker(&handle.slot_owner());
+            self.removed(handle).await;
         }
         valka_core::metrics::set_active_workers(self.workers.len() as f64);
+    }
+
+    /// Clean up connection `conn_id` of `worker_id`: only if it is still the registered
+    /// one. A connection noticed late (the worker already reconnected) must not remove
+    /// its successor's handle or slots, nor reset signals the worker still holds.
+    pub async fn deregister_connection(&self, worker_id: &WorkerId, conn_id: u64) {
+        let removed = self
+            .workers
+            .remove_if(worker_id.as_ref(), |_, h| h.conn_id == conn_id);
+        self.matching
+            .deregister_worker(&slot_owner(worker_id, conn_id));
+        if let Some((_, handle)) = removed {
+            self.removed(handle).await;
+        }
+        valka_core::metrics::set_active_workers(self.workers.len() as f64);
+    }
+
+    async fn removed(&self, handle: WorkerHandle) {
+        handle.close();
+        // Delivered-but-unacked signals go back to PENDING for redelivery.
+        let router = self.router();
+        futures::future::join_all(
+            handle
+                .active_tasks
+                .iter()
+                .map(|task_id| router.reset_signals(task_id)),
+        )
+        .await;
+        info!(
+            worker_id = %handle.worker_id,
+            active_tasks = handle.active_tasks.len(),
+            "Worker deregistered"
+        );
+        // Active tasks are reclaimed by lease expiry in the engine.
+    }
+
+    /// The connection is reading its stream now: its heartbeat clock starts here, not at
+    /// the hello (reattaching its runs may take a while when an owner is unreachable).
+    pub fn connection_ready(&self, worker_id: &WorkerId, conn_id: u64) {
+        if let Some(mut h) = self.workers.get_mut(worker_id.as_ref())
+            && h.conn_id == conn_id
+        {
+            h.update_heartbeat();
+        }
     }
 
     /// A (re)connecting worker still runs these runs. Each is reattached to this node,
@@ -108,25 +159,33 @@ impl DispatcherService {
         running: &[valka_proto::RunningTask],
         tx: &mpsc::Sender<WorkerResponse>,
     ) {
-        let router = self.router();
-        for r in running {
-            if let Some(mut h) = self.workers.get_mut(worker_id.as_ref()) {
+        if let Some(mut h) = self.workers.get_mut(worker_id.as_ref()) {
+            for r in running {
                 h.assign_task(r.task_id.clone());
             }
-            match router
-                .reattach(&r.task_id, &r.task_run_id, r.attempt_number, &worker_id.0)
-                .await
-            {
-                Ok(outcome) => self.reattached(worker_id, r, outcome, tx).await,
-                Err(e) => {
-                    valka_core::metrics::record_reattach("retrying");
-                    warn!(task_id = %r.task_id, error = %e, "reattach failed; retrying in the background");
-                    let (me, worker_id, r, tx) =
-                        (self.clone(), worker_id.clone(), r.clone(), tx.clone());
-                    tokio::spawn(async move { me.retry_reattach(worker_id, r, tx).await });
+        }
+        // Concurrently: an unreachable owner must not hold up the others (the stream is
+        // not read until this is done).
+        let router = self.router();
+        futures::future::join_all(running.iter().map(|r| {
+            let router = router.clone();
+            async move {
+                match router
+                    .reattach(&r.task_id, &r.task_run_id, r.attempt_number, &worker_id.0)
+                    .await
+                {
+                    Ok(outcome) => self.reattached(worker_id, r, outcome, tx).await,
+                    Err(e) => {
+                        valka_core::metrics::record_reattach("retrying");
+                        warn!(task_id = %r.task_id, error = %e, "reattach failed; retrying in the background");
+                        let (me, worker_id, r, tx) =
+                            (self.clone(), worker_id.clone(), r.clone(), tx.clone());
+                        tokio::spawn(async move { me.retry_reattach(worker_id, r, tx).await });
+                    }
                 }
             }
-        }
+        }))
+        .await;
     }
 
     async fn retry_reattach(
@@ -193,26 +252,45 @@ impl DispatcherService {
 
     /// The worker is draining: no new tasks, but its stream stays open for results.
     pub fn stop_dispatching(&self, worker_id: &WorkerId) {
-        if let Some(mut handle) = self.workers.get_mut(worker_id.as_ref()) {
-            handle.draining = true;
+        let conn = self.workers.get(worker_id.as_ref()).map(|h| h.conn_id);
+        if let Some(conn) = conn {
+            self.stop_dispatching_connection(worker_id, conn);
         }
-        self.matching.deregister_worker(worker_id);
+    }
+
+    /// [`DispatcherService::stop_dispatching`] for one connection of the worker.
+    pub fn stop_dispatching_connection(&self, worker_id: &WorkerId, conn_id: u64) {
+        let owner = {
+            let Some(mut h) = self.workers.get_mut(worker_id.as_ref()) else {
+                return;
+            };
+            if h.conn_id != conn_id {
+                return;
+            }
+            h.draining = true;
+            h.stop_dispatch.close();
+            h.slot_owner()
+        };
+        self.matching.deregister_worker(&owner);
     }
 
     /// Background loop: register as waiting in matching service, receive tasks, push to worker.
     ///
     /// Each round registers one slot per free concurrency slot (up to
     /// `MAX_SLOTS_PER_ROUND`) on every queue, spread over the partitions, waits for the first
-    /// task, then takes whatever the other slots received in the meantime.
+    /// task, then takes whatever the other slots received in the meantime. The loop belongs
+    /// to the worker's current connection: it ends when that connection drains, goes away or
+    /// is superseded, and hands back whatever its slots had already received.
     pub async fn run_worker_match_loop(&self, worker_id: WorkerId, queues: Vec<String>) {
         let num_partitions = self.matching.config().num_partitions.max(1) as usize;
-        let Some(slot_freed) = self
+        let Some((slot_freed, conn_id, stop)) = self
             .workers
             .get(worker_id.as_ref())
-            .map(|h| h.slot_freed.clone())
+            .map(|h| (h.slot_freed.clone(), h.conn_id, h.stop_dispatch.clone()))
         else {
             return;
         };
+        let owner = slot_owner(&worker_id, conn_id);
         let in_flight = Arc::new(AtomicI32::new(0));
         let mut round = 0usize;
 
@@ -220,17 +298,22 @@ impl DispatcherService {
             // Dispatches still in flight hold a slot each until the task is assigned.
             let available = {
                 match self.workers.get(worker_id.as_ref()) {
-                    // Disconnected, or draining: no more tasks for this worker.
+                    // Disconnected, superseded by a reconnect, or draining: no more tasks.
                     None => return,
-                    Some(handle) if handle.draining => return,
+                    Some(handle) if handle.conn_id != conn_id || handle.draining => return,
                     Some(handle) => handle.available_slots() - in_flight.load(Ordering::SeqCst),
                 }
             };
+            if stop.is_closed() {
+                return;
+            }
 
             if available <= 0 || queues.is_empty() {
                 // Woken when a result frees a slot; the timeout notices a disconnect.
-                let _ =
-                    tokio::time::timeout(Duration::from_millis(250), slot_freed.notified()).await;
+                tokio::select! {
+                    _ = tokio::time::timeout(Duration::from_millis(250), slot_freed.notified()) => {}
+                    _ = stop.closed() => return,
+                }
                 continue;
             }
 
@@ -243,7 +326,7 @@ impl DispatcherService {
                     receivers.push(self.matching.register_worker(
                         queue,
                         partition_id,
-                        worker_id.clone(),
+                        owner.clone(),
                     ));
                 }
             }
@@ -251,12 +334,21 @@ impl DispatcherService {
             // A worker is waiting: let the local feeder offer it pending tasks right away.
             self.engine.wake_feeder();
 
-            let (first, index, _) = futures::future::select_all(receivers.iter_mut()).await;
-            let mut matched: Vec<TaskEnvelope> = first.into_iter().collect();
+            let first = tokio::select! {
+                (first, index, _) = futures::future::select_all(receivers.iter_mut()) => {
+                    Some((first, index))
+                }
+                _ = stop.closed() => None,
+            };
+            let mut matched: Vec<TaskEnvelope> = Vec::new();
+            let index = first.map(|(first, index)| {
+                matched.extend(first.ok());
+                index
+            });
             // Close the other slots before reading them, so no task can land in a slot
             // after it was read and be dropped with it.
             for (i, rx) in receivers.iter_mut().enumerate() {
-                if i == index {
+                if Some(i) == index {
                     continue;
                 }
                 rx.close();
@@ -265,6 +357,13 @@ impl DispatcherService {
                 }
             }
             drop(receivers);
+            if index.is_none() {
+                // Drained or disconnected while waiting: what already arrived goes back
+                // now rather than when its offer lapses.
+                let router = self.router();
+                futures::future::join_all(matched.iter().map(|e| router.unoffer(&e.task_id))).await;
+                return;
+            }
             if matched.is_empty() {
                 debug!(worker_id = %worker_id, "Match channel closed");
                 continue;
@@ -283,7 +382,7 @@ impl DispatcherService {
                     let (worker_id, in_flight, slot_freed) =
                         (worker_id.clone(), in_flight.clone(), slot_freed.clone());
                     tokio::spawn(async move {
-                        me.dispatch_to_worker(&worker_id, envelope).await;
+                        me.dispatch_to_worker(&worker_id, conn_id, envelope).await;
                         in_flight.fetch_sub(1, Ordering::SeqCst);
                         // A dispatch that failed gave its slot back.
                         slot_freed.notify_one();
@@ -295,14 +394,14 @@ impl DispatcherService {
         }
     }
 
-    async fn dispatch_to_worker(&self, worker_id: &WorkerId, envelope: TaskEnvelope) {
+    async fn dispatch_to_worker(&self, worker_id: &WorkerId, conn_id: u64, envelope: TaskEnvelope) {
         let router = self.router();
-        // Is the worker still here and taking work? If not, hand the task back before
-        // recording anything.
+        // Is this connection of the worker still here and taking work? If not, hand the
+        // task back before recording anything.
         if !self
             .workers
             .get(worker_id.as_ref())
-            .is_some_and(|h| !h.draining)
+            .is_some_and(|h| h.conn_id == conn_id && !h.draining)
         {
             router.unoffer(&envelope.task_id).await;
             return;
@@ -345,21 +444,26 @@ impl DispatcherService {
                 .collect(),
         };
 
-        let tx = {
-            let Some(mut handle) = self.workers.get_mut(worker_id.as_ref()) else {
-                // Worker vanished between the check and now: the run never started.
-                router.return_run(&envelope.task_id, &info.run_id).await;
-                return;
-            };
-            handle.assign_task(envelope.task_id.clone());
-            handle.response_tx.clone()
+        let tx = match self.workers.get_mut(worker_id.as_ref()) {
+            Some(mut handle) if handle.conn_id == conn_id => {
+                handle.assign_task(envelope.task_id.clone());
+                Some(handle.response_tx.clone())
+            }
+            _ => None,
+        };
+        let Some(tx) = tx else {
+            // The connection went away between the check and now: the run never started.
+            router.return_run(&envelope.task_id, &info.run_id).await;
+            return;
         };
         let response = WorkerResponse {
             response: Some(worker_response::Response::TaskAssignment(assignment)),
         };
         if tx.send(response).await.is_err() {
             warn!(worker_id = %worker_id, "Failed to send task assignment - worker disconnected");
-            if let Some(mut handle) = self.workers.get_mut(worker_id.as_ref()) {
+            if let Some(mut handle) = self.workers.get_mut(worker_id.as_ref())
+                && handle.conn_id == conn_id
+            {
                 handle.complete_task(&envelope.task_id);
             }
             router.return_run(&envelope.task_id, &info.run_id).await;
@@ -392,11 +496,7 @@ impl DispatcherService {
         });
 
         let run_result = if result.success {
-            RunResult::Completed(if result.output.is_empty() {
-                None
-            } else {
-                serde_json::from_str(&result.output).ok()
-            })
+            RunResult::Completed(output_value(&result.output))
         } else {
             RunResult::Failed {
                 error: result.error_message.clone(),
@@ -436,7 +536,9 @@ impl DispatcherService {
         if let Some(mut handle) = self.workers.get_mut(worker_id.as_ref()) {
             handle.update_heartbeat();
         }
-        self.router().heartbeat(&heartbeat.active_task_ids).await;
+        self.router()
+            .heartbeat(&worker_id.0, &heartbeat.active_task_ids)
+            .await;
     }
 
     pub async fn handle_log_batch(&self, _worker_id: &WorkerId, batch: LogBatch) {
@@ -456,39 +558,43 @@ impl DispatcherService {
         }
     }
 
-    /// Cancel a task on the worker that's running it
-    pub async fn cancel_task_on_worker(&self, task_id: &str) -> bool {
-        for entry in self.workers.iter() {
-            let handle = entry.value();
-            if handle.active_tasks.contains(task_id) {
-                let cancel = WorkerResponse {
-                    response: Some(worker_response::Response::TaskCancellation(
-                        TaskCancellation {
-                            task_id: task_id.to_string(),
-                            reason: "Cancelled by user".to_string(),
-                        },
-                    )),
-                };
-                let _ = handle.response_tx.send(cancel).await;
-                return true;
-            }
-        }
-        false
+    /// The response channel of the worker running `task_id` on this node. The map's guard
+    /// is released before anyone sends on it: a send may wait on a slow worker, and a
+    /// guard held meanwhile would block every writer of that shard of the map.
+    fn running_worker_tx(&self, task_id: &str) -> Option<mpsc::Sender<WorkerResponse>> {
+        self.workers
+            .iter()
+            .find(|entry| entry.value().active_tasks.contains(task_id))
+            .map(|entry| entry.value().response_tx.clone())
     }
 
-    /// Send a signal to the worker currently running a task. Returns true if delivered.
+    /// Cancel a task on the worker that's running it. True if the cancel was handed to
+    /// the worker's stream.
+    pub async fn cancel_task_on_worker(&self, task_id: &str) -> bool {
+        let Some(tx) = self.running_worker_tx(task_id) else {
+            return false;
+        };
+        let cancel = WorkerResponse {
+            response: Some(worker_response::Response::TaskCancellation(
+                TaskCancellation {
+                    task_id: task_id.to_string(),
+                    reason: "Cancelled by user".to_string(),
+                },
+            )),
+        };
+        deliver(&tx, cancel).await
+    }
+
+    /// Send a signal to the worker currently running a task. True only if it was handed to
+    /// the worker's stream (a closed or stuck stream leaves the signal PENDING).
     pub async fn send_signal_to_worker(&self, task_id: &str, signal: TaskSignal) -> bool {
-        for entry in self.workers.iter() {
-            let handle = entry.value();
-            if handle.active_tasks.contains(task_id) {
-                let response = WorkerResponse {
-                    response: Some(worker_response::Response::TaskSignal(signal)),
-                };
-                let _ = handle.response_tx.send(response).await;
-                return true;
-            }
-        }
-        false
+        let Some(tx) = self.running_worker_tx(task_id) else {
+            return false;
+        };
+        let response = WorkerResponse {
+            response: Some(worker_response::Response::TaskSignal(signal)),
+        };
+        deliver(&tx, response).await
     }
 
     /// Handle a signal acknowledgement from a worker
@@ -508,12 +614,32 @@ impl DispatcherService {
     pub fn start_heartbeat_checker(
         &self,
         shutdown: watch::Receiver<bool>,
-    ) -> (tokio::task::JoinHandle<()>, mpsc::Receiver<WorkerId>) {
+    ) -> (tokio::task::JoinHandle<()>, mpsc::Receiver<DeadWorker>) {
         let (dead_tx, dead_rx) = mpsc::channel(64);
         let workers = self.workers.clone();
         let handle = tokio::spawn(heartbeat::heartbeat_checker(workers, shutdown, dead_tx));
         (handle, dead_rx)
     }
+}
+
+/// Hand `msg` to a worker's stream, waiting at most `DELIVERY_TIMEOUT` for room.
+async fn deliver(tx: &mpsc::Sender<WorkerResponse>, msg: WorkerResponse) -> bool {
+    matches!(
+        tokio::time::timeout(DELIVERY_TIMEOUT, tx.send(msg)).await,
+        Ok(Ok(()))
+    )
+}
+
+/// A result's output: JSON as sent, anything else (an SDK may send a plain string) kept
+/// as a JSON string rather than dropped.
+pub fn output_value(output: &str) -> Option<serde_json::Value> {
+    if output.is_empty() {
+        return None;
+    }
+    Some(
+        serde_json::from_str(output)
+            .unwrap_or_else(|_| serde_json::Value::String(output.to_string())),
+    )
 }
 
 pub fn log_level_to_string(level: i32) -> String {

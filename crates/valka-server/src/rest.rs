@@ -101,17 +101,22 @@ pub struct AppState {
     pub(crate) admin_token: Option<String>,
 }
 
-/// Header set when a cluster-wide answer is missing some node's part.
-const PARTIAL_HEADER: &str = "x-valka-partial";
+/// Header set when a cluster-wide answer is missing some node's part (gRPC: metadata).
+pub(crate) const PARTIAL_HEADER: &str = "x-valka-partial";
 
-fn partial_headers(missing: &[String]) -> [(axum::http::HeaderName, String); 1] {
+/// The partial header's value: `false`, or `true; missing=<nodes>`.
+pub(crate) fn partial_value(missing: &[String]) -> String {
+    if missing.is_empty() {
+        "false".to_string()
+    } else {
+        format!("true; missing={}", missing.join(","))
+    }
+}
+
+pub(crate) fn partial_headers(missing: &[String]) -> [(axum::http::HeaderName, String); 1] {
     [(
         axum::http::HeaderName::from_static(PARTIAL_HEADER),
-        if missing.is_empty() {
-            "false".to_string()
-        } else {
-            format!("true; missing={}", missing.join(","))
-        },
+        partial_value(missing),
     )]
 }
 

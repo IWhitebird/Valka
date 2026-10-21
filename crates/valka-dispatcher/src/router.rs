@@ -20,8 +20,8 @@ pub trait TaskRouter: Send + Sync {
     /// A task offered to this node was not dispatched: make it runnable again.
     async fn unoffer(&self, task_id: &str);
     async fn report_result(&self, task_id: &str, run_id: &str, result: RunResult) -> ResultOutcome;
-    /// Extend the leases of running tasks.
-    async fn heartbeat(&self, task_ids: &[String]);
+    /// Extend the leases of the runs `worker_id` holds of these tasks.
+    async fn heartbeat(&self, worker_id: &str, task_ids: &[String]);
     async fn checkpoint(
         &self,
         task_id: &str,
@@ -60,8 +60,8 @@ impl TaskRouter for LocalRouter {
     async fn report_result(&self, task_id: &str, run_id: &str, result: RunResult) -> ResultOutcome {
         self.0.report_result(task_id, run_id, result).await
     }
-    async fn heartbeat(&self, task_ids: &[String]) {
-        self.0.heartbeat(task_ids);
+    async fn heartbeat(&self, worker_id: &str, task_ids: &[String]) {
+        self.0.heartbeat_from(worker_id, task_ids);
     }
     async fn checkpoint(
         &self,

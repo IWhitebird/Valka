@@ -115,8 +115,12 @@ impl Node {
         let (_hb_handle, mut dead_rx) = dispatcher.start_heartbeat_checker(shutdown_rx.clone());
         let d2 = dispatcher.clone();
         tokio::spawn(async move {
-            while let Some(worker_id) = dead_rx.recv().await {
-                d2.deregister_worker(&worker_id).await;
+            // The checker closed the connection; deregister it now (its stream handler may
+            // be busy), resetting its delivered signals. Only that connection: the worker
+            // may already have reconnected.
+            while let Some(dead) = dead_rx.recv().await {
+                d2.deregister_connection(&dead.worker_id, dead.conn_id)
+                    .await;
             }
         });
 

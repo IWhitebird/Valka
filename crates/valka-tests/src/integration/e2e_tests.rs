@@ -750,8 +750,8 @@ impl valka_dispatcher::TaskRouter for SlowResults {
         tokio::time::sleep(self.delay).await;
         self.inner.report_result(task_id, run_id, result).await
     }
-    async fn heartbeat(&self, task_ids: &[String]) {
-        self.inner.heartbeat(task_ids).await
+    async fn heartbeat(&self, worker_id: &str, task_ids: &[String]) {
+        self.inner.heartbeat(worker_id, task_ids).await
     }
     async fn checkpoint(
         &self,

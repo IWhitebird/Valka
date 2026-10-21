@@ -11,7 +11,7 @@
 
 use futures::future::join_all;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
@@ -21,13 +21,83 @@ use valka_dispatcher::DispatcherService;
 use valka_dispatcher::TaskRouter;
 use valka_engine::state::SignalStatus;
 use valka_engine::{
-    CheckpointView, CreateTask, DeadLetterView, DispatchInfo, Engine, NodeStats, ResultOutcome,
-    RunResult, RunView, ShardDetail, SignalView, TaskView,
+    CheckpointView, CreateTask, DeadLetterView, DispatchInfo, DispatchableTask, Engine, NodeStats,
+    ReattachOutcome, ResultOutcome, RunResult, RunView, ShardDetail, SignalView, TaskView,
 };
 use valka_wal::owners::{self, OwnerState};
 
 /// Attempts at reaching a shard's owner before answering `Unavailable`.
 const ROUTE_ATTEMPTS: usize = 5;
+
+/// How long an owner waits for the node running a task to take a signal before answering
+/// (it keeps trying in the background). Well below the peer call timeout, so a forwarded
+/// `SendSignal` never times out at its sender because the run's node is unreachable.
+const TELL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// When a signal that could not be delivered (or was reset by a disconnect) is tried again
+/// while its task runs. After the last try it waits for the task's next dispatch.
+const SIGNAL_REDELIVERY: [Duration; 6] = [
+    Duration::from_millis(200),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+];
+
+/// The most a `Fetch` reply carries (it always carries at least one task): fetched tasks
+/// over it go back to the owner's runnable index at once.
+const FETCH_REPLY_BYTES: usize = 4 * 1024 * 1024;
+
+/// How long (and how many) `SendSignal` request ids an owner remembers, so a forward
+/// retried after a lost answer finds the signal its first attempt created.
+const SIGNAL_REQUEST_TTL: Duration = Duration::from_secs(300);
+const SIGNAL_REQUEST_MAX: usize = 65_536;
+
+/// Signal request id -> the signal it created, oldest first.
+#[derive(Default)]
+struct SignalRequests {
+    order: VecDeque<(tokio::time::Instant, String)>,
+    ids: HashMap<String, String>,
+}
+
+impl SignalRequests {
+    fn get(&self, request_id: &str) -> Option<String> {
+        self.ids.get(request_id).cloned()
+    }
+
+    fn remember(&mut self, request_id: String, signal_id: String) {
+        let now = tokio::time::Instant::now();
+        while let Some((at, _)) = self.order.front() {
+            if now.duration_since(*at) < SIGNAL_REQUEST_TTL && self.order.len() < SIGNAL_REQUEST_MAX
+            {
+                break;
+            }
+            if let Some((_, old)) = self.order.pop_front() {
+                self.ids.remove(&old);
+            }
+        }
+        self.order.push_back((now, request_id.clone()));
+        self.ids.insert(request_id, signal_id);
+    }
+}
+
+/// Bytes of `value` as JSON, without building the JSON.
+fn json_len<T: serde::Serialize>(value: &T) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut c = Count(0);
+    let _ = serde_json::to_writer(&mut c, value);
+    c.0
+}
 
 /// A cluster-wide answer, and whether some node did not contribute.
 #[derive(Debug, Clone)]
@@ -55,6 +125,8 @@ struct Inner {
     /// shard -> node that last answered for it.
     owners: Mutex<HashMap<ShardId, String>>,
     scatter_timeout: Duration,
+    /// See [`SignalRequests`].
+    signal_requests: Mutex<SignalRequests>,
 }
 
 fn unexpected(r: Reply) -> ServerError {
@@ -63,6 +135,10 @@ fn unexpected(r: Reply) -> ServerError {
 
 impl Api {
     pub fn new(engine: Engine, dispatcher: DispatcherService, peers: PeerClients) -> Self {
+        // Peers size their messages like the internal listener does (see serve_internal).
+        peers.set_max_message_bytes(valka_cluster::peer::max_message_bytes(
+            engine.config().limits.max_payload_bytes,
+        ));
         Self {
             inner: Arc::new(Inner {
                 engine,
@@ -70,6 +146,7 @@ impl Api {
                 peers,
                 owners: Mutex::new(HashMap::new()),
                 scatter_timeout: Duration::from_secs(3),
+                signal_requests: Mutex::new(SignalRequests::default()),
             }),
         }
     }
@@ -150,6 +227,7 @@ impl Api {
             .route(Command::FindIdempotent {
                 probe_id: probe,
                 key: key.clone(),
+                queue: Some(req.queue_name.clone()),
             })
             .await?
         {
@@ -179,6 +257,7 @@ impl Api {
             .route(Command::CancelTask {
                 task_id: task_id.into(),
                 reason: reason.into(),
+                retry: false,
             })
             .await?
         {
@@ -214,6 +293,7 @@ impl Api {
                 task_id: task_id.into(),
                 name: name.into(),
                 payload,
+                request_id: Some(uuid::Uuid::now_v7().to_string()),
             })
             .await?
         {
@@ -329,7 +409,7 @@ impl Api {
     }
 
     /// Run `cmd` on the owner of its shard.
-    async fn route(&self, cmd: Command) -> Result<Reply, ServerError> {
+    async fn route(&self, mut cmd: Command) -> Result<Reply, ServerError> {
         let shard = self.known(cmd.routing_id())?;
         let me = self.node_id().to_string();
         let mut target = self.guess_owner(shard);
@@ -390,6 +470,8 @@ impl Api {
                     self.inner.owners.lock().remove(&shard);
                     debug!(shard = %shard, node, error = %m, "forward failed");
                     last = m;
+                    // The call may have run (a timeout): the next attempt says so.
+                    cmd.mark_retry();
                     target = self.lookup_owner(shard).await;
                 }
             }
@@ -424,17 +506,33 @@ impl Api {
                 self.ensure_readable(&task_id)?;
                 Ok(Reply::MaybeTask(e.get_task(&task_id)))
             }
-            Command::CancelTask { task_id, reason } => {
-                let (view, running) = e.cancel_task(&task_id, &reason).await?;
+            Command::CancelTask {
+                task_id,
+                reason,
+                retry,
+            } => {
+                let (view, running) = match e.cancel_task(&task_id, &reason).await {
+                    Ok(r) => r,
+                    Err(err @ ServerError::InvalidStatusTransition { .. }) if retry => {
+                        // An earlier attempt whose answer was lost may have cancelled it.
+                        return match e.get_task(&task_id) {
+                            Some(t) if t.status == TaskStatus::Cancelled => {
+                                e.sync().await?;
+                                Ok(Reply::Task(t))
+                            }
+                            _ => Err(err),
+                        };
+                    }
+                    Err(err) => return Err(err),
+                };
                 if let Some(loc) = running {
-                    self.tell_worker(
-                        &loc.node_id,
-                        Command::CancelOnWorker {
-                            task_id: task_id.clone(),
-                            reason,
-                        },
-                    )
-                    .await;
+                    // Best effort and off the reply: a node that does not answer must not
+                    // hold up the cancel (its worker finds out when its result is stale).
+                    let me = self.clone();
+                    tokio::spawn(async move {
+                        me.tell_worker(&loc.node_id, Command::CancelOnWorker { task_id, reason })
+                            .await;
+                    });
                 }
                 Ok(Reply::Task(view))
             }
@@ -446,22 +544,30 @@ impl Api {
                 task_id,
                 name,
                 payload,
+                request_id,
             } => {
+                self.ensure_readable(&task_id)?;
+                if let Some(rid) = &request_id
+                    && let Some(signal) = self.signal_for_request(rid, &task_id)
+                {
+                    // A forward retried after its answer was lost: answer with the signal
+                    // the first attempt created (once durable), not with a second one.
+                    e.sync().await?;
+                    let delivered = signal.status != SignalStatus::Pending.as_str();
+                    return Ok(Reply::SignalSent { signal, delivered });
+                }
                 let signal = e.send_signal(&task_id, &name, payload).await?;
-                let delivered = match e.run_location(&task_id) {
-                    Some(loc) => self
-                        .tell_worker(
-                            &loc.node_id,
-                            Command::DeliverSignal {
-                                signal: signal.clone(),
-                            },
-                        )
-                        .await
-                        .is_some_and(|r| r == Reply::Delivered(true)),
-                    None => false,
-                };
-                if delivered {
-                    e.signal_delivered(&signal.id);
+                if let Some(rid) = request_id {
+                    self.inner
+                        .signal_requests
+                        .lock()
+                        .remember(rid, signal.id.clone());
+                }
+                let delivered = self.deliver_signal(&task_id, &signal).await;
+                if !delivered && e.run_location(&task_id).is_some() {
+                    // The run's worker may not have it yet (the dispatch is on its way) or
+                    // its node did not answer: keep trying while the task runs.
+                    self.spawn_signal_delivery(task_id, false);
                 }
                 Ok(Reply::SignalSent { signal, delivered })
             }
@@ -485,9 +591,17 @@ impl Api {
                     .ok_or(ServerError::NotOwner(shard.0))?;
                 Ok(Reply::ShardDetail(Box::new(detail)))
             }
-            Command::FindIdempotent { probe_id, key } => {
+            Command::FindIdempotent {
+                probe_id,
+                key,
+                queue,
+            } => {
                 let shard = self.ensure_readable(&probe_id)?;
-                let found = e.find_by_idempotency_key(shard, &key);
+                let found = match &queue {
+                    Some(q) => e.find_idempotent(shard, q, &key),
+                    // An older node: any queue's task with the key.
+                    None => e.find_by_idempotency_key(shard, &key),
+                };
                 if found.is_some() {
                     // It is about to be someone's answer: only once it is durable.
                     e.sync().await?;
@@ -551,13 +665,26 @@ impl Api {
                 attempt,
                 worker_id,
                 node_id,
-            } => Ok(Reply::Reattached(
-                e.reattach(&task_id, &run_id, attempt, &worker_id, &node_id)
-                    .await?,
-            )),
+            } => {
+                let outcome = e
+                    .reattach(&task_id, &run_id, attempt, &worker_id, &node_id)
+                    .await?;
+                if outcome != ReattachOutcome::Stale {
+                    // Signals its old connection left PENDING (reset when it went away, or
+                    // never delivered) reach the run on its new one. The worker's node
+                    // already counts the task as running, so the first try is immediate.
+                    self.spawn_signal_delivery(task_id, true);
+                }
+                Ok(Reply::Reattached(outcome))
+            }
             Command::ResetSignals { task_id } => {
                 self.ensure_readable(&task_id)?;
                 e.reset_signals(&task_id);
+                // The worker may already run it elsewhere (it reconnected to another node
+                // before this one noticed): try that node.
+                if e.run_location(&task_id).is_some() {
+                    self.spawn_signal_delivery(task_id, false);
+                }
                 Ok(Reply::Done)
             }
             cmd @ (Command::Heartbeat { .. }
@@ -573,26 +700,34 @@ impl Api {
     async fn execute_node_command(&self, cmd: Command) -> Result<Reply, ServerError> {
         let e = &self.inner.engine;
         match cmd {
-            Command::Heartbeat { task_ids } => {
+            Command::Heartbeat {
+                task_ids,
+                worker_id,
+            } => {
                 // Extend what this node owns; name the rest so the sender can re-route.
                 let (mine, not_mine): (Vec<String>, Vec<String>) = task_ids
                     .into_iter()
                     .partition(|id| e.shard_of(id).is_some_and(|s| e.owns(s)));
-                e.heartbeat(&mine);
+                match worker_id.as_deref() {
+                    Some(w) => e.heartbeat_from(w, &mine),
+                    None => e.heartbeat(&mine),
+                }
                 Ok(Reply::NotOwned(not_mine))
             }
             Command::Fetch {
                 queue,
                 max,
                 wait_ms,
-            } => Ok(Reply::Fetched(
-                e.fetch(
-                    &queue,
-                    max.min(1000),
-                    Duration::from_millis(wait_ms.min(30_000)),
-                )
-                .await,
-            )),
+            } => {
+                let tasks = e
+                    .fetch(
+                        &queue,
+                        max.min(1000),
+                        Duration::from_millis(wait_ms.min(30_000)),
+                    )
+                    .await;
+                Ok(Reply::Fetched(self.within_reply_budget(tasks)))
+            }
             Command::CancelOnWorker { task_id, .. } => Ok(Reply::Delivered(
                 self.inner.dispatcher.cancel_task_on_worker(&task_id).await,
             )),
@@ -657,6 +792,89 @@ impl Api {
         self.send_to_node(node, cmd).await
     }
 
+    /// The signal a `SendSignal` with this request id created, if this node remembers it.
+    fn signal_for_request(&self, request_id: &str, task_id: &str) -> Option<SignalView> {
+        let id = self.inner.signal_requests.lock().get(request_id)?;
+        self.inner
+            .engine
+            .list_signals(task_id, None)
+            .into_iter()
+            .find(|s| s.id == id)
+    }
+
+    /// Hand `signal` to the worker running its task, waiting at most `TELL_TIMEOUT`; mark
+    /// it delivered if that worked.
+    async fn deliver_signal(&self, task_id: &str, signal: &SignalView) -> bool {
+        let e = &self.inner.engine;
+        let Some(loc) = e.run_location(task_id) else {
+            return false;
+        };
+        let cmd = Command::DeliverSignal {
+            signal: signal.clone(),
+        };
+        let delivered = tokio::time::timeout(TELL_TIMEOUT, self.tell_worker(&loc.node_id, cmd))
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|r| r == Reply::Delivered(true));
+        if delivered {
+            e.signal_delivered(&signal.id);
+        }
+        delivered
+    }
+
+    /// Deliver a running task's PENDING signals. True once nothing is left to do here (all
+    /// delivered, or the task no longer runs or is no longer this node's).
+    async fn deliver_pending_signals(&self, task_id: &str) -> bool {
+        let e = &self.inner.engine;
+        if !e.shard_of(task_id).is_some_and(|s| e.owns(s)) || e.run_location(task_id).is_none() {
+            return true;
+        }
+        let mut all = true;
+        for signal in e.pending_signals(task_id) {
+            all &= self.deliver_signal(task_id, &signal).await;
+        }
+        all
+    }
+
+    /// Keep delivering `task_id`'s PENDING signals in the background (see
+    /// `SIGNAL_REDELIVERY`) while it runs. PENDING signals otherwise only travel with a
+    /// dispatch, so one missed while the task runs would wait for its next attempt.
+    fn spawn_signal_delivery(&self, task_id: String, immediately: bool) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            if immediately && me.deliver_pending_signals(&task_id).await {
+                return;
+            }
+            for delay in SIGNAL_REDELIVERY {
+                tokio::time::sleep(delay).await;
+                if me.deliver_pending_signals(&task_id).await {
+                    return;
+                }
+            }
+            debug!(
+                task_id,
+                "signals still pending; the task's next dispatch carries them"
+            );
+        });
+    }
+
+    /// Fetched tasks up to `FETCH_REPLY_BYTES` (at least one); the rest are runnable again.
+    fn within_reply_budget(&self, tasks: Vec<DispatchableTask>) -> Vec<DispatchableTask> {
+        let mut used = 0usize;
+        let mut out = Vec::with_capacity(tasks.len());
+        for t in tasks {
+            let size = json_len(&t);
+            if !out.is_empty() && used.saturating_add(size) > FETCH_REPLY_BYTES {
+                self.inner.engine.unoffer(&t.task_id);
+                continue;
+            }
+            used = used.saturating_add(size);
+            out.push(t);
+        }
+        out
+    }
+
     /// Group task ids by the node this one believes owns them.
     fn by_owner(&self, ids: &[String]) -> HashMap<String, Vec<String>> {
         let mut out: HashMap<String, Vec<String>> = HashMap::new();
@@ -673,7 +891,8 @@ impl Api {
 
     /// Heartbeats for running tasks, batched per owner. Ids an owner disowns are looked
     /// up in the bucket and sent again.
-    pub async fn route_heartbeats(&self, task_ids: &[String]) {
+    pub async fn route_heartbeats(&self, worker_id: Option<&str>, task_ids: &[String]) {
+        let worker_id = worker_id.map(str::to_string);
         let mut retry = Vec::new();
         for (node, ids) in self.by_owner(task_ids) {
             match self
@@ -681,6 +900,7 @@ impl Api {
                     &node,
                     Command::Heartbeat {
                         task_ids: ids.clone(),
+                        worker_id: worker_id.clone(),
                     },
                 )
                 .await
@@ -705,8 +925,11 @@ impl Api {
             }
         }
         for (node, ids) in again {
-            self.send_to_node(&node, Command::Heartbeat { task_ids: ids })
-                .await;
+            let cmd = Command::Heartbeat {
+                task_ids: ids,
+                worker_id: worker_id.clone(),
+            };
+            self.send_to_node(&node, cmd).await;
         }
     }
 
@@ -792,6 +1015,13 @@ impl Api {
             match r {
                 Ok(r) => replies.push(r),
                 Err(node) => missing.push(node),
+            }
+        }
+        // A node whose lease went quiet (suspect, not yet declared dead) is not asked, and
+        // nobody else serves its shards yet: the answer lacks them.
+        for m in self.inner.engine.members() {
+            if m.suspect && !missing.contains(&m.node_id) {
+                missing.push(m.node_id);
             }
         }
         Ok((replies, missing))
@@ -1016,17 +1246,19 @@ impl TaskRouter for Api {
         }
     }
 
-    async fn heartbeat(&self, task_ids: &[String]) {
+    async fn heartbeat(&self, worker_id: &str, task_ids: &[String]) {
         let e = &self.inner.engine;
         let (mine, remote): (Vec<String>, Vec<String>) = task_ids
             .iter()
             .cloned()
             .partition(|id| e.shard_of(id).is_some_and(|s| e.owns(s)));
-        e.heartbeat(&mine);
+        // Only this worker's runs: a run that went to another worker must not be kept
+        // alive by the one still busy with the expired run.
+        e.heartbeat_from(worker_id, &mine);
         if !remote.is_empty() {
             // Off the worker's stream: a slow owner must not hold up its other messages.
-            let me = self.clone();
-            tokio::spawn(async move { me.route_heartbeats(&remote).await });
+            let (me, worker_id) = (self.clone(), worker_id.to_string());
+            tokio::spawn(async move { me.route_heartbeats(Some(&worker_id), &remote).await });
         }
     }
 

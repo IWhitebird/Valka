@@ -350,12 +350,12 @@ async fn test_send_signal_worker_channel_closed() {
         timestamp_ms: 0,
     };
 
-    // send_signal_to_worker finds the task but send may silently fail
+    // The worker is found but its stream is gone: not delivered (the signal stays PENDING
+    // for redelivery instead of being marked DELIVERED to nobody).
     let delivered = dispatcher
         .send_signal_to_worker("task-orphan", signal)
         .await;
-    assert!(delivered, "Should return true (found the task)");
-    // No panic despite closed channel
+    assert!(!delivered, "a closed stream delivers nothing");
 }
 
 #[tokio::test]
@@ -370,8 +370,7 @@ async fn test_cancel_worker_channel_closed() {
     drop(rx);
 
     let result = dispatcher.cancel_task_on_worker("task-cancel-closed").await;
-    assert!(result, "Should return true (found the task)");
-    // No panic despite closed channel
+    assert!(!result, "a closed stream delivers nothing");
 }
 
 #[tokio::test]

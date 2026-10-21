@@ -887,6 +887,23 @@ async fn changing_partitions_reaches_every_node() {
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
+    // Queue names become object keys: a bad one is refused before anything is written.
+    let (s, body) = admin_call(
+        &c.nodes[1],
+        "PUT",
+        "/api/v1/queues/bad$q/partitions",
+        Some(ADMIN),
+        Some(serde_json::json!({"partitions": 4})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("queue_name may only contain"),
+        "{body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

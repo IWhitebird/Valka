@@ -2,9 +2,10 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::info;
 
@@ -12,6 +13,7 @@ use crate::api::Api;
 use crate::convert::{log_line_to_proto, proto_to_status, task_to_proto};
 use valka_core::ServerError;
 use valka_dispatcher::DispatcherService;
+use valka_dispatcher::worker_handle::Latch;
 use valka_engine::{CreateTask, LogIngester};
 use valka_proto::*;
 
@@ -123,26 +125,34 @@ impl api_service_server::ApiService for ApiServiceImpl {
             proto_to_status(req.status)
         };
         let (limit, offset) = if let Some(ref p) = req.pagination {
-            let offset: usize = p.page_token.parse().unwrap_or(0);
-            (p.page_size.max(1) as usize, offset)
+            // The same bounds as REST: every node returns `limit + offset` rows.
+            let offset: usize = p.page_token.parse::<usize>().unwrap_or(0).min(100_000);
+            (p.page_size.clamp(1, 1000) as usize, offset)
         } else {
             (50, 0)
         };
-        let tasks = self
+        let gathered = self
             .api
             .list_tasks(queue_name, status_filter, limit, offset)
             .await
-            .map_err(Status::from)?
-            .value;
+            .map_err(Status::from)?;
+        let tasks = gathered.value;
         let next_token = if tasks.len() == limit {
-            (offset + limit).to_string()
+            offset.saturating_add(limit).to_string()
         } else {
             String::new()
         };
-        Ok(Response::new(ListTasksResponse {
+        let mut response = Response::new(ListTasksResponse {
             tasks: tasks.into_iter().map(task_to_proto).collect(),
             next_page_token: next_token,
-        }))
+        });
+        // Like REST's X-Valka-Partial: a node that did not answer is missing from the page.
+        if let Ok(v) = crate::rest::partial_value(&gathered.missing).parse() {
+            response
+                .metadata_mut()
+                .insert(crate::rest::PARTIAL_HEADER, v);
+        }
+        Ok(response)
     }
 
     async fn cancel_task(
@@ -256,21 +266,47 @@ impl worker_service_server::WorkerService for WorkerServiceImpl {
         request: Request<Streaming<WorkerRequest>>,
     ) -> Result<Response<Self::SessionStream>, Status> {
         let inbound = request.into_inner();
-        let (response_tx, response_rx) = mpsc::channel(256);
+        let (response_tx, mut response_rx) = mpsc::channel(256);
+        let closer = Latch::new();
 
         let dispatcher = self.dispatcher.clone();
         let shutdown = self.shutdown.clone();
+        let handler_closer = closer.clone();
         tokio::spawn(async move {
             valka_dispatcher::stream::handle_worker_stream(
                 dispatcher,
                 inbound,
                 response_tx,
                 shutdown,
+                handler_closer,
             )
             .await;
         });
 
-        let stream = ReceiverStream::new(response_rx).map(Ok);
+        // The response stream ends when the connection is closed (its handler returned, or
+        // the server closed it), after what is already queued: tasks still finishing may
+        // hold a sender for a while, and the worker must see the end to reconnect.
+        let stream = async_stream::stream! {
+            let mut closing = false;
+            loop {
+                let msg = if closing {
+                    response_rx.try_recv().ok()
+                } else {
+                    tokio::select! {
+                        biased;
+                        msg = response_rx.recv() => msg,
+                        _ = closer.closed() => {
+                            closing = true;
+                            response_rx.try_recv().ok()
+                        }
+                    }
+                };
+                match msg {
+                    Some(m) => yield Ok(m),
+                    None => break,
+                }
+            }
+        };
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -297,6 +333,8 @@ pub async fn serve_grpc(
     api_keys: crate::auth::ApiKeys,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
+    let max_message =
+        valka_cluster::peer::max_message_bytes(api.engine().config().limits.max_payload_bytes);
     let worker_service = WorkerServiceImpl {
         dispatcher: api.dispatcher().clone(),
         shutdown: shutdown.clone(),
@@ -323,16 +361,20 @@ pub async fn serve_grpc(
         .http2_keepalive_timeout(Some(std::time::Duration::from_secs(5)))
         .add_service(health_service)
         .add_service(reflection_service)
-        .add_service(api_service_server::ApiServiceServer::with_interceptor(
-            api_service,
+        // Explicit message limits, both ways: tonic's 4 MiB default is below what a task
+        // may carry (input, metadata, checkpoints, result).
+        .add_service(InterceptedService::new(
+            api_service_server::ApiServiceServer::new(api_service)
+                .max_decoding_message_size(max_message)
+                .max_encoding_message_size(max_message),
             crate::auth::GrpcAuth(api_keys.clone()),
         ))
-        .add_service(
-            worker_service_server::WorkerServiceServer::with_interceptor(
-                worker_service,
-                crate::auth::GrpcAuth(api_keys),
-            ),
-        )
+        .add_service(InterceptedService::new(
+            worker_service_server::WorkerServiceServer::new(worker_service)
+                .max_decoding_message_size(max_message)
+                .max_encoding_message_size(max_message),
+            crate::auth::GrpcAuth(api_keys),
+        ))
         .serve_with_shutdown(addr, async move {
             let _ = shutdown.changed().await;
         })

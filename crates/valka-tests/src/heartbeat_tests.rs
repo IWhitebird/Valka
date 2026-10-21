@@ -89,16 +89,19 @@ async fn test_heartbeat_checker_detects_dead_worker() {
     use dashmap::DashMap;
     use std::sync::Arc;
     use tokio::sync::watch;
+    use valka_dispatcher::heartbeat::DeadWorker;
 
     let workers = Arc::new(DashMap::new());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let (dead_tx, mut dead_rx) = mpsc::channel::<WorkerId>(16);
+    let (dead_tx, mut dead_rx) = mpsc::channel::<DeadWorker>(16);
 
     // Create a worker with old heartbeat (dead)
     let worker_id = WorkerId::new();
     let mut handle = make_handle(1);
     handle.worker_id = worker_id.clone();
     handle.last_heartbeat = Utc::now() - Duration::seconds(60);
+    let conn_id = handle.conn_id;
+    let closer = handle.closer.clone();
     workers.insert(worker_id.0.clone(), handle);
 
     // Start heartbeat checker
@@ -110,15 +113,22 @@ async fn test_heartbeat_checker_detects_dead_worker() {
     ));
 
     // Wait for the checker to detect and report the dead worker
-    let dead_id = tokio::time::timeout(tokio::time::Duration::from_secs(10), dead_rx.recv())
+    let dead = tokio::time::timeout(tokio::time::Duration::from_secs(10), dead_rx.recv())
         .await
         .expect("Should detect dead worker within timeout")
         .expect("Should receive dead worker ID");
 
-    assert_eq!(dead_id, worker_id);
+    assert_eq!(dead.worker_id, worker_id);
+    assert_eq!(dead.conn_id, conn_id, "the report names the connection");
 
-    // Verify worker was removed from map
-    assert!(workers.is_empty(), "Dead worker should be removed from map");
+    // The connection is closed (its stream ends, so a live worker reconnects); the handle
+    // stays for the connection's cleanup, which resets its signals.
+    assert!(closer.is_closed(), "the dead worker's connection is closed");
+    assert_eq!(
+        workers.len(),
+        1,
+        "removal is left to the connection's cleanup"
+    );
 
     // Shutdown
     let _ = shutdown_tx.send(true);

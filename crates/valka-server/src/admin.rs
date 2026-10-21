@@ -160,6 +160,8 @@ pub async fn set_partitions(
     Path(queue): Path<String>,
     Json(body): Json<PartitionsBody>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // The queue name becomes an object key.
+    valka_core::validate_queue_name(&queue).map_err(ApiError::BadRequest)?;
     let cfg = valka_wal::queues::set_partitions(
         state.engine.store(),
         &queue,

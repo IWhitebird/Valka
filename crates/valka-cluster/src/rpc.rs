@@ -26,6 +26,10 @@ pub enum Command {
     CancelTask {
         task_id: String,
         reason: String,
+        /// Sent again after a call whose outcome is unknown (it may have run): a task
+        /// already CANCELLED then answers as the cancel's result, not as an error.
+        #[serde(default)]
+        retry: bool,
     },
     DeleteTask {
         task_id: String,
@@ -34,6 +38,10 @@ pub enum Command {
         task_id: String,
         name: String,
         payload: Option<Value>,
+        /// Minted once by the node that took the request, so a retried forward creates
+        /// one signal, not two.
+        #[serde(default)]
+        request_id: Option<String>,
     },
     ListSignals {
         task_id: String,
@@ -50,6 +58,9 @@ pub enum Command {
     FindIdempotent {
         probe_id: String,
         key: String,
+        /// Keys are per queue. Absent from older nodes: then any queue's task with the key.
+        #[serde(default)]
+        queue: Option<String>,
     },
     /// Stats and per-queue task counts of `probe_id`'s shard (operator view).
     ShardDetail {
@@ -105,6 +116,10 @@ pub enum Command {
     /// Extend the leases of these running tasks (those the receiving node owns).
     Heartbeat {
         task_ids: Vec<String>,
+        /// The worker that sent the heartbeat: only its own runs are extended. Absent from
+        /// older nodes: then whatever run each task has.
+        #[serde(default)]
+        worker_id: Option<String>,
     },
     /// Runnable tasks of `queue` for the caller's idle workers (long poll).
     Fetch {
@@ -168,6 +183,13 @@ impl Command {
             | Command::DeliverSignal { .. }
             | Command::Drain
             | Command::InvalidateQueue { .. } => Target::Node,
+        }
+    }
+
+    /// This command is sent again after a call whose outcome is unknown.
+    pub fn mark_retry(&mut self) {
+        if let Command::CancelTask { retry, .. } = self {
+            *retry = true;
         }
     }
 
@@ -364,6 +386,7 @@ mod tests {
             task_id: "t".into(),
             name: "ping".into(),
             payload: Some(serde_json::json!({"a": 1})),
+            request_id: Some("r".into()),
         };
         let j = serde_json::to_vec(&c).unwrap();
         assert_eq!(serde_json::from_slice::<Command>(&j).unwrap(), c);

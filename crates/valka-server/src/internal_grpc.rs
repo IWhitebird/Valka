@@ -111,8 +111,17 @@ pub async fn serve_internal(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
     let addr: SocketAddr = listener.local_addr()?;
-    let svc = internal_service_server::InternalServiceServer::with_interceptor(
-        InternalServiceImpl { api, local_events },
+    // The same message limit as the peer clients (tonic's 4 MiB default is too small for
+    // what a task may carry).
+    let max_message =
+        valka_cluster::peer::max_message_bytes(api.engine().config().limits.max_payload_bytes);
+    let svc = tonic::service::interceptor::InterceptedService::new(
+        internal_service_server::InternalServiceServer::new(InternalServiceImpl {
+            api,
+            local_events,
+        })
+        .max_decoding_message_size(max_message)
+        .max_encoding_message_size(max_message),
         valka_cluster::security::token_check(token),
     );
     let mut builder = tonic::transport::Server::builder()

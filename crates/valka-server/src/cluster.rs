@@ -230,8 +230,11 @@ pub async fn list_shards(
     State(state): State<AppState>,
     Query(q): Query<ShardsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // Every node reports the shards it serves; the rest are unowned right now.
+    // Every node reports the shards it serves; the rest are unowned right now, as far as
+    // a complete answer can tell: a node that did not answer makes it partial (its shards
+    // show without an owner).
     let served = state.api.shard_map().await?;
+    let missing = served.missing;
     let mut by_shard: std::collections::BTreeMap<u16, valka_engine::ShardStats> =
         served.value.into_iter().map(|s| (s.shard, s)).collect();
     let local = state.engine.shard_stats();
@@ -252,7 +255,7 @@ pub async fn list_shards(
         .filter(|s| !q.dirty.unwrap_or(false) || s.records_since_snapshot > 0)
         .filter(|s| q.min_tasks.is_none_or(|m| s.tasks >= m))
         .collect();
-    Ok(Json(rows))
+    Ok((crate::rest::partial_headers(&missing), Json(rows)))
 }
 
 /// One shard, from the node serving it; a shard nobody serves right now is shown from
