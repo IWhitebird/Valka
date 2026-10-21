@@ -394,8 +394,8 @@ impl Engine {
                 && v.record.generation == generation
                 && v.record.state == OwnerState::Owned
         });
-        let ok = mine
-            && owners::cas(
+        let cas = if mine {
+            owners::cas(
                 &self.inner.store,
                 shard,
                 current.as_ref(),
@@ -407,13 +407,31 @@ impl Engine {
                 },
             )
             .await
-            .map_err(|e| back_to_serving(e.into()))?;
-        // Either way the shard is no longer ours to serve: released, or (owner record not
-        // ours) taken over after this node was declared dead.
+        } else {
+            Ok(false)
+        };
+        // Whatever happened, the shard is no longer ours to serve from this state: released,
+        // taken over after this node was declared dead, or (CAS failed) unknown. A failed CAS
+        // may have landed with its answer lost, or land later, and another node may already
+        // be claiming the shard: serving it again here would be two writers. Found by the
+        // randomized simulation (a lost CAS answer put the shard back to Serving while the
+        // bucket said released; the new owner never saw the writes that followed).
         {
             let mut st = self.inner.shards[shard.index()].lock();
             *st = ShardState::new(shard);
         }
+        let ok = match cas {
+            Ok(ok) => ok,
+            Err(e) => {
+                // Settle it through a claim: if the record still names this incarnation the
+                // claim takes the next generation from the final snapshot just written
+                // (which also fences the late CAS); if it was released, whoever placement
+                // picks claims it.
+                self.inner.stranded.lock().insert(shard);
+                warn!(shard = %shard, error = %e, "release outcome unknown; the shard will be claimed again");
+                return Err(e.into());
+            }
+        };
         self.inner
             .moved_at
             .lock()

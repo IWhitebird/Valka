@@ -388,6 +388,68 @@ async fn a_drain_slower_than_the_lease_timeout_keeps_its_lease() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_release_whose_cas_answer_is_lost_never_leaves_two_writers() {
+    // Found by the randomized simulation: the owner's CAS to "released" landed but its
+    // answer was lost; the owner took the error as "not released" and served the shard
+    // again while another node claimed it. Writes acknowledged by the old owner after
+    // that were never seen by the new one.
+    let b = bucket();
+    let a = start(&b, "a").await;
+    let n2 = start(&b, "b").await;
+    wait_until("converged", 20, || !n2.engine.owned_shards().is_empty()).await;
+    let nodes = [&a.engine, &n2.engine];
+    let id = loop {
+        let id = create_anywhere(&nodes).await;
+        if owner_of(&nodes, &id).is_some_and(|e| e.node_id() == "a") {
+            break id;
+        }
+    };
+    let shard = a.engine.shard_of(&id).unwrap();
+
+    a.faults.lose_next_put_acks("owners/", 1);
+    let released = a.engine.release_shards(vec![shard], 1).await;
+    assert_eq!(released, 0, "the release reported an error");
+    assert!(
+        !a.engine.owns(shard),
+        "a release with an unknown outcome must not go back to serving"
+    );
+
+    // The shard is claimed again (by a, settling its stranded release, or by b) and served
+    // by exactly one node, with the task it held.
+    wait_until("the shard is served again", 30, || {
+        nodes.iter().filter(|e| e.owns(shard)).count() == 1
+    })
+    .await;
+    let owner = owner_of(&nodes, &id).unwrap();
+    assert_eq!(owner.get_task(&id).unwrap().status, TaskStatus::Pending);
+    // A write acknowledged now is seen after the next move too.
+    let more = owner
+        .create_task_at(&valka_core::new_id_in_shard(shard).to_string(), create("q"))
+        .await
+        .unwrap();
+    owner.sync().await.unwrap();
+    let other = if owner.node_id() == "a" {
+        &n2.engine
+    } else {
+        &a.engine
+    };
+    assert!(!other.owns(shard));
+    let released = owner.release_shards(vec![shard], 1).await;
+    assert_eq!(released, 1);
+    wait_until("handed over", 30, || {
+        nodes.iter().filter(|e| e.owns(shard)).count() == 1
+    })
+    .await;
+    let owner = owner_of(&nodes, &id).unwrap();
+    assert!(owner.get_task(&id).is_some());
+    assert!(
+        owner.get_task(&more.id).is_some(),
+        "the acknowledged write survived the move"
+    );
+    assert_partition(&nodes);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_claim_that_crashed_before_serving_is_skipped_over() {
     // A claimer CAS'd the owner record (gen 2) and died before writing its acquisition
     // snapshot. Its log has nothing for the shard. The next claim takes gen 3 and starts

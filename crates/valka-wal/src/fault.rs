@@ -32,6 +32,9 @@ pub struct FaultConfig {
     pub fail_per_mille: AtomicU32,
     /// PUTs are performed but the response is replaced with an error ("lost ack").
     pub lost_put_ack_per_mille: AtomicU32,
+    /// Lose the answer of the next PUTs to keys containing this text (one per count),
+    /// whatever the rates: for tests that need a lost answer at one exact step.
+    lose_next_put_ack: Mutex<Option<(String, u32)>>,
     /// Added latency per op.
     pub latency_ms: AtomicU64,
     /// When set, PUTs fail unconditionally (bucket unavailable).
@@ -52,6 +55,7 @@ impl FaultConfig {
         Arc::new(Self {
             fail_per_mille: AtomicU32::new(0),
             lost_put_ack_per_mille: AtomicU32::new(0),
+            lose_next_put_ack: Mutex::new(None),
             latency_ms: AtomicU64::new(0),
             puts_down: AtomicBool::new(false),
             frozen: AtomicBool::new(false),
@@ -71,6 +75,23 @@ impl FaultConfig {
         self.lost_put_ack_per_mille
             .store(per_mille, Ordering::SeqCst);
     }
+    /// Perform the next `count` PUTs to keys containing `key_part`, then answer each with
+    /// an error, as if the response were lost.
+    pub fn lose_next_put_acks(&self, key_part: &str, count: u32) {
+        *self.lose_next_put_ack.lock() = Some((key_part.to_string(), count));
+    }
+
+    fn take_targeted_loss(&self, key: &str) -> bool {
+        let mut target = self.lose_next_put_ack.lock();
+        match target.as_mut() {
+            Some((part, n)) if key.contains(part.as_str()) && *n > 0 => {
+                *n -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn set_latency(&self, d: Duration) {
         self.latency_ms
             .store(d.as_millis() as u64, Ordering::SeqCst);
@@ -153,9 +174,10 @@ impl ObjectStore for FaultyStore {
         self.cfg.puts.fetch_add(1, Ordering::Relaxed);
         self.before(Op::Put).await?;
         let r = self.inner.put_opts(location, payload, opts).await?;
-        if self
-            .cfg
-            .roll(self.cfg.lost_put_ack_per_mille.load(Ordering::SeqCst))
+        if self.cfg.take_targeted_loss(location.as_ref())
+            || self
+                .cfg
+                .roll(self.cfg.lost_put_ack_per_mille.load(Ordering::SeqCst))
         {
             return Err(generic(Op::Put));
         }

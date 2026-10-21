@@ -556,7 +556,7 @@ number of nodes.
 | Layer | Where | What it shows |
 |---|---|---|
 | TLA+ model | `spec/tla/` (TLC in CI; long configurations nightly) | leases, ownership, sealing, splitting, truncation and GC keep every acknowledged record and one history per shard, under arbitrary pauses, crashes and late PUTs. It found 7 protocol bugs before any code existed (PHASE2.md §19) |
-| Randomized simulation | `crates/valka-engine/src/sim_tests.rs` | 3–4 engines on one in-memory bucket with fault injection (kills, freezes, drains, lost PUT responses, bucket errors), paused time, and a history checker over every acknowledged operation. It found 3 implementation bugs (PHASE2.md §19a) |
+| Randomized simulation | `crates/valka-engine/src/sim_tests.rs` | 3–4 engines on one in-memory bucket with fault injection (kills, freezes, drains, lost PUT responses, bucket errors), paused time, and a history checker over every acknowledged operation. It found 4 implementation bugs (PHASE2.md §19a) |
 | Multi-engine scenarios | `crates/valka-engine/src/cluster_tests.rs`, `safety_tests.rs` | every failure walkthrough above, deterministic |
 | Engine and WAL | `crates/valka-engine/src/tests.rs`, `crates/valka-wal` | crash/replay property test, timers, the writer under faults |
 | Integration | `crates/valka-tests` | REST, gRPC and the Rust SDK end to end; 3-node clusters over real localhost gRPC (routing, cross-node workers, reattach, admin, mTLS) |

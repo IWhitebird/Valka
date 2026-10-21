@@ -130,6 +130,8 @@ async fn run_seed(seed: u64) {
     let mut h = History::default();
     let mut running: Vec<(String, String)> = Vec::new();
     let mut key_seq = 0u32;
+    // What happened, step by step: printed when a check fails.
+    let mut trace: Vec<String> = Vec::new();
 
     for step in 0..120 {
         match rng.random_range(0..100) {
@@ -145,11 +147,25 @@ async fn run_seed(seed: u64) {
                 }
                 let e = candidates[rng.random_range(0..candidates.len())];
                 // An error is not an acknowledgement: that task may or may not exist.
-                if let Ok(t) = e.create_task(req("q", key.clone())).await {
-                    if let Some(k) = &key {
-                        h.acked_keys.insert(k.clone(), t.id.clone());
+                match e.create_task(req("q", key.clone())).await {
+                    Ok(t) => {
+                        let replay = h.created.contains_key(&t.id);
+                        trace.push(format!(
+                            "{step}: create via {} key {key:?} -> {} (shard {:?}{})",
+                            e.node_id(),
+                            t.id,
+                            e.shard_of(&t.id),
+                            if replay { ", replay" } else { "" }
+                        ));
+                        if let Some(k) = &key {
+                            h.acked_keys.insert(k.clone(), t.id.clone());
+                        }
+                        h.created.insert(t.id, key);
                     }
-                    h.created.insert(t.id, key);
+                    Err(err) => trace.push(format!(
+                        "{step}: create via {} key {key:?} failed: {err}",
+                        e.node_id()
+                    )),
                 }
             }
             // Dispatch a pending task on its owner.
@@ -162,6 +178,7 @@ async fn run_seed(seed: u64) {
                 if let Some(e) = owner(&nodes, id)
                     && let Ok(d) = e.dispatch(id, "w")
                 {
+                    trace.push(format!("{step}: dispatch {id} on {}", e.node_id()));
                     running.push((id.clone(), d.run_id));
                 }
             }
@@ -176,9 +193,11 @@ async fn run_seed(seed: u64) {
                 };
                 if rng.random_bool(0.8) {
                     if e.complete_run(&id, &run, None).await.is_ok() {
+                        trace.push(format!("{step}: complete {id} on {}", e.node_id()));
                         h.completed.insert(id);
                     }
                 } else if e.fail_run(&id, &run, "boom", false).await.is_ok() {
+                    trace.push(format!("{step}: fail {id} on {}", e.node_id()));
                     h.failed.insert(id);
                 }
             }
@@ -187,11 +206,18 @@ async fn run_seed(seed: u64) {
                 let i = rng.random_range(0..NODES);
                 if nodes[i].engine.is_some() && !nodes[i].frozen && live(&nodes).len() > 1 {
                     let e = nodes[i].engine.take().unwrap();
+                    trace.push(format!(
+                        "{step}: kill {} inc {}",
+                        e.node_id(),
+                        e.incarnation()
+                    ));
                     e.halt();
                     nodes[i].faults.set_puts_down(true);
                 } else if nodes[i].engine.is_none() {
                     let name = nodes[i].name.clone();
                     nodes[i] = start(&backing, &name, seed * 100 + step).await;
+                    let inc = nodes[i].engine.as_ref().map(|e| e.incarnation());
+                    trace.push(format!("{step}: restart {name} inc {inc:?}"));
                 }
             }
             // Freeze a node (GC pause, SIGSTOP), or wake it up.
@@ -201,9 +227,11 @@ async fn run_seed(seed: u64) {
                     if nodes[i].frozen {
                         nodes[i].faults.freeze(false);
                         nodes[i].frozen = false;
+                        trace.push(format!("{step}: thaw {}", nodes[i].name));
                     } else if live(&nodes).len() > 1 {
                         nodes[i].faults.freeze(true);
                         nodes[i].frozen = true;
+                        trace.push(format!("{step}: freeze {}", nodes[i].name));
                     }
                 }
             }
@@ -214,10 +242,17 @@ async fn run_seed(seed: u64) {
                     && !nodes[i].frozen
                     && live(&nodes).len() > 1
                 {
-                    let _ = e.drain().await;
+                    let drained = e.drain().await;
+                    trace.push(format!(
+                        "{step}: drain {} inc {}: {drained:?}",
+                        e.node_id(),
+                        e.incarnation()
+                    ));
                     e.halt();
                     let name = nodes[i].name.clone();
                     nodes[i] = start(&backing, &name, seed * 1000 + step).await;
+                    let inc = nodes[i].engine.as_ref().map(|e| e.incarnation());
+                    trace.push(format!("{step}: restart {name} inc {inc:?}"));
                 }
             }
             // Bucket trouble on one node for a while.
@@ -227,6 +262,7 @@ async fn run_seed(seed: u64) {
                 nodes[i]
                     .faults
                     .set_lost_put_ack_rate(rng.random_range(0..200));
+                trace.push(format!("{step}: bucket faults on {}", nodes[i].name));
             }
             _ => {
                 for n in &nodes {
@@ -244,6 +280,12 @@ async fn run_seed(seed: u64) {
                 .is_some_and(|e| e.poisoned().is_some());
             if poisoned && !nodes[i].frozen {
                 let e = nodes[i].engine.take().unwrap();
+                trace.push(format!(
+                    "{step}: {} inc {} exits: {:?}",
+                    e.node_id(),
+                    e.incarnation(),
+                    e.poisoned()
+                ));
                 e.halt();
                 nodes[i].faults.set_puts_down(true);
             }
@@ -314,9 +356,28 @@ async fn run_seed(seed: u64) {
     // G1: every acknowledged create exists; acknowledged ends hold.
     for id in h.created.keys() {
         let e = owner(&nodes, id).unwrap_or_else(|| panic!("seed {seed}: no owner for {id}"));
-        let t = e
-            .get_task(id)
-            .unwrap_or_else(|| panic!("seed {seed}: acknowledged task {id} lost"));
+        let Some(t) = e.get_task(id) else {
+            for line in &trace {
+                eprintln!("  {line}");
+            }
+            let store = Store::wrap(backing.clone(), "", true, "sim");
+            let shard = e.shard_of(id).unwrap();
+            eprintln!(
+                "shard {shard}: served by {} inc {} at gen {:?}; owner record {:?}",
+                e.node_id(),
+                e.incarnation(),
+                e.shard_stats().get(shard.index()).map(|r| r.generation),
+                valka_wal::owners::get(&store, shard)
+                    .await
+                    .unwrap()
+                    .map(|v| v.record)
+            );
+            for k in valka_wal::snapshot::list(&store, shard).await.unwrap() {
+                eprintln!("  snapshot {}", k.key());
+            }
+            dump(&backing, &nodes).await;
+            panic!("seed {seed}: acknowledged task {id} lost");
+        };
         if h.completed.contains(id) {
             assert_eq!(t.status, TaskStatus::Completed, "seed {seed}: task {id}");
         }

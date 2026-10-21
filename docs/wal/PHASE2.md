@@ -780,6 +780,13 @@ The model's findings (§19) are all implemented, each with a regression test
     after its CAS, or whose CAS response was lost, left the shard unserved forever when
     placement then preferred another node. Such shards are now "stranded" and retried by
     their claimer whatever placement says; once served, they are handed over normally.
+  - *A release whose owner-record CAS has an unknown outcome must not serve again.* The
+    CAS to "released" landed but its answer was lost; the owner took the error as "not
+    released" and went back to serving while another node claimed the shard from the
+    final snapshot, so writes the old owner acknowledged afterwards were lost (found later,
+    in v0.2.0 work, by the same simulation). Now the shard is dropped and marked stranded:
+    a claim settles it, at the next generation, which also fences a late-landing CAS.
+    Regression test: `cluster_tests::a_release_whose_cas_answer_is_lost_never_leaves_two_writers`.
 - **A claim that finds its newest snapshot pointing into a dead, unsplit log backs off**
   for the guardian's split rather than splitting inline: after the claim's own CAS the
   owner record names the claimer, so an inline split would skip the very shard.
