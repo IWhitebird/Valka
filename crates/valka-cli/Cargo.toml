@@ -24,3 +24,4 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 futures = { workspace = true }
 tokio-stream = { workspace = true }
+reqwest = { version = "0.13", features = ["json"] }

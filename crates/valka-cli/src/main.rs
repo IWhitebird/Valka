@@ -3,50 +3,81 @@ use clap::{Parser, Subcommand};
 
 mod commands;
 
+use commands::Conn;
+
 #[derive(Parser)]
-#[command(name = "valka", about = "Valka distributed task queue CLI")]
+#[command(
+    name = "valka",
+    version,
+    about = "Command-line client for the Valka task queue",
+    long_about = "Command-line client for the Valka task queue.\n\nTask and log commands use \
+                  the gRPC API (--server); cluster, worker and queue commands use the REST \
+                  API (--http). Any node of a cluster answers any request."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// gRPC server address
-    #[arg(long, default_value = "http://[::1]:50051", global = true)]
-    server: String,
+    /// gRPC address of a node; repeat it (or separate with commas) to list several nodes.
+    #[arg(
+        long,
+        env = "VALKA_SERVER",
+        default_value = "http://127.0.0.1:50051",
+        value_delimiter = ',',
+        global = true
+    )]
+    server: Vec<String>,
+
+    /// REST address of a node (cluster, worker and queue commands).
+    #[arg(
+        long,
+        env = "VALKA_HTTP",
+        default_value = "http://127.0.0.1:8989",
+        global = true
+    )]
+    http: String,
+
+    /// API key for the public API (when the server sets VALKA_API_KEYS).
+    #[arg(long, env = "VALKA_API_KEY", global = true, hide_env_values = true)]
+    api_key: Option<String>,
+
+    /// Admin token for cluster changes (the server's VALKA_ADMIN_TOKEN).
+    #[arg(long, env = "VALKA_ADMIN_TOKEN", global = true, hide_env_values = true)]
+    admin_token: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Task operations
+    /// Create, inspect, list and cancel tasks
     Task {
         #[command(subcommand)]
         command: TaskCommands,
     },
-    /// Worker operations
-    Worker {
-        #[command(subcommand)]
-        command: WorkerCommands,
-    },
-    /// Log operations
+    /// Follow a task run's logs
     Logs {
         #[command(subcommand)]
         command: LogCommands,
     },
-    /// Start the server
-    Server {
-        /// Path to configuration file
-        #[arg(long)]
-        config: Option<String>,
+    /// Connected workers
+    Worker {
+        #[command(subcommand)]
+        command: WorkerCommands,
     },
-    /// Cluster operations
+    /// Cluster health, membership and shard placement
     Cluster {
         #[command(subcommand)]
         command: ClusterCommands,
+    },
+    /// Queue partitions
+    Queue {
+        #[command(subcommand)]
+        command: QueueCommands,
     },
 }
 
 #[derive(Subcommand)]
 enum TaskCommands {
-    /// Create a new task
+    /// Create a task
     Create {
         /// Queue name
         #[arg(long)]
@@ -54,33 +85,42 @@ enum TaskCommands {
         /// Task name
         #[arg(long)]
         name: String,
-        /// Input JSON
+        /// Input as JSON
         #[arg(long)]
         input: Option<String>,
-        /// Priority
+        /// Priority (higher runs first within a queue partition)
         #[arg(long, default_value = "0")]
         priority: i32,
-        /// Max retries
+        /// Attempts before the task is dead-lettered
         #[arg(long, default_value = "3")]
         max_retries: i32,
-        /// Timeout in seconds
+        /// Seconds an attempt may run
         #[arg(long, default_value = "300")]
         timeout: i32,
+        /// Idempotency key: a second create with the same key returns the first task
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        /// Run no earlier than this RFC 3339 time
+        #[arg(long)]
+        scheduled_at: Option<String>,
+        /// Print only the new task's id
+        #[arg(long, short)]
+        quiet: bool,
     },
-    /// Get a task by ID
+    /// Show a task
     Get {
         /// Task ID
         task_id: String,
     },
-    /// List tasks
+    /// List tasks, newest first
     List {
-        /// Filter by queue name
+        /// Only this queue
         #[arg(long)]
         queue: Option<String>,
-        /// Filter by status
+        /// Only this status (PENDING, RUNNING, COMPLETED, FAILED, RETRY, DEAD_LETTER, CANCELLED)
         #[arg(long)]
         status: Option<String>,
-        /// Limit
+        /// How many
         #[arg(long, default_value = "20")]
         limit: i32,
     },
@@ -92,19 +132,8 @@ enum TaskCommands {
 }
 
 #[derive(Subcommand)]
-enum WorkerCommands {
-    /// List connected workers
-    List,
-    /// Drain a worker (graceful shutdown)
-    Drain {
-        /// Worker ID
-        worker_id: String,
-    },
-}
-
-#[derive(Subcommand)]
 enum LogCommands {
-    /// Tail logs for a task run
+    /// Print a task run's logs and follow new lines
     Tail {
         /// Task run ID
         task_run_id: String,
@@ -112,19 +141,66 @@ enum LogCommands {
 }
 
 #[derive(Subcommand)]
+enum WorkerCommands {
+    /// List the workers connected to every node
+    List,
+}
+
+#[derive(Subcommand)]
 enum ClusterCommands {
-    /// Show cluster status
+    /// Health, nodes and shard ownership
     Status,
+    /// Every node's lease as this node sees it
+    Members,
+    /// Hand every shard of a node over to the others, then stop it (admin)
+    Drain {
+        /// Node ID
+        node: String,
+    },
+    /// Move a shard to a node and pin it there (admin)
+    Move {
+        /// Shard number
+        shard: u16,
+        /// Target node ID
+        #[arg(long)]
+        to: String,
+    },
+    /// Return a pinned shard to automatic placement (admin)
+    Unpin {
+        /// Shard number
+        shard: u16,
+    },
+}
+
+#[derive(Subcommand)]
+enum QueueCommands {
+    /// Queues and their partitions
+    List,
+    /// Change a queue's partition count (admin)
+    Partitions {
+        /// Queue name
+        queue: String,
+        /// New partition count (1-4096)
+        count: u32,
+    },
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("valka=info")
-        .init();
-
+async fn main() {
     let cli = Cli::parse();
+    if let Err(e) = run(cli).await {
+        eprintln!("error: {e:#}");
+        std::process::exit(1);
+    }
+}
 
+async fn run(cli: Cli) -> Result<()> {
+    let conn = Conn {
+        servers: cli.server,
+        http: cli.http.trim_end_matches('/').to_string(),
+        api_key: cli.api_key.filter(|k| !k.is_empty()),
+        admin_token: cli.admin_token.filter(|k| !k.is_empty()),
+    };
     match cli.command {
         Commands::Task { command } => match command {
             TaskCommands::Create {
@@ -134,57 +210,54 @@ async fn main() -> Result<()> {
                 priority,
                 max_retries,
                 timeout,
+                idempotency_key,
+                scheduled_at,
+                quiet,
             } => {
                 commands::task::create(
-                    &cli.server,
-                    &queue,
-                    &name,
-                    input,
-                    priority,
-                    max_retries,
-                    timeout,
+                    &conn,
+                    commands::task::NewTask {
+                        queue,
+                        name,
+                        input,
+                        priority,
+                        max_retries,
+                        timeout,
+                        idempotency_key,
+                        scheduled_at,
+                    },
+                    quiet,
                 )
-                .await?;
+                .await
             }
-            TaskCommands::Get { task_id } => {
-                commands::task::get(&cli.server, &task_id).await?;
-            }
+            TaskCommands::Get { task_id } => commands::task::get(&conn, &task_id).await,
             TaskCommands::List {
                 queue,
                 status,
                 limit,
-            } => {
-                commands::task::list(&cli.server, queue, status, limit).await?;
-            }
-            TaskCommands::Cancel { task_id } => {
-                commands::task::cancel(&cli.server, &task_id).await?;
-            }
-        },
-        Commands::Worker { command } => match command {
-            WorkerCommands::List => {
-                println!("Worker list not yet implemented (requires admin RPC)");
-            }
-            WorkerCommands::Drain {
-                worker_id: _worker_id,
-            } => {
-                println!("Worker drain not yet implemented (requires admin RPC)");
-            }
+            } => commands::task::list(&conn, queue, status, limit).await,
+            TaskCommands::Cancel { task_id } => commands::task::cancel(&conn, &task_id).await,
         },
         Commands::Logs { command } => match command {
-            LogCommands::Tail { task_run_id } => {
-                commands::logs::tail(&cli.server, &task_run_id).await?;
-            }
+            LogCommands::Tail { task_run_id } => commands::logs::tail(&conn, &task_run_id).await,
         },
-        Commands::Server { config: _config } => {
-            println!("Use `valka-server` binary to start the server");
-            println!("  valka-server [config-path]");
-        }
+        Commands::Worker { command } => match command {
+            WorkerCommands::List => commands::cluster::workers(&conn).await,
+        },
         Commands::Cluster { command } => match command {
-            ClusterCommands::Status => {
-                println!("Cluster status not yet implemented");
+            ClusterCommands::Status => commands::cluster::status(&conn).await,
+            ClusterCommands::Members => commands::cluster::members(&conn).await,
+            ClusterCommands::Drain { node } => commands::cluster::drain(&conn, &node).await,
+            ClusterCommands::Move { shard, to } => {
+                commands::cluster::move_shard(&conn, shard, &to).await
+            }
+            ClusterCommands::Unpin { shard } => commands::cluster::unpin(&conn, shard).await,
+        },
+        Commands::Queue { command } => match command {
+            QueueCommands::List => commands::cluster::queues(&conn).await,
+            QueueCommands::Partitions { queue, count } => {
+                commands::cluster::set_partitions(&conn, &queue, count).await
             }
         },
     }
-
-    Ok(())
 }

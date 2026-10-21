@@ -1,167 +1,153 @@
-use anyhow::Result;
-use tonic::transport::Channel;
-use valka_proto::api_service_client::ApiServiceClient;
+use anyhow::{Result, bail};
 use valka_proto::*;
 
-pub async fn create(
-    server: &str,
-    queue: &str,
-    name: &str,
-    input: Option<String>,
-    priority: i32,
-    max_retries: i32,
-    timeout: i32,
-) -> Result<()> {
-    let mut client = connect(server).await?;
+use super::Conn;
 
-    let response = client
-        .create_task(CreateTaskRequest {
-            queue_name: queue.to_string(),
-            task_name: name.to_string(),
-            input: input.unwrap_or_default(),
-            priority,
-            max_retries,
-            timeout_seconds: timeout,
-            idempotency_key: String::new(),
+/// The options of `valka task create`.
+pub struct NewTask {
+    pub queue: String,
+    pub name: String,
+    pub input: Option<String>,
+    pub priority: i32,
+    pub max_retries: i32,
+    pub timeout: i32,
+    pub idempotency_key: Option<String>,
+    pub scheduled_at: Option<String>,
+}
+
+pub async fn create(conn: &Conn, t: NewTask, quiet: bool) -> Result<()> {
+    if let Some(input) = &t.input {
+        serde_json::from_str::<serde_json::Value>(input)
+            .map_err(|e| anyhow::anyhow!("--input is not valid JSON: {e}"))?;
+    }
+    let mut client = conn.client().await?;
+    let task = client
+        .create_task_request(CreateTaskRequest {
+            queue_name: t.queue,
+            task_name: t.name,
+            input: t.input.unwrap_or_default(),
+            priority: t.priority,
+            max_retries: t.max_retries,
+            timeout_seconds: t.timeout,
+            idempotency_key: t.idempotency_key.unwrap_or_default(),
             metadata: String::new(),
-            scheduled_at: String::new(),
+            scheduled_at: t.scheduled_at.unwrap_or_default(),
         })
         .await?;
-
-    if let Some(task) = response.into_inner().task {
-        println!("Task created:");
+    if quiet {
+        println!("{}", task.id);
+    } else {
+        println!("Task created");
         print_task(&task);
     }
-
     Ok(())
 }
 
-pub async fn get(server: &str, task_id: &str) -> Result<()> {
-    let mut client = connect(server).await?;
-
-    let response = client
-        .get_task(GetTaskRequest {
-            task_id: task_id.to_string(),
-        })
-        .await?;
-
-    if let Some(task) = response.into_inner().task {
-        print_task(&task);
-    } else {
-        println!("Task not found");
-    }
-
+pub async fn get(conn: &Conn, task_id: &str) -> Result<()> {
+    let mut client = conn.client().await?;
+    print_task(&client.get_task(task_id).await?);
     Ok(())
 }
 
 pub async fn list(
-    server: &str,
+    conn: &Conn,
     queue: Option<String>,
     status: Option<String>,
     limit: i32,
 ) -> Result<()> {
-    let mut client = connect(server).await?;
-
-    let status_enum = status.as_deref().map(status_str_to_proto).unwrap_or(0);
-
-    let response = client
-        .list_tasks(ListTasksRequest {
-            queue_name: queue.unwrap_or_default(),
-            status: status_enum,
-            pagination: Some(Pagination {
-                page_size: limit,
-                page_token: String::new(),
-            }),
-        })
-        .await?;
-
-    let tasks = response.into_inner().tasks;
+    let status = match status.as_deref() {
+        Some(s) => Some(status_from_str(s)?),
+        None => None,
+    };
+    let mut client = conn.client().await?;
+    let tasks = client.list_tasks(queue.as_deref(), status, limit).await?;
     if tasks.is_empty() {
-        println!("No tasks found");
+        println!("No tasks");
         return Ok(());
     }
-
     println!(
-        "{:<38} {:<20} {:<20} {:<12} {:<8}",
+        "{:<38} {:<18} {:<20} {:<12} {:>7}",
         "ID", "QUEUE", "NAME", "STATUS", "ATTEMPT"
     );
-    println!("{}", "-".repeat(98));
-
     for task in tasks {
         println!(
-            "{:<38} {:<20} {:<20} {:<12} {:<8}",
+            "{:<38} {:<18} {:<20} {:<12} {:>7}",
             task.id,
-            task.queue_name,
-            task.task_name,
-            proto_status_to_str(task.status),
+            truncate(&task.queue_name, 18),
+            truncate(&task.task_name, 20),
+            status_to_str(task.status),
             task.attempt_count,
         );
     }
-
     Ok(())
 }
 
-pub async fn cancel(server: &str, task_id: &str) -> Result<()> {
-    let mut client = connect(server).await?;
-
-    let response = client
-        .cancel_task(CancelTaskRequest {
-            task_id: task_id.to_string(),
-        })
-        .await?;
-
-    if let Some(task) = response.into_inner().task {
-        println!("Task cancelled:");
-        print_task(&task);
-    }
-
+pub async fn cancel(conn: &Conn, task_id: &str) -> Result<()> {
+    let mut client = conn.client().await?;
+    let task = client.cancel_task(task_id).await?;
+    println!("Task cancelled");
+    print_task(&task);
     Ok(())
-}
-
-async fn connect(server: &str) -> Result<ApiServiceClient<Channel>> {
-    let channel = Channel::from_shared(server.to_string())?.connect().await?;
-    Ok(ApiServiceClient::new(channel))
 }
 
 fn print_task(task: &TaskMeta) {
-    println!("  ID:             {}", task.id);
-    println!("  Queue:          {}", task.queue_name);
-    println!("  Name:           {}", task.task_name);
-    println!("  Status:         {}", proto_status_to_str(task.status));
-    println!("  Priority:       {}", task.priority);
-    println!(
-        "  Attempt:        {}/{}",
-        task.attempt_count, task.max_retries
+    let row = |k: &str, v: &str| println!("  {k:<16}{v}");
+    row("ID", &task.id);
+    row("Queue", &task.queue_name);
+    row("Name", &task.task_name);
+    row("Status", status_to_str(task.status));
+    row("Priority", &task.priority.to_string());
+    row(
+        "Attempts",
+        &format!("{} of {}", task.attempt_count, task.max_retries),
     );
-    println!("  Timeout:        {}s", task.timeout_seconds);
+    row("Timeout", &format!("{} s", task.timeout_seconds));
+    if !task.idempotency_key.is_empty() {
+        row("Idempotency key", &task.idempotency_key);
+    }
+    if !task.scheduled_at.is_empty() {
+        row("Scheduled at", &task.scheduled_at);
+    }
     if !task.input.is_empty() {
-        println!("  Input:          {}", task.input);
+        row("Input", &task.input);
     }
     if !task.output.is_empty() {
-        println!("  Output:         {}", task.output);
+        row("Output", &task.output);
     }
     if !task.error_message.is_empty() {
-        println!("  Error:          {}", task.error_message);
+        row("Error", &task.error_message);
     }
-    println!("  Created:        {}", task.created_at);
-    println!("  Updated:        {}", task.updated_at);
+    row("Created", &task.created_at);
+    row("Updated", &task.updated_at);
 }
 
-fn status_str_to_proto(s: &str) -> i32 {
-    match s.to_uppercase().as_str() {
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(n - 1).collect();
+        t.push('…');
+        t
+    }
+}
+
+fn status_from_str(s: &str) -> Result<i32> {
+    Ok(match s.to_uppercase().as_str() {
         "PENDING" => 1,
-        "DISPATCHING" => 2,
         "RUNNING" => 3,
         "COMPLETED" => 4,
         "FAILED" => 5,
         "RETRY" => 6,
         "DEAD_LETTER" => 7,
         "CANCELLED" => 8,
-        _ => 0,
-    }
+        other => bail!(
+            "unknown status {other}: use PENDING, RUNNING, COMPLETED, FAILED, RETRY, \
+             DEAD_LETTER or CANCELLED"
+        ),
+    })
 }
 
-fn proto_status_to_str(status: i32) -> &'static str {
+fn status_to_str(status: i32) -> &'static str {
     match status {
         1 => "PENDING",
         2 => "DISPATCHING",
@@ -172,5 +158,29 @@ fn proto_status_to_str(status: i32) -> &'static str {
         7 => "DEAD_LETTER",
         8 => "CANCELLED",
         _ => "UNKNOWN",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn statuses_round_trip() {
+        for s in [
+            "PENDING",
+            "RUNNING",
+            "COMPLETED",
+            "FAILED",
+            "RETRY",
+            "DEAD_LETTER",
+            "CANCELLED",
+        ] {
+            assert_eq!(status_to_str(status_from_str(s).unwrap()), s);
+        }
+        assert_eq!(status_from_str("running").unwrap(), 3);
+        assert!(status_from_str("DONE").is_err());
+        assert_eq!(truncate("abcdef", 4), "abc…");
+        assert_eq!(truncate("abc", 4), "abc");
     }
 }
