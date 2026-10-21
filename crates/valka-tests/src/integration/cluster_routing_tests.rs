@@ -466,9 +466,23 @@ async fn requests_reach_the_new_owner_after_a_takeover() {
         assert!(tokio::time::Instant::now() < deadline, "never taken over");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    // Every acked task is served again. The first read above may have been answered by
+    // the halted node before its lease aged out, so the others' shards may still be in
+    // the middle of their takeover: wait for each the same way.
     for id in &ids {
-        let (status, _) = call(&c.nodes[via], get(&format!("/api/v1/tasks/{id}"))).await;
-        assert_eq!(status, StatusCode::OK, "acked task {id} after takeover");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let (status, body) = call(&c.nodes[via], get(&format!("/api/v1/tasks/{id}"))).await;
+            if status == StatusCode::OK {
+                break;
+            }
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "acked task {id} never served after the takeover"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
     // Membership names the dead node and the guardian that tombstoned it; no shard is
     // left unowned. (The reads above may have been served before the takeover: a halted
