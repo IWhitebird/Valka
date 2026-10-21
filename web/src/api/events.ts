@@ -1,3 +1,4 @@
+import { credentials } from "@/lib/credentials";
 import type { TaskEvent, TaskStatus, RawTaskEvent } from "./types";
 
 // Proto status enum values → string status
@@ -27,7 +28,11 @@ export function subscribeEvents(
   onEvent: (event: TaskEvent) => void,
   onError?: (error: Event) => void,
 ): () => void {
-  const eventSource = new EventSource("/api/v1/events");
+  // EventSource cannot send headers: the server also takes the key as ?access_token=.
+  const apiKey = credentials.apiKey();
+  const eventSource = new EventSource(
+    apiKey ? `/api/v1/events?access_token=${encodeURIComponent(apiKey)}` : "/api/v1/events",
+  );
 
   eventSource.onmessage = (event) => {
     try {

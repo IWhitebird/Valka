@@ -328,3 +328,34 @@ export interface StorageStats {
   };
   computed_at: string;
 }
+
+// ─── Admin ─────────────────────────────────────────────────────────
+
+export interface QueuePartition {
+  partition: number;
+  shard: number;
+  desired_owner: string | null;
+  /** Removed by a shrink: no new tasks, served until empty. */
+  draining: boolean;
+}
+
+export interface QueueInfo {
+  queue: string;
+  /** Partitions new tasks go to. */
+  partitions: number;
+  /** Every partition the queue ever had (removed ones drain). */
+  served_partitions: number;
+  previous: { partitions: number; changed_at: string } | null;
+  version: number;
+  created_at: string;
+  partition_shards: QueuePartition[];
+}
+
+export interface AuditRecord {
+  id: string;
+  action: string;
+  params: Record<string, unknown>;
+  result: Record<string, unknown>;
+  node: string;
+  at: string;
+}

@@ -5,6 +5,7 @@ const TABS = [
   { name: "Overview", href: "/cluster" },
   { name: "Shards", href: "/cluster/shards" },
   { name: "Storage", href: "/cluster/storage" },
+  { name: "Operations", href: "/cluster/operations" },
 ];
 
 export function ClusterTabs() {

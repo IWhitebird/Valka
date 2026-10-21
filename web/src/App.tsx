@@ -12,6 +12,7 @@ import { ClusterPage } from "@/pages/cluster";
 import { ClusterNodePage } from "@/pages/cluster-node";
 import { ClusterShardsPage } from "@/pages/cluster-shards";
 import { ClusterStoragePage } from "@/pages/cluster-storage";
+import { ClusterOperationsPage } from "@/pages/cluster-operations";
 
 function App() {
   return (
@@ -27,6 +28,7 @@ function App() {
             <Route path="/cluster/nodes/:nodeId" element={<ClusterNodePage />} />
             <Route path="/cluster/shards" element={<ClusterShardsPage />} />
             <Route path="/cluster/storage" element={<ClusterStoragePage />} />
+            <Route path="/cluster/operations" element={<ClusterOperationsPage />} />
             <Route path="/events" element={<EventsPage />} />
             <Route path="/dead-letters" element={<DeadLettersPage />} />
           </Route>

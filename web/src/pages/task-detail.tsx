@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
 import { ArrowLeft, Trash2 } from "lucide-react";
 import { useTask, useTaskRuns, useTaskCheckpoints, useDeleteTask } from "@/hooks/use-tasks";
@@ -17,14 +17,9 @@ export function TaskDetailPage() {
   const { data: runs = [], isLoading: runsLoading } = useTaskRuns(taskId!);
   const { data: checkpoints = [] } = useTaskCheckpoints(taskId!);
   const deleteTask = useDeleteTask();
-  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
-
-  // Auto-select the latest run when runs load
-  useEffect(() => {
-    if (runs.length > 0 && !selectedRunId) {
-      setSelectedRunId(runs[0].id);
-    }
-  }, [runs, selectedRunId]);
+  const [chosenRunId, setSelectedRunId] = useState<string | null>(null);
+  // The run the user picked, else the latest one.
+  const selectedRunId = chosenRunId ?? runs[0]?.id ?? null;
 
   if (taskLoading) {
     return (

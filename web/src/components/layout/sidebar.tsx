@@ -7,9 +7,13 @@ import {
   AlertTriangle,
   Server,
 } from "lucide-react";
+import { useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
+import { useClusterOverview } from "@/hooks/use-cluster";
+import { credentials } from "@/lib/credentials";
 
 const navigation = [
   { name: "Dashboard", href: "/", icon: LayoutDashboard },
@@ -22,6 +26,17 @@ const navigation = [
 
 export function Sidebar() {
   const location = useLocation();
+  const queryClient = useQueryClient();
+  const { data: overview } = useClusterOverview();
+  const [signedIn, setSignedIn] = useState(() => credentials.apiKey() !== null);
+  const version = overview?.nodes.find((n) => n.node_id === overview.this_node)?.version;
+
+  function signOut() {
+    credentials.setApiKey(null);
+    credentials.setAdminToken(null);
+    setSignedIn(false);
+    queryClient.invalidateQueries();
+  }
 
   function isActive(href: string): boolean {
     if (href === "/") return location.pathname === "/";
@@ -67,11 +82,26 @@ export function Sidebar() {
 
       <Separator />
 
-      <div className="flex items-center justify-between px-5 py-3">
-        <span className="text-[11px] text-muted-foreground/50">Valka</span>
-        <Badge variant="secondary" className="h-5 text-[10px] font-normal text-muted-foreground">
-          v0.1.0
-        </Badge>
+      <div className="space-y-2 px-5 py-3">
+        <div className="flex items-center justify-between">
+          <span className="truncate text-[11px] text-muted-foreground/70" title="The node serving this dashboard">
+            {overview?.this_node ?? "Valka"}
+          </span>
+          {version && (
+            <Badge variant="secondary" className="h-5 text-[10px] font-normal text-muted-foreground">
+              v{version}
+            </Badge>
+          )}
+        </div>
+        {signedIn && (
+          <button
+            type="button"
+            onClick={signOut}
+            className="text-[11px] text-muted-foreground/70 underline-offset-2 hover:text-foreground hover:underline"
+          >
+            Sign out
+          </button>
+        )}
       </div>
     </aside>
   );
