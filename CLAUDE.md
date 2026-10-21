@@ -48,7 +48,7 @@ cargo fmt --check                # Format check
 | `valka-cluster` | Node-to-node layer: internal RPC commands/queries (`rpc.rs`), peer clients with circuit breaker (`peer.rs`), cluster token + mTLS (`security.rs`) |
 | `valka-server` | Binary: assembles all services (gRPC + REST + internal listener + engine + log ingester); `api.rs` routes every request (local / forward / scatter), `feeder.rs` remote fetching, `relay.rs` cluster events, `admin.rs` admin API |
 | `valka-sdk` | Rust worker SDK: ValkaClient (task CRUD) + ValkaWorker (builder pattern, stream) |
-| `valka-cli` | CLI: `valka task create/get/list/cancel`, `valka logs tail` |
+| `valka-cli` | CLI: `valka task create/get/list/cancel`, `valka logs tail`, `valka worker list`, `valka cluster status/members/drain/move/unpin`, `valka queue list/partitions` (`--server` repeatable, `--api-key`, `--admin-token`) |
 | `valka-tests` | Unit + integration test suite (255 tests, incl. 3-node clusters over real localhost gRPC, plus MinIO-gated) |
 | `examples/rs` | Rust examples (producer, worker, full_lifecycle, signal_demo, steps) |
 
@@ -60,7 +60,7 @@ In addition to the Rust SDK (`valka-sdk` crate), polyglot SDKs live in `sdks/`:
 |-----|----------|---------|
 | **Rust** | `crates/valka-sdk` | `valka-sdk` (crate) |
 | **TypeScript** | `sdks/typescript/` | `@valka/sdk` (npm) |
-| **Go** | `sdks/go/` | `github.com/valka-queue/valka/sdks/go` |
+| **Go** | `sdks/go/` | `github.com/IWhitebird/Valka/sdks/go` |
 | **Python** | `sdks/python/` | `valka` (PyPI) |
 
 Examples for each language are in `examples/{rs,typescript,python,go}/`.
@@ -83,6 +83,11 @@ One code path for one node or many. Start = lease CAS (`inc + 1`, fences the pre
 
 ### Requests and workers across nodes (PHASE2 §9–§11)
 Queues have partitions (`queues/{hh}/{queue}`, default 16); keyed creates use `jump_hash(key, P)`, unkeyed prefer a local partition. Every REST/gRPC call goes through `valka_server::api::Api`: id-routed commands run on the shard owner (`InternalService.Execute`, JSON `valka_cluster::Command`, NOT_OWNER hints, owner-record fallback); lists/stats are scattered (`X-Valka-Partial`). Workers: idle workers' nodes long-poll owners (`Command::Fetch`, RAM reservation, 30 s TTL), dispatch is recorded by the owner (`Command::Dispatch`, idempotent on the run id), an undelivered run goes back with `RunReturned` (no attempt spent). The dispatcher's `TaskRouter` sends results/heartbeats/checkpoints/signal acks to owners; cancels and signals go to the run's node. Reconnecting workers send `WorkerHello.running`: Reattached / Adopted / Stale. Internal calls need `VALKA_CLUSTER__TOKEN` (constant-time), mTLS optional.
+
+### Public API keys, limits and safe retries
+- `VALKA_API_KEYS` (comma-separated) guards REST `/api/v1/*` (not the admin routes, which use `VALKA_ADMIN_TOKEN`) and gRPC `ApiService`/`WorkerService` (`valka_server::auth`: REST middleware + tonic interceptor, constant-time). Unset = open with a startup warning. `/healthz`, `/metrics`, the dashboard files and gRPC health/reflection stay open; the SSE stream also takes `?access_token=`. A 401 for a bad API key has code `UNAUTHENTICATED`; the admin API's is `UNAUTHORIZED`.
+- `[limits]` (`LimitsConfig`): `max_tasks_in_ram` (default 1M; creates over it get `ServerError::ResourceExhausted` → 429 / RESOURCE_EXHAUSTED; near it finished tasks are evicted early, keeping a minute for retried creates) and `max_payload_bytes` (input/metadata, default 1 MiB). The engine samples tasks in RAM every second (`valka_tasks_in_ram`).
+- A create with an idempotency key already in use returns the original task (REST 200 instead of 201, `idempotent-replayed: true`; gRPC response metadata), after a WAL sync so the answer is durable. All SDK clients generate `auto-…` keys for keyless creates, retry transient failures (unavailable, timeout, 429/502/503/504) on the next node of their address list, and never retry cancels or signals; workers take several addresses and rotate on reconnect. Keys: `VALKA_API_KEY` env in every SDK and the CLI.
 
 ### Time in tests
 `TokioClock` derives wall time from tokio's instant, so `#[tokio::test(start_paused = true)]` + `tokio::time::advance` moves leases, retries and timestamps deterministically. `FaultyStore` (valka-wal) injects latency, errors, lost PUT acks and freezes.
@@ -137,6 +142,8 @@ Key env vars:
 - `VALKA_CLUSTER__TLS_{CERT,KEY,CA}` — optional mTLS for internal traffic
 - `VALKA_CLUSTER__LEASE_TIMEOUT_MS` (10000), `JOIN_DELAY_MS` (15000), `MIN_RESIDENCY_SECS` (300), ... — see `docs/ARCHITECTURE.md` §12
 - `VALKA_ADMIN_TOKEN` — enables the admin API (drain, move/pin shard, partitions, audit) behind `Authorization: Bearer`
+- `VALKA_API_KEYS` — comma-separated keys for the public API (unset = open, with a warning); clients use `VALKA_API_KEY`
+- `VALKA_LIMITS__MAX_TASKS_IN_RAM` (1000000) / `VALKA_LIMITS__MAX_PAYLOAD_BYTES` (1048576) — per-node backpressure and payload size
 - `VALKA_WAL__FLUSH_INTERVAL_MS` — group-commit window (default 50)
 - `VALKA_GRPC_ADDR` — gRPC listen address (default `0.0.0.0:50051`)
 - `VALKA_HTTP_ADDR` — REST/HTTP listen address (default `0.0.0.0:8989`)
@@ -193,10 +200,10 @@ Production: `npm run build` produces `web/dist/`, served by axum fallback.
 
 Stack: React 19, TypeScript, Vite, Tailwind CSS, Radix UI, TanStack React Query.
 
-Pages: Dashboard, Tasks, Task Detail (with runs, logs, signals, steps), Workers, Cluster (overview, node detail, 4096-shard heatmap, storage), Events, Dead Letters.
+Pages: Dashboard, Tasks, Task Detail (with runs, logs, signals, steps), Workers, Cluster (overview + membership, node detail, shard heatmap for any shard count, storage, Operations: drain/move/unpin/partitions/audit behind the admin token), Events, Dead Letters. When the server has API keys, a 401 `UNAUTHENTICATED` shows a sign-in screen (`src/components/auth`); the key lives in localStorage, the admin token in sessionStorage (`src/lib/credentials.ts`).
 
 Brand: logo, icons, banners and colors are generated by `python3 assets/brand/build.py` (which also installs the web icons into `web/public/`, `www/app/`, `www/public/`); see `assets/brand/README.md`. Never hand-edit those files.
 
 Web tests: `cd web && npm test` (vitest + Testing Library; helpers in `src/lib`, components in `src/components/{cluster,task-detail}`).
 
-SDK tests: `cd sdks/go && go test ./...`; `cd sdks/python && PYTHONPATH=src python -m pytest tests` (needs `httpx`, `grpcio`, `protobuf`, `pytest`); TypeScript: `cd sdks/typescript && npm run typecheck && npm run build`.
+SDK tests: `cd sdks/go && go test ./...`; `cd sdks/python && PYTHONPATH=src python -m pytest tests && ruff check src tests` (needs `httpx`, `grpcio`, `protobuf`, `pytest`, `ruff`); TypeScript: `cd sdks/typescript && npm run typecheck && npm test` (builds, then `node --test`). Web: `cd web && npm run lint && npm test`.

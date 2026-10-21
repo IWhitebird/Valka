@@ -75,6 +75,8 @@ func handleTask(ctx *valka.TaskContext) (interface{}, error) {
 |--------|-------------|
 | `WithName(name)` | Worker name |
 | `WithServerAddr(addr)` | Valka server gRPC address |
+| `WithServerAddrs(addrs...)` | Several nodes; the worker moves to the next when its connection drops |
+| `WithAPIKey(key)` | API key (default: `VALKA_API_KEY`) |
 | `WithQueues(queues...)` | Queues to listen on |
 | `WithConcurrency(n)` | Max concurrent tasks |
 | `WithHandler(fn)` | Function to process tasks |
@@ -123,11 +125,12 @@ Step results must round-trip through `encoding/json`. `ctx.Checkpoint(step, valu
 
 ## Client
 
+The client uses the REST API (port `8989`).
+
 ```go
 package main
 
 import (
-    "context"
     "fmt"
     "log"
 
@@ -135,32 +138,42 @@ import (
 )
 
 func main() {
-    client, err := valka.NewClient("localhost:50051")
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer client.Close()
+    client := valka.NewClient("http://valka-1:8989",
+        valka.WithBaseURLs("http://valka-2:8989", "http://valka-3:8989"), // optional: more nodes
+        valka.WithClientAPIKey("..."),                                    // or VALKA_API_KEY
+    )
 
-    // Create a task
-    task, err := client.CreateTask(context.Background(), &valka.CreateTaskRequest{
+    retries := 3
+    task, err := client.CreateTask(valka.CreateTaskRequest{
+        QueueName:  "emails",
         TaskName:   "send-email",
-        Queue:      "emails",
         Input:      map[string]interface{}{"to": "user@example.com"},
-        MaxRetries: 3,
+        MaxRetries: &retries,
     })
     if err != nil {
         log.Fatal(err)
     }
-    fmt.Printf("Created task: %s\n", task.ID)
+    fmt.Println("created", task.ID)
 
-    // Get task status
-    task, err = client.GetTask(context.Background(), task.ID)
+    task, err = client.GetTask(task.ID)
     if err != nil {
         log.Fatal(err)
     }
-    fmt.Printf("Status: %s\n", task.Status)
+    fmt.Println("status", task.Status)
 }
 ```
+
+### Several nodes, API keys and retries
+
+- Give the client every node's URL. A call that fails because a node is unreachable or busy
+  (connection errors, `429`, `502`, `503`, `504`) is retried with backoff on the next node, up to
+  `WithAttempts(n)` times (default 6).
+- Every create carries an idempotency key: yours, or a generated `auto-…` one. A retried create
+  therefore returns the task the first attempt made instead of making a second.
+  `WithAutoIdempotency(false)` turns this off.
+- Cancels and signals are sent once, since repeating them is not safe.
+- `WithClientAPIKey` (default: the `VALKA_API_KEY` environment variable) is sent as
+  `Authorization: Bearer <key>`.
 
 ## Signal Handling
 
@@ -182,7 +195,7 @@ worker, _ := valka.NewWorker(
 The worker survives server restarts and node failures without losing work:
 
 - When its stream breaks (or the server sends `ServerShutdown`), the worker **reconnects with
-  exponential backoff**, from 100 ms up to 30 s, to the address given to `WithServerAddr(...)`. Running
+  exponential backoff**, from 100 ms up to 30 s, to its node (the next one in its list when it has several). Running
   handlers keep going meanwhile.
 - On the new connection it **resends every result not yet acknowledged** (`APPLIED` or `STALE`),
   and keeps heartbeating those tasks until then. The Go SDK also resends them on every heartbeat
@@ -191,6 +204,7 @@ The worker survives server restarts and node failures without losing work:
   new connection instead of running the task again, or records a dispatch that was lost in a
   crash. A run that ended meanwhile (cancelled, expired) gets a cancellation.
 
-In a cluster, point `WithServerAddr(...)` at a load balancer or a DNS name that covers several nodes, so the
-worker can land on a live node when its own dies. See
+In a cluster, give the worker every node with `WithServerAddrs(...)` (it moves to the next on each
+reconnect), or point it at a load balancer or DNS name that covers several nodes, so it lands
+on a live node when its own dies. See
 [Clustering](/docs/clustering#reattach-after-a-reconnect).

@@ -136,14 +136,17 @@ VALKA_CLUSTER__INTERNAL_ADDR=0.0.0.0:50052
 VALKA_CLUSTER__ADVERTISE_INTERNAL_ADDR=10.0.0.1:50052
 VALKA_CLUSTER__ADVERTISE_GRPC_ADDR=10.0.0.1:50051
 VALKA_CLUSTER__ADVERTISE_HTTP_ADDR=10.0.0.1:8989
+VALKA_API_KEYS=<keys for producers and workers, comma-separated>
 VALKA_ADMIN_TOKEN=<another secret, only if you want the admin API>
 ```
 
 Nodes 2 and 3 differ only in `VALKA_NODE_ID` and their addresses. Open `50052` between the nodes
 and nowhere else. For mTLS on the internal port, see [Clustering](/docs/clustering#security).
 
-Point workers and clients at any node, or at a load balancer or DNS name in front of all of them,
-so a worker that loses its node reconnects to another one.
+Give workers and clients every node's address (all four SDKs and the CLI take a list), or a load
+balancer or DNS name in front of all of them, so a worker that loses its node reconnects to another
+one and a create that hits a dying node is retried on the next. Clients send one of the API keys
+(`VALKA_API_KEY` in the SDKs and the CLI).
 
 No systemd units ship yet. Any supervisor works, as long as it restarts the process when it
 exits and gives it time to stop (see [Graceful shutdown](#graceful-shutdown)).
@@ -353,6 +356,9 @@ variables (highest wins). Nested keys use a double underscore: `[storage] bucket
 |----------|---------|-------------|
 | `VALKA_NODE_ID` | host name | Stable node id (1–64 characters from `A-Z a-z 0-9 _ -`) |
 | `VALKA_ADMIN_TOKEN` | - | Enables the admin API |
+| `VALKA_API_KEYS` | - | API keys for the public API, comma-separated. Unset: the API is open (the server warns) |
+| `VALKA_LIMITS__MAX_TASKS_IN_RAM` | `1000000` | Tasks a node holds in RAM; above it creates get `429` |
+| `VALKA_LIMITS__MAX_PAYLOAD_BYTES` | `1048576` | Largest task input or metadata |
 | `VALKA_GRPC_ADDR` | `0.0.0.0:50051` | gRPC listen address |
 | `VALKA_HTTP_ADDR` | `0.0.0.0:8989` | REST, dashboard and metrics listen address |
 | `VALKA_WEB_DIR` | `web/dist` | Built dashboard files (the image sets `/usr/share/valka/web`) |
@@ -401,6 +407,12 @@ node_id = ""
 # Bearer token for the admin API (drain a node, move a shard, set queue partitions,
 # audit log). Unset = admin API disabled. Env: VALKA_ADMIN_TOKEN.
 # admin_token = ""
+
+# API keys for the public REST and gRPC APIs, comma-separated (env: VALKA_API_KEYS).
+# Clients send one as "Authorization: Bearer <key>"; the SDKs and the CLI read
+# VALKA_API_KEY. Unset = the public API is OPEN to anyone who can reach its ports (the
+# server logs a warning). /healthz and /metrics stay open.
+# api_keys = "key-for-producers,key-for-workers"
 
 # gRPC listen address (workers and API clients)
 grpc_addr = "0.0.0.0:50051"
@@ -514,6 +526,18 @@ reconcile_grace_ms = 5000
 gc_interval_secs = 300
 # Refuse to start while another live process holds this node id.
 startup_lease_check = true
+
+# --- Limits ------------------------------------------------------------------
+
+[limits]
+# Tasks a node may hold in RAM (live, plus finished ones within completed_retention_secs).
+# Above it, creates are refused with RESOURCE_EXHAUSTED / HTTP 429 until the backlog
+# drains; near it, finished tasks leave RAM early (their history stays in the bucket).
+# 0 disables the limit.
+max_tasks_in_ram = 1000000
+# Largest task input or metadata, in bytes of JSON. Store big data elsewhere and pass a
+# reference.
+max_payload_bytes = 1048576
 
 # --- Matching / Task Routing -----------------------------------------------
 

@@ -51,8 +51,11 @@ Most task queues bolt together a message broker, a database, and a cache. Every 
 - Automatic retries with exponential backoff + dead letter queue
 - Structured log streaming per task run
 - Event broadcasting via gRPC streams and SSE
-- Idempotency keys, task cancellation, scheduled/delayed tasks
-- Web dashboard, CLI, and Prometheus metrics
+- Idempotency keys (a repeated create returns the first task), task cancellation, scheduled/delayed tasks
+- Producers ride through failures too: SDK clients take every node's address, retry on the next node, and attach an idempotency key so a retry never makes a second task
+- API keys for the public API, a separate admin token for cluster changes
+- Backpressure: a per-node limit on tasks in RAM (HTTP 429 / RESOURCE_EXHAUSTED) and on payload size
+- Web dashboard (with an Operations page for drains, shard moves and queue partitions), CLI, and Prometheus metrics
 - Graceful shutdown for both server and workers
 
 ## Quick Start
@@ -83,7 +86,7 @@ The server starts on **gRPC `:50051`** and **REST `:8989`**.
 |----------|---------|---------|
 | **Rust** | `valka-sdk` | `cargo add valka-sdk` |
 | **TypeScript** | `@valka/sdk` | `npm install @valka/sdk` |
-| **Go** | `github.com/valka-queue/valka/sdks/go` | `go get github.com/valka-queue/valka/sdks/go` |
+| **Go** | `github.com/IWhitebird/Valka/sdks/go` | `go get github.com/IWhitebird/Valka/sdks/go` |
 | **Python** | `valka` | `pip install valka` |
 
 Any language can also interact via the REST API.
@@ -93,7 +96,9 @@ Any language can also interact via the REST API.
 ```rust
 let worker = ValkaWorker::builder()
     .name("email-worker")
-    .server_addr("http://localhost:50051")
+    // Every node of the cluster: the worker moves on if its node goes away.
+    .server_addrs(&["http://valka-1:50051", "http://valka-2:50051"])
+    .api_key("…") // or VALKA_API_KEY
     .queues(&["emails"])
     .concurrency(8)
     .handler(|ctx: TaskContext| async move {
@@ -249,6 +254,9 @@ Layered via [figment](https://github.com/SergioBenitez/Figment): defaults → `v
 | `VALKA_CLUSTER__ADVERTISE_INTERNAL_ADDR` | internal addr | Address peers use to reach this node |
 | `VALKA_CLUSTER__NUM_SHARDS` | `4096` | Shard count of a new bucket (fixed afterwards) |
 | `VALKA_ADMIN_TOKEN` | — | Enables the admin API (drain node, move shard, queue partitions) |
+| `VALKA_API_KEYS` | — | Comma-separated API keys for the public REST and gRPC APIs (unset: open, with a warning) |
+| `VALKA_LIMITS__MAX_TASKS_IN_RAM` | `1000000` | Tasks a node holds in RAM before creates get 429 |
+| `VALKA_LIMITS__MAX_PAYLOAD_BYTES` | `1048576` | Largest task input or metadata |
 | `VALKA_WAL__FLUSH_INTERVAL_MS` | `50` | Group-commit window (enqueue ack latency) |
 | `VALKA_GRPC_ADDR` | `0.0.0.0:50051` | gRPC listen address |
 | `VALKA_HTTP_ADDR` | `0.0.0.0:8989` | REST/HTTP listen address |

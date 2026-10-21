@@ -51,8 +51,8 @@ Monitor connected workers on every node:
 
 ### Cluster
 
-Nodes, shard ownership and write-ahead log health, in three tabs (Overview, Shards, Storage)
-and a page per node:
+Nodes, shard ownership and write-ahead log health, in four tabs (Overview, Shards, Storage,
+Operations) and a page per node:
 
 - **Overview**: a health banner (ok, degraded or critical, with the reasons: unowned shards,
   suspect or poisoned nodes, nodes that did not answer), one card per node (status, incarnation,
@@ -69,9 +69,19 @@ and a page per node:
   queue, sequence numbers and latest snapshot. Filter by node.
 - **Storage**: WAL segments, snapshots and task log chunks in the bucket, an upper-bound
   estimate of daily PUT cost, and the bucket layout.
+- **Operations**: drain a node (it hands its shards over, then stops), move a shard to a node and
+  pin it there, unpin shards, change a queue's partition count, and the audit log of every admin
+  action. These need the admin token (`VALKA_ADMIN_TOKEN`), which you enter on the page; it is
+  kept for that browser tab only. Every destructive action asks for confirmation first.
 
 Watch a takeover here: kill a node and see it turn suspect, then dead, while its shards move to
 the other nodes. See [Clustering](/docs/clustering#watching-a-takeover).
+
+### Signing in
+
+When the server is started with `VALKA_API_KEYS`, the dashboard asks for one of those keys the
+first time a request is refused, checks it with the server, and keeps it in your browser until
+you choose **Sign out** in the sidebar.
 
 ### Events
 

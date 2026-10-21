@@ -9,6 +9,21 @@ In a cluster, **every node serves the whole API**. A request about one task is f
 node that owns the task's shard; a list is gathered from every live node and merged. You can
 send any request to any node.
 
+### Authentication
+
+When the server is started with `VALKA_API_KEYS` (comma-separated), every `/api/v1` endpoint
+needs one of those keys:
+
+```
+Authorization: Bearer <api key>
+```
+
+A missing or wrong key gets `401` with code `UNAUTHENTICATED`. The event stream also accepts the
+key as `?access_token=<key>`, because a browser's `EventSource` cannot send headers.
+`/healthz` and `/metrics` stay open for probes and scrapers. The [admin endpoints](#admin) use the
+separate admin token instead. Without `VALKA_API_KEYS` the API is open, and the server logs a
+warning at startup.
+
 ### Partial answers
 
 Endpoints that gather from every node (`GET /api/v1/tasks`, `DELETE /api/v1/tasks`,
@@ -48,11 +63,11 @@ POST /api/v1/tasks
 |-------|------|----------|---------|-------------|
 | `queue_name` | string | Yes | - | Queue to place the task in |
 | `task_name` | string | Yes | - | Human-readable task identifier |
-| `input` | JSON | No | `null` | Task payload (any valid JSON) |
+| `input` | JSON | No | `null` | Task payload (any valid JSON, up to `limits.max_payload_bytes`, 1 MiB by default) |
 | `priority` | integer | No | `0` | Higher = higher priority |
 | `max_retries` | integer | No | `3` | Attempt limit: a failure on this attempt dead-letters the task |
 | `timeout_seconds` | integer | No | `300` | Lease timeout per attempt |
-| `idempotency_key` | string | No | `null` | Prevents duplicate tasks |
+| `idempotency_key` | string | No | `null` | One task per key: a repeated create returns the first task |
 | `metadata` | JSON | No | `{}` | Arbitrary metadata |
 | `scheduled_at` | RFC 3339 | No | `null` | Delayed execution time |
 
@@ -75,7 +90,13 @@ The response is sent once the task is durable in the bucket.
 }
 ```
 
-A create whose `idempotency_key` is already taken returns `409 CONFLICT`.
+A create whose `idempotency_key` is already in use returns the task that key made, with
+`200 OK` instead of `201` and the header `idempotent-replayed: true` (`false` on a new task). That
+makes a create safe to retry after a timeout or a lost response: the SDK clients attach a
+generated key (`auto-…`) to every create that has none for this reason.
+
+A node at its task limit (`limits.max_tasks_in_ram`) answers `429` with code
+`RESOURCE_EXHAUSTED` until workers drain the backlog.
 
 ### Get a Task
 
@@ -510,9 +531,12 @@ All errors follow this format:
 
 | Status | Code | Description |
 |--------|------|-------------|
-| 400 | `BAD_REQUEST` | Invalid argument (missing field, unknown status, bad timestamp) |
+| 400 | `BAD_REQUEST` | Invalid argument (missing field, unknown status, bad timestamp, payload too large) |
+| 401 | `UNAUTHENTICATED` | Missing or wrong API key |
+| 401 | `UNAUTHORIZED` | Missing or wrong admin token (admin endpoints) |
+| 403 | `FORBIDDEN` | Admin API disabled: the server has no `VALKA_ADMIN_TOKEN` |
 | 404 | `NOT_FOUND` | Resource not found |
-| 409 | `CONFLICT` | Idempotency key already used |
 | 422 | `INVALID_STATE` | Task in invalid state for the operation |
+| 429 | `RESOURCE_EXHAUSTED` | The node holds as many tasks as its limit allows. Retry later |
 | 503 | `UNAVAILABLE` | The shard is moving, its owner is unreachable, or the bucket is failing. Retry |
 | 500 | `INTERNAL_ERROR` | Server error |

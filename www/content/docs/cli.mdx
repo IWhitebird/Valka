@@ -1,125 +1,136 @@
 ---
-title: CLI Reference
-description: Command-line interface for managing tasks, workers, and logs.
+title: CLI
+description: Create and inspect tasks, follow logs, and operate a cluster from the command line.
 ---
 
-The Valka CLI provides direct access to the gRPC API from the terminal.
+`valka` talks to any node of a cluster. Task and log commands use the gRPC API; cluster, worker
+and queue commands use the REST API.
 
 ## Installation
 
-The CLI is bundled in the Valka Docker image at `/usr/local/bin/valka`. You can run it directly:
-
 ```bash
-docker exec -it <valka-container> valka --help
+cargo install --path crates/valka-cli
 ```
 
-Or install it as a standalone binary:
+Or run it from the repository:
 
 ```bash
-cargo install valka-cli
+cargo run -p valka-cli -- --help
 ```
 
-## Global Options
+## Global options
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--server` | `http://[::1]:50051` | gRPC server address. In a cluster, any node works |
+| Option | Environment | Default | Description |
+|--------|-------------|---------|-------------|
+| `--server` | `VALKA_SERVER` | `http://127.0.0.1:50051` | gRPC address of a node. Repeat it, or separate addresses with commas, to list several nodes: the CLI moves to the next one if a node does not answer |
+| `--http` | `VALKA_HTTP` | `http://127.0.0.1:8989` | REST address of a node (cluster, worker and queue commands) |
+| `--api-key` | `VALKA_API_KEY` | - | API key, when the server sets `VALKA_API_KEYS` |
+| `--admin-token` | `VALKA_ADMIN_TOKEN` | - | Admin token, for `cluster drain`, `cluster move`, `cluster unpin` and `queue partitions` |
 
-## Task Commands
+## Tasks
 
-### Create a Task
+### Create a task
 
 ```bash
 valka task create --queue emails --name send-welcome \
   --input '{"to": "user@example.com"}' \
-  --max-retries 3 \
-  --timeout 300
+  --priority 5 --max-retries 3 --timeout 300
 ```
 
-| Flag | Required | Default | Description |
-|------|----------|---------|-------------|
-| `--queue` | Yes | - | Target queue |
-| `--name` | Yes | - | Task name |
-| `--input` | No | `null` | JSON payload |
-| `--priority` | No | `0` | Task priority |
-| `--max-retries` | No | `3` | Max retries |
-| `--timeout` | No | `300` | Timeout in seconds |
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--queue` | required | Queue name |
+| `--name` | required | Task name |
+| `--input` | - | Input as JSON |
+| `--priority` | `0` | Higher runs first within a queue partition |
+| `--max-retries` | `3` | Attempts before the task is dead-lettered |
+| `--timeout` | `300` | Seconds an attempt may run |
+| `--idempotency-key` | generated | One task per key: running the command again returns the first task |
+| `--scheduled-at` | - | Run no earlier than this RFC 3339 time |
+| `-q`, `--quiet` | | Print only the new task's id |
 
-### Get a Task
+The CLI attaches a generated idempotency key when you give none, so a create retried after a
+node failure never makes a second task.
+
+### Get a task
 
 ```bash
 valka task get 01912345-6789-7abc-def0-123456789abc
 ```
 
-Displays the full task details including status, input, output, and timing.
-
-### List Tasks
+### List tasks
 
 ```bash
 valka task list --queue emails --status RUNNING --limit 20
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--queue` | - | Filter by queue name |
-| `--status` | - | Filter by status |
-| `--limit` | `20` | Max results |
+`--status` is one of `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`, `RETRY`, `DEAD_LETTER` or
+`CANCELLED`.
 
-**Status values**: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`, `RETRY`, `DEAD_LETTER`, `CANCELLED`
-
-### Cancel a Task
+### Cancel a task
 
 ```bash
 valka task cancel 01912345-6789-7abc-def0-123456789abc
 ```
 
-## Log Commands
+## Logs
 
-### Tail Logs
-
-Stream logs for a task run in real-time:
+### Follow a run's logs
 
 ```bash
 valka logs tail <TASK_RUN_ID>
 ```
 
-Output format:
+Prints the run's log lines so far, then new ones as they arrive. Stop with Ctrl-C. Run ids are on
+the task's page in the dashboard, or from `GET /api/v1/tasks/{id}/runs`.
+
+## Workers
+
+```bash
+valka worker list
 ```
-2025-01-15T10:00:01Z [INFO]  Processing email task: send-welcome
-2025-01-15T10:00:02Z [DEBUG] Attempt #1
-2025-01-15T10:00:03Z [INFO]  Email sent to user@example.com
+
+The workers connected to every node, with their node, queues, concurrency and active tasks.
+
+## Cluster
+
+```bash
+valka cluster status     # health, nodes, shards owned, pending and running tasks
+valka cluster members    # every node's lease: incarnation, status, lease age, eligibility
+```
+
+These need the admin token:
+
+```bash
+valka cluster drain valka-2              # hand valka-2's shards to the others, then stop it
+valka cluster move 1731 --to valka-3     # pin shard 1731 to valka-3
+valka cluster unpin 1731                 # back to automatic placement
+```
+
+## Queues
+
+```bash
+valka queue list                         # partitions per queue, and partitions still draining
+valka queue partitions emails 32         # change a queue's partition count (admin token)
 ```
 
 ## Examples
 
-### Full Workflow
+### A full round trip
 
 ```bash
-# Create a task
-TASK_ID=$(valka task create --queue emails --name send-email \
-  --input '{"to": "hello@example.com"}' | awk '/ID:/ {print $2; exit}')
-
-echo "Created task: $TASK_ID"
-
-# Watch the task
-valka task get $TASK_ID
-
-# List all running tasks
+export VALKA_API_KEY=...                       # if the server requires one
+TASK_ID=$(valka task create --queue emails --name send-email --input '{"to":"a@b.c"}' -q)
+valka task get "$TASK_ID"
 valka task list --status RUNNING
-
-# Cancel if needed
-valka task cancel $TASK_ID
+valka task cancel "$TASK_ID"
 ```
 
-### Monitoring
+### Watching a cluster
 
 ```bash
-# Check all pending tasks across queues
-valka task list --status PENDING --limit 100
-
-# List failed tasks
-valka task list --status FAILED
-
-# Check dead letter queue
+export VALKA_SERVER=http://valka-1:50051,http://valka-2:50051,http://valka-3:50051
+export VALKA_HTTP=http://valka-1:8989
+valka cluster status
 valka task list --status DEAD_LETTER
 ```

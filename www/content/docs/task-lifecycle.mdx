@@ -235,8 +235,10 @@ curl -X POST http://localhost:8989/api/v1/tasks \
   }'
 ```
 
-If a task with the same idempotency key already exists, the create is rejected with `409 CONFLICT`
-(gRPC `ALREADY_EXISTS`) and no second task is made. A key always maps to the same queue partition,
+If a task with the same idempotency key already exists, no second task is made: the create
+returns the existing task (REST `200 OK` with `idempotent-replayed: true` instead of `201`). So a
+create is safe to retry after a timeout, and the SDK clients give every keyless create a
+generated key for exactly that reason. A key always maps to the same queue partition,
 so this holds on every node of a cluster, and also after the queue's partition count changes. A
 key is remembered as long as its task is held in RAM: while it is live, and for
 `completed_retention_secs` (24 h by default) after it finishes.
