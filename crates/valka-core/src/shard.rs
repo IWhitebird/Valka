@@ -97,6 +97,35 @@ pub fn shard_of_task_id(task_id: &str) -> Option<ShardId> {
 /// Default number of partitions a queue is created with.
 pub const DEFAULT_QUEUE_PARTITIONS: u32 = 16;
 
+/// Longest queue name accepted.
+pub const MAX_QUEUE_NAME_LEN: usize = 128;
+
+/// A queue name names objects in the bucket (`queues/{hh}/{queue}`), so it is limited to
+/// characters every object store keeps as they are: ASCII letters, digits and `. _ - : @`,
+/// not starting with a dot.
+pub fn validate_queue_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("queue_name is required".into());
+    }
+    if name.len() > MAX_QUEUE_NAME_LEN {
+        return Err(format!(
+            "queue_name is longer than {MAX_QUEUE_NAME_LEN} characters"
+        ));
+    }
+    if name.starts_with('.') {
+        return Err("queue_name must not start with '.'".into());
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '@')))
+    {
+        return Err(format!(
+            "queue_name may only contain letters, digits and . _ - : @ (found {c:?})"
+        ));
+    }
+    Ok(())
+}
+
 /// The shard partition `p` of `queue` lives on. All of a partition's tasks share one
 /// shard, so one owner and one matching queue serve it.
 pub fn partition_shard(queue_name: &str, partition: u32, num_shards: u32) -> ShardId {
@@ -208,6 +237,20 @@ mod tests {
         }
         assert!((400..800).contains(&moved), "about 1/17 move, got {moved}");
         assert_eq!(jump_hash("x", 1), 0);
+    }
+
+    #[test]
+    fn queue_names_are_safe_object_key_segments() {
+        for ok in ["emails", "tree.queue", "billing:invoices", "a-b_c@2", "Q1"] {
+            assert!(validate_queue_name(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "", ".", "..", ".hidden", "a/b", "50%", "jobs#1", "a b", "é", "x?",
+        ] {
+            assert!(validate_queue_name(bad).is_err(), "{bad}");
+        }
+        assert!(validate_queue_name(&"q".repeat(MAX_QUEUE_NAME_LEN)).is_ok());
+        assert!(validate_queue_name(&"q".repeat(MAX_QUEUE_NAME_LEN + 1)).is_err());
     }
 
     #[test]

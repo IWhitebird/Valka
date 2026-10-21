@@ -163,7 +163,12 @@ impl Engine {
         let store = &self.inner.store;
         let me = self.node_id().to_string();
         let inc = self.incarnation();
-        let io = |e: WalError| ClaimRefused::Busy(e.to_string());
+        // An unreadable owner record or newest snapshot is not a transient failure: the
+        // claim must not go on from older state, and someone has to look.
+        let io = |e: WalError| match e {
+            WalError::Corrupt(why) => ClaimRefused::Invariant(why),
+            e => ClaimRefused::Busy(e.to_string()),
+        };
 
         // 1. Who owns it, and may it move?
         let current = owners::get(store, shard).await.map_err(io)?;

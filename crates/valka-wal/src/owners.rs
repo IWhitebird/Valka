@@ -62,13 +62,21 @@ pub async fn cas(
 ) -> Result<bool, WalError> {
     let key = keys::owner(shard);
     let body = Bytes::from(serde_json::to_vec(next)?);
-    match current {
-        None => Ok(store.put_create(&key, body).await?.is_some()),
-        Some(v) => Ok(matches!(
+    let written = match current {
+        None => store.put_create(&key, body).await?.is_some(),
+        Some(v) => matches!(
             store.put_if_match(&key, &v.etag, body).await?,
             CasOutcome::Written(_)
-        )),
+        ),
+    };
+    if written {
+        return Ok(true);
     }
+    // A conditional PUT whose response was lost may have landed anyway: the client retries
+    // it (on a 5xx or a dropped connection) and the retry fails its precondition on our own
+    // write. Only our write can have stored exactly `next` (it names this node and a
+    // generation nobody used before), so finding it means we won.
+    Ok(get(store, shard).await?.is_some_and(|v| v.record == *next))
 }
 
 /// Every owner record in the bucket. One LIST plus one GET per shard; used by the garbage
@@ -131,5 +139,27 @@ mod tests {
         let all = list_all(&s).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].1.record.state, OwnerState::Released);
+    }
+
+    #[tokio::test]
+    async fn a_cas_whose_write_already_landed_wins() {
+        // The client retried a CAS whose response was lost: the retry fails its
+        // precondition on our own write, which must still count as won.
+        let s = Store::memory();
+        let sh = ShardId(4);
+        let first = rec("a", 1, 1, OwnerState::Owned);
+        assert!(cas(&s, sh, None, &first).await.unwrap());
+        let v = get(&s, sh).await.unwrap().unwrap();
+        let next = rec("a", 1, 2, OwnerState::Owned);
+        assert!(cas(&s, sh, Some(&v), &next).await.unwrap());
+        // The same CAS again, as the lost-response retry sees it.
+        assert!(cas(&s, sh, Some(&v), &next).await.unwrap());
+        assert!(cas(&s, sh, None, &next).await.unwrap());
+        // Someone else's record still loses.
+        assert!(
+            !cas(&s, sh, Some(&v), &rec("b", 1, 2, OwnerState::Owned))
+                .await
+                .unwrap()
+        );
     }
 }

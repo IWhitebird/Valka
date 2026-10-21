@@ -379,9 +379,9 @@ async fn flush(
 
 /// Segments are written create-if-absent: a segment position is written exactly once, so
 /// a late PUT from a fenced-out writer can never overwrite a sealed position.
-/// `AlreadyExists` after a retry is ours only if the stored bytes are ours: an earlier
-/// attempt may have landed with its response lost, or someone else may have taken the
-/// position meanwhile.
+/// `AlreadyExists` is ours only if the stored bytes are ours: an attempt (ours, or one the
+/// object-store client retried on its own after a 5xx or a dropped connection) may have
+/// landed with its response lost, or someone else may have taken the position.
 async fn put_with_retry(
     store: &Store,
     key: &str,
@@ -393,11 +393,6 @@ async fn put_with_retry(
     loop {
         let err = match store.put_create(key, bytes.clone()).await {
             Ok(Some(_)) => return Ok(()),
-            Ok(None) if attempt == 0 => {
-                return Err(WalError::NotDurable(format!(
-                    "{key}: segment already exists (another writer holds this log)"
-                )));
-            }
             Ok(None) => match store.get(key).await {
                 Ok(Some((stored, _))) if stored == bytes => return Ok(()),
                 Ok(_) => {
@@ -543,6 +538,23 @@ mod tests {
         faults.set_lost_put_ack_rate(0);
         put.await.unwrap().expect("the landed bytes are ours");
         assert_eq!(store.get(key).await.unwrap().unwrap().0, ours);
+    }
+
+    #[tokio::test]
+    async fn a_first_put_that_finds_its_own_bytes_succeeds() {
+        // The object-store client retries a conditional PUT on its own (5xx, dropped
+        // connection); the retry then fails its precondition on our own landed write.
+        let store = Store::memory();
+        let key = "wal/n/00000001-0000000000000001.seg";
+        let ours = Bytes::from_static(b"ours");
+        store.put_create(key, ours.clone()).await.unwrap().unwrap();
+        put_with_retry(&store, key, ours, 5)
+            .await
+            .expect("the stored bytes are ours");
+        let err = put_with_retry(&store, key, Bytes::from_static(b"other"), 5)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("taken by another writer"), "{err}");
     }
 
     #[tokio::test(start_paused = true)]

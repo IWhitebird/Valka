@@ -29,6 +29,8 @@ x-valka: &valka
     minio-init:
       condition: service_completed_successfully
   restart: unless-stopped
+  # A stop hands the node's shards to the others (or snapshots them); give it time.
+  stop_grace_period: 30s
   environment: &valka-env
     VALKA_STORAGE__BACKEND: s3
     VALKA_STORAGE__BUCKET: valka

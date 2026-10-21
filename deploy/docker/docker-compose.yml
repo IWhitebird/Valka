@@ -64,6 +64,8 @@ services:
       - "50051:50051"
       - "8989:8989"
     restart: unless-stopped
+    # A stop snapshots the node's shards (or hands them over); give it time.
+    stop_grace_period: 30s
 
 volumes:
   miniodata:

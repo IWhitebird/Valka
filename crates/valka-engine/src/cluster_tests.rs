@@ -602,3 +602,39 @@ async fn a_takeover_does_not_wait_out_claim_backoff() {
     .await;
     assert!(n2.engine.owns(shard));
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_claim_never_falls_back_past_an_unreadable_snapshot() {
+    // Found by the code review: a newest snapshot that would not decode (truncated, or
+    // written by a newer version) was skipped, and the claim went on from an older one or
+    // from an empty shard, dropping records whose log may already be gone.
+    let b = bucket();
+    let a = start(&b, "a").await;
+    a.engine.sync().await.unwrap();
+    a.engine.halt();
+    drop(a);
+    let shard = ShardId(5);
+    let generation = owners::get(&plain(&b), shard)
+        .await
+        .unwrap()
+        .unwrap()
+        .record
+        .generation;
+    let unreadable = valka_wal::snapshot::SnapshotKey {
+        shard,
+        generation,
+        seq: 1_000,
+        ptr: valka_wal::snapshot::LogPtr::Final,
+    };
+    plain(&b)
+        .put(&unreadable.key(), bytes::Bytes::from_static(b"garbage"))
+        .await
+        .unwrap();
+
+    let a2 = start(&b, "a").await;
+    assert!(
+        !a2.engine.owns(shard),
+        "refused, not served from older state"
+    );
+    assert_eq!(a2.engine.owned_shards().len(), SHARDS as usize - 1);
+}

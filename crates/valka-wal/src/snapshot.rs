@@ -179,25 +179,22 @@ pub async fn load<T: DeserializeOwned>(store: &Store, key: &SnapshotKey) -> Resu
     decode(&bytes)
 }
 
-/// Load the newest loadable snapshot among `candidates` (sorted oldest first) that passes
-/// `accept`. A corrupt newest snapshot falls back to the previous one.
+/// Load the newest snapshot among `candidates` (sorted oldest first) that passes `accept`.
+/// `Ok(None)` when none passes. The newest one failing to load (gone, or undecodable — say
+/// written by a newer version) is an error, never a reason to fall back to an older one:
+/// older state would silently drop records whose log may already be deleted.
 pub async fn load_newest_of<T: DeserializeOwned>(
     store: &Store,
     candidates: &[SnapshotKey],
     accept: impl Fn(&SnapshotKey) -> bool,
 ) -> Result<Option<(SnapshotKey, T)>, WalError> {
-    for key in candidates.iter().rev().filter(|k| accept(k)) {
-        let Some((bytes, _)) = store.get(&key.key()).await? else {
-            continue;
-        };
-        match decode::<T>(&bytes) {
-            Ok(state) => return Ok(Some((key.clone(), state))),
-            Err(e) => {
-                tracing::error!(key = %key.key(), error = %e, "corrupt snapshot, trying previous")
-            }
-        }
-    }
-    Ok(None)
+    let Some(key) = candidates.iter().rev().find(|k| accept(k)) else {
+        return Ok(None);
+    };
+    let state = load(store, key)
+        .await
+        .map_err(|e| WalError::Corrupt(format!("snapshot {}: {e}", key.key())))?;
+    Ok(Some((key.clone(), state)))
 }
 
 /// Load the newest snapshot of a shard. `Ok(None)` when the shard has never been served.
@@ -305,7 +302,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_latest_falls_back() {
+    async fn an_unreadable_newest_snapshot_is_an_error_not_a_fallback() {
         let s = Store::memory();
         let good = sk(1, 1, 1, LogPtr::Final);
         write(&s, &good, &"good".to_string()).await.unwrap();
@@ -313,8 +310,14 @@ mod tests {
         s.put(&bad.key(), Bytes::from_static(b"garbage"))
             .await
             .unwrap();
-        let (k, v): (SnapshotKey, String) = load_latest(&s, ShardId(1)).await.unwrap().unwrap();
-        assert_eq!(k, good);
-        assert_eq!(v, "good");
+        let err = load_latest::<String>(&s, ShardId(1)).await.unwrap_err();
+        assert!(err.to_string().contains(&bad.key()), "{err}");
+        // Candidates the caller rules out are not considered.
+        let (k, v): (SnapshotKey, String) =
+            load_newest_of(&s, &list(&s, ShardId(1)).await.unwrap(), |k| k.seq < 2)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!((k, v), (good, "good".to_string()));
     }
 }
