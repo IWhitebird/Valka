@@ -54,10 +54,12 @@ export interface TaskRun {
 }
 
 export interface TaskLog {
+  /** The entry's 1-based position in the run's log; pass it as `after_id` to page. */
   id: number;
   task_run_id: string;
   timestamp_ms: number;
-  level: number;
+  /** "DEBUG", "INFO", "WARN" or "ERROR". */
+  level: string;
   message: string;
   metadata: unknown | null;
 }

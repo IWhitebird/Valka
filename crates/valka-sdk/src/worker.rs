@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
+use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -163,16 +165,70 @@ pub struct ValkaWorker {
 /// acknowledged, and the current outbound channel.
 #[derive(Default)]
 struct Session {
-    /// task id -> the run this worker executes (sent in `WorkerHello.running` on every
-    /// connect, so the server can reattach it to the new connection's node).
+    /// task id -> the latest run of it this worker executes (sent in `WorkerHello.running`
+    /// on every connect, so the server can reattach it to the new connection's node). An
+    /// older run of the same task still finishing here is stale and never removes it.
     running: Mutex<HashMap<String, RunningTask>>,
+    /// task run id -> its result, until the server answers APPLIED or STALE.
     unacked: Mutex<HashMap<String, TaskResult>>,
-    signals: Mutex<HashMap<String, mpsc::Sender<TaskSignal>>>,
+    /// task id -> (run id, the run's signal channel).
+    signals: Mutex<HashMap<String, (String, mpsc::Sender<TaskSignal>)>>,
     outbound: Mutex<Option<mpsc::Sender<WorkerRequest>>>,
+    /// Handlers running or waiting for a slot whose result is not yet in `unacked`.
+    executing: AtomicUsize,
 }
 
 const RESULT_RETRY_DELAY: Duration = Duration::from_secs(1);
-const SHUTDOWN_ACK_WAIT: Duration = Duration::from_secs(5);
+/// How long a drain waits for the results of finished handlers to be acknowledged.
+const SHUTDOWN_ACK_WAIT: Duration = Duration::from_secs(10);
+const DRAIN_POLL: Duration = Duration::from_millis(50);
+/// Reconnect delay cap while draining: unacked results are waiting for a connection.
+const DRAIN_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+/// A graceful shutdown in progress. It outlives connections: a drain interrupted by a lost
+/// connection or a `ServerShutdown` carries on over the next node.
+struct Drain {
+    reason: String,
+    ack_wait: Duration,
+    /// When the last handler finished; its result then has `ack_wait` to be acknowledged.
+    idle_since: Option<Instant>,
+}
+
+impl Drain {
+    fn new(reason: &str) -> Self {
+        Self {
+            reason: reason.to_string(),
+            ack_wait: SHUTDOWN_ACK_WAIT,
+            idle_since: None,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DrainState {
+    /// Handlers are still running, or results still wait for their ack.
+    Busy,
+    /// Nothing runs and every result is acknowledged.
+    Done,
+    /// Results stayed unacknowledged for the whole ack wait.
+    GaveUp,
+}
+
+/// Counts a handler as executing until it is dropped (also when the handler panics).
+struct Executing(Arc<Session>);
+
+impl Executing {
+    fn new(session: Arc<Session>) -> Self {
+        session.executing.fetch_add(1, Ordering::SeqCst);
+        Self(session)
+    }
+}
+
+impl Drop for Executing {
+    fn drop(&mut self) {
+        self.0.executing.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 impl Session {
     async fn send(&self, request: WorkerRequest) {
@@ -202,7 +258,14 @@ impl Session {
                     );
                 }
                 self.unacked.lock().await.remove(&ack.task_run_id);
-                self.running.lock().await.remove(&ack.task_id);
+                // Only this run's entry: a newer run of the same task may be running here.
+                let mut running = self.running.lock().await;
+                if running
+                    .get(&ack.task_id)
+                    .is_some_and(|r| r.task_run_id == ack.task_run_id)
+                {
+                    running.remove(&ack.task_id);
+                }
             }
             ResultStatus::Retry | ResultStatus::Unspecified => {
                 let session = self.clone();
@@ -216,11 +279,46 @@ impl Session {
             }
         }
     }
+
+    /// Where a drain stands: handlers first, then their results' acks (bounded).
+    async fn drain_state(&self, drain: &mut Drain) -> DrainState {
+        if self.executing.load(Ordering::SeqCst) > 0 {
+            drain.idle_since = None;
+            return DrainState::Busy;
+        }
+        if self.unacked.lock().await.is_empty() {
+            return DrainState::Done;
+        }
+        let since = *drain.idle_since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= drain.ack_wait {
+            DrainState::GaveUp
+        } else {
+            DrainState::Busy
+        }
+    }
 }
 
 fn result_request(result: TaskResult) -> WorkerRequest {
     WorkerRequest {
         request: Some(worker_request::Request::TaskResult(result)),
+    }
+}
+
+fn shutdown_request(reason: &str) -> WorkerRequest {
+    WorkerRequest {
+        request: Some(worker_request::Request::Shutdown(GracefulShutdown {
+            reason: reason.to_string(),
+        })),
+    }
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }
 
@@ -235,31 +333,91 @@ impl ValkaWorker {
     }
 
     /// Run the worker event loop. Blocks until shutdown.
+    ///
+    /// A shutdown (Ctrl-C or the [`ShutdownHandle`]) drains: the server stops sending tasks,
+    /// running handlers finish and their results are acknowledged, then this returns. A
+    /// connection lost meanwhile is re-established (on the next node) and the drain goes on.
     pub async fn run(self) -> Result<(), SdkError> {
+        let notify = self.shutdown.clone();
+        let ctrl_c = tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                info!("SIGINT received, shutting down gracefully");
+                notify.notify_one();
+            }
+        });
+        let outcome = self.run_sessions().await;
+        ctrl_c.abort();
+        outcome
+    }
+
+    async fn run_sessions(&self) -> Result<(), SdkError> {
         let mut retry_policy = RetryPolicy::new();
+        let mut drain: Option<Drain> = None;
 
         loop {
-            match self.connect_and_run(&mut retry_policy).await {
+            let e = match self.connect_and_run(&mut retry_policy, &mut drain).await {
                 Ok(()) => {
-                    info!("Worker disconnected gracefully");
+                    info!("Worker drained and disconnected");
                     return Ok(());
                 }
-                Err(e) => {
-                    // Try the next node next time (any node takes any worker).
-                    self.next_addr.fetch_add(1, Ordering::Relaxed);
-                    let delay = retry_policy.next_delay();
-                    warn!(
-                        error = %e,
-                        retry_in_ms = delay.as_millis(),
-                        "Worker connection lost, reconnecting..."
-                    );
-                    tokio::time::sleep(delay).await;
+                Err(e) => e,
+            };
+            // Try the next node next time (any node takes any worker).
+            self.next_addr.fetch_add(1, Ordering::Relaxed);
+            let mut delay = retry_policy.next_delay();
+            if drain.is_some() {
+                delay = delay.min(DRAIN_RECONNECT_DELAY);
+            }
+            warn!(
+                error = %e,
+                retry_in_ms = delay.as_millis(),
+                "Worker connection lost, reconnecting..."
+            );
+            if self.wait_to_reconnect(delay, &mut drain).await {
+                info!("Worker drained while disconnected");
+                return Ok(());
+            }
+        }
+    }
+
+    /// Sleep before the next connection attempt. A shutdown requested meanwhile starts a
+    /// drain; returns true when the drain has nothing left to wait for.
+    async fn wait_to_reconnect(&self, delay: Duration, drain: &mut Option<Drain>) -> bool {
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        let mut poll = tokio::time::interval(DRAIN_POLL);
+        loop {
+            tokio::select! {
+                _ = &mut sleep => return false,
+                _ = self.shutdown.notified(), if drain.is_none() => {
+                    info!("Shutdown requested while disconnected, draining");
+                    *drain = Some(Drain::new("shutdown"));
+                    let soon = Instant::now() + DRAIN_RECONNECT_DELAY;
+                    if sleep.deadline() > soon {
+                        sleep.as_mut().reset(soon);
+                    }
+                }
+                _ = poll.tick(), if drain.is_some() => {}
+            }
+            if let Some(d) = drain.as_mut() {
+                match self.session.drain_state(d).await {
+                    DrainState::Busy => {}
+                    DrainState::Done => return true,
+                    DrainState::GaveUp => {
+                        warn!("results still unacknowledged after the drain's ack wait");
+                        return true;
+                    }
                 }
             }
         }
     }
 
-    async fn connect_and_run(&self, retry_policy: &mut RetryPolicy) -> Result<(), SdkError> {
+    /// One connection. `Ok` means a drain finished; any `Err` means reconnect.
+    async fn connect_and_run(
+        &self,
+        retry_policy: &mut RetryPolicy,
+        drain: &mut Option<Drain>,
+    ) -> Result<(), SdkError> {
         let addr =
             &self.server_addrs[self.next_addr.load(Ordering::Relaxed) % self.server_addrs.len()];
         let channel = connect_channel(addr, Duration::from_secs(10)).await?;
@@ -269,7 +427,6 @@ impl ValkaWorker {
         let response = client.session(ReceiverStream::new(request_rx)).await?;
         let mut inbound = response.into_inner();
 
-        retry_policy.reset();
         info!(worker_id = %self.worker_id, name = %self.name, "Connected to server");
 
         let hello = WorkerRequest {
@@ -293,6 +450,13 @@ impl ValkaWorker {
             .send(hello)
             .await
             .map_err(|_| SdkError::NotConnected)?;
+        // A drain carried over from an earlier connection: no new tasks on this one either.
+        if let Some(d) = drain.as_ref() {
+            request_tx
+                .send(shutdown_request(&d.reason))
+                .await
+                .map_err(|_| SdkError::NotConnected)?;
+        }
 
         // Register this connection before collecting unacked results: a result delivered
         // concurrently is then either in the snapshot below or sent on this connection.
@@ -329,39 +493,53 @@ impl ValkaWorker {
             }
         });
 
-        let mut draining: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = None;
+        let mut poll = tokio::time::interval(DRAIN_POLL);
+        let mut answered = false;
         let outcome = loop {
             tokio::select! {
                 msg = inbound.next() => {
                     match msg {
-                        Some(Ok(response)) => match response.response {
-                            Some(worker_response::Response::TaskAssignment(assignment)) => {
-                                self.start_task(assignment, client.clone()).await;
+                        Some(Ok(response)) => {
+                            // The server took the session: back off from scratch next time.
+                            if !answered {
+                                answered = true;
+                                retry_policy.reset();
                             }
-                            Some(worker_response::Response::TaskCancellation(cancel)) => {
-                                info!(task_id = %cancel.task_id, "Task cancelled by server");
-                                self.session.running.lock().await.remove(&cancel.task_id);
-                                self.session.signals.lock().await.remove(&cancel.task_id);
-                            }
-                            Some(worker_response::Response::TaskSignal(signal)) => {
-                                let tx = self.session.signals.lock().await.get(&signal.task_id).cloned();
-                                if let Some(tx) = tx
-                                    && tx.send(signal).await.is_err()
-                                {
-                                    warn!("Signal channel closed for task");
+                            match response.response {
+                                Some(worker_response::Response::TaskAssignment(assignment)) => {
+                                    self.start_task(assignment, client.clone()).await;
                                 }
+                                Some(worker_response::Response::TaskCancellation(cancel)) => {
+                                    info!(task_id = %cancel.task_id, "Task cancelled by server");
+                                    self.session.running.lock().await.remove(&cancel.task_id);
+                                    self.session.signals.lock().await.remove(&cancel.task_id);
+                                }
+                                Some(worker_response::Response::TaskSignal(signal)) => {
+                                    let tx = self
+                                        .session
+                                        .signals
+                                        .lock()
+                                        .await
+                                        .get(&signal.task_id)
+                                        .map(|(_, tx)| tx.clone());
+                                    if let Some(tx) = tx
+                                        && tx.send(signal).await.is_err()
+                                    {
+                                        warn!("Signal channel closed for task");
+                                    }
+                                }
+                                Some(worker_response::Response::ResultAck(ack)) => {
+                                    self.session.on_ack(ack).await;
+                                }
+                                Some(worker_response::Response::HeartbeatAck(_)) => {}
+                                Some(worker_response::Response::ServerShutdown(shutdown)) => {
+                                    // Reconnect to another node; a drain in progress goes on there.
+                                    info!(reason = %shutdown.reason, "Server shutting down");
+                                    break Err(SdkError::Connection("server shutting down".into()));
+                                }
+                                None => {}
                             }
-                            Some(worker_response::Response::ResultAck(ack)) => {
-                                self.session.on_ack(ack).await;
-                            }
-                            Some(worker_response::Response::HeartbeatAck(_)) => {}
-                            Some(worker_response::Response::ServerShutdown(shutdown)) => {
-                                info!(reason = %shutdown.reason, "Server shutting down");
-                                break Err(SdkError::Connection("server shutting down".into()));
-                            }
-                            None => {}
-                        },
-                        Some(Err(_)) | None if draining.is_some() => break Ok(()),
+                        }
                         Some(Err(e)) => {
                             error!(error = %e, "Stream error");
                             break Err(SdkError::Connection("stream error".into()));
@@ -372,16 +550,23 @@ impl ValkaWorker {
                         }
                     }
                 }
-                _ = async { draining.as_mut().expect("guarded").await }, if draining.is_some() => {
-                    break Ok(());
+                _ = self.shutdown.notified(), if drain.is_none() => {
+                    info!("Shutdown requested, draining gracefully");
+                    let d = Drain::new("shutdown");
+                    let _ = request_tx.send(shutdown_request(&d.reason)).await;
+                    *drain = Some(d);
                 }
-                _ = tokio::signal::ctrl_c(), if draining.is_none() => {
-                    info!("SIGINT received, shutting down gracefully");
-                    draining = Some(Box::pin(self.drain(request_tx.clone(), "SIGINT")));
-                }
-                _ = self.shutdown.notified(), if draining.is_none() => {
-                    info!("Shutdown requested via handle, draining gracefully");
-                    draining = Some(Box::pin(self.drain(request_tx.clone(), "shutdown_handle")));
+                _ = poll.tick(), if drain.is_some() => {
+                    if let Some(d) = drain.as_mut() {
+                        match self.session.drain_state(d).await {
+                            DrainState::Busy => {}
+                            DrainState::Done => break Ok(()),
+                            DrainState::GaveUp => {
+                                warn!("results still unacknowledged after the drain's ack wait");
+                                break Ok(());
+                            }
+                        }
+                    }
                 }
             }
         };
@@ -395,11 +580,14 @@ impl ValkaWorker {
     /// the spawned task, so cancels, signals and acks keep flowing at full capacity.
     async fn start_task(&self, assignment: TaskAssignment, rpc: WorkerServiceClient<AuthChannel>) {
         let task_id = assignment.task_id.clone();
+        let task_run_id = assignment.task_run_id.clone();
+        // A newer run replaces an older one of the same task still finishing here: that
+        // one is stale, and its result will be answered STALE.
         self.session.running.lock().await.insert(
             task_id.clone(),
             RunningTask {
                 task_id: task_id.clone(),
-                task_run_id: assignment.task_run_id.clone(),
+                task_run_id: task_run_id.clone(),
                 attempt_number: assignment.attempt_number,
             },
         );
@@ -408,7 +596,7 @@ impl ValkaWorker {
             .signals
             .lock()
             .await
-            .insert(task_id.clone(), sig_tx);
+            .insert(task_id.clone(), (task_run_id.clone(), sig_tx));
 
         // Logs and signal acks follow whichever connection is current, so a task that
         // outlives a reconnect keeps reporting.
@@ -423,59 +611,299 @@ impl ValkaWorker {
         let slots = self.slots.clone();
         let handler = self.handler.clone();
         let session = self.session.clone();
+        // Counted from now on, so a drain waits for tasks that still wait for a slot.
+        let executing = Executing::new(self.session.clone());
         tokio::spawn(async move {
+            let _executing = executing;
             let Ok(permit) = slots.acquire_owned().await else {
                 return;
             };
-            let task_run_id = assignment.task_run_id.clone();
             let ctx = TaskContext::new(assignment, request_tx, sig_rx, rpc);
-            let result = match handler(ctx).await {
-                Ok(output) => TaskResult {
-                    task_id: task_id.clone(),
-                    task_run_id,
-                    success: true,
-                    retryable: false,
-                    output: output.to_string(),
-                    error_message: String::new(),
-                },
-                Err(err) => TaskResult {
-                    task_id: task_id.clone(),
-                    task_run_id,
-                    success: false,
-                    retryable: true,
-                    output: String::new(),
-                    error_message: err,
-                },
+            let outcome = AssertUnwindSafe(async move { handler(ctx).await })
+                .catch_unwind()
+                .await;
+            let (success, output, error_message) = match outcome {
+                Ok(Ok(output)) => (true, output.to_string(), String::new()),
+                Ok(Err(err)) => (false, String::new(), err),
+                Err(panic) => {
+                    let msg = panic_message(panic.as_ref());
+                    error!(task_id = %task_id, panic = %msg, "Task handler panicked");
+                    (false, String::new(), format!("handler panicked: {msg}"))
+                }
             };
-            session.signals.lock().await.remove(&task_id);
+            let result = TaskResult {
+                task_id: task_id.clone(),
+                task_run_id: task_run_id.clone(),
+                success,
+                retryable: !success,
+                output,
+                error_message,
+            };
+            {
+                let mut signals = session.signals.lock().await;
+                if signals
+                    .get(&task_id)
+                    .is_some_and(|(run, _)| *run == task_run_id)
+                {
+                    signals.remove(&task_id);
+                }
+            }
             drop(permit);
+            // `_executing` drops after this: a drain never sees the handler gone before its
+            // result is in `unacked`.
             session.deliver(result).await;
         });
     }
+}
 
-    /// Stop receiving tasks, wait for in-flight handlers, then give their results a moment
-    /// to be acknowledged. The receive loop keeps running meanwhile, so acks arrive.
-    fn drain(
-        &self,
-        request_tx: mpsc::Sender<WorkerRequest>,
-        reason: &str,
-    ) -> impl Future<Output = ()> + Send + 'static {
-        let shutdown = WorkerRequest {
-            request: Some(worker_request::Request::Shutdown(GracefulShutdown {
-                reason: reason.to_string(),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use valka_proto::worker_service_server::{WorkerService, WorkerServiceServer};
+
+    fn running(task: &str, run: &str) -> RunningTask {
+        RunningTask {
+            task_id: task.into(),
+            task_run_id: run.into(),
+            attempt_number: 1,
+        }
+    }
+
+    fn result(task: &str, run: &str) -> TaskResult {
+        TaskResult {
+            task_id: task.into(),
+            task_run_id: run.into(),
+            success: true,
+            ..Default::default()
+        }
+    }
+
+    fn ack(task: &str, run: &str, status: ResultStatus) -> ResultAck {
+        ResultAck {
+            task_id: task.into(),
+            task_run_id: run.into(),
+            status: status as i32,
+            message: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_ack_of_an_older_run_leaves_the_newer_run_alone() {
+        let s = Arc::new(Session::default());
+        s.running
+            .lock()
+            .await
+            .insert("t".into(), running("t", "r2"));
+        s.deliver(result("t", "r1")).await;
+        s.on_ack(ack("t", "r1", ResultStatus::Stale)).await;
+        assert!(s.unacked.lock().await.is_empty());
+        assert_eq!(s.running.lock().await["t"].task_run_id, "r2");
+
+        s.deliver(result("t", "r2")).await;
+        s.on_ack(ack("t", "r2", ResultStatus::Applied)).await;
+        assert!(s.running.lock().await.is_empty());
+        assert!(s.unacked.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_drain_waits_for_handlers_then_acks() {
+        let s = Arc::new(Session::default());
+        let mut d = Drain::new("test");
+        d.ack_wait = Duration::from_millis(30);
+        assert_eq!(s.drain_state(&mut d).await, DrainState::Done);
+
+        let busy = Executing::new(s.clone());
+        assert_eq!(s.drain_state(&mut d).await, DrainState::Busy);
+        s.deliver(result("t", "r1")).await;
+        drop(busy);
+        assert_eq!(
+            s.drain_state(&mut d).await,
+            DrainState::Busy,
+            "waiting for the ack"
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(s.drain_state(&mut d).await, DrainState::GaveUp);
+
+        s.on_ack(ack("t", "r1", ResultStatus::Applied)).await;
+        assert_eq!(s.drain_state(&mut d).await, DrainState::Done);
+    }
+
+    /// A node that records what a worker sends it and answers with a script.
+    #[derive(Clone)]
+    struct FakeNode {
+        name: &'static str,
+        log: mpsc::UnboundedSender<(&'static str, WorkerRequest)>,
+        /// Sent right after the hello.
+        on_hello: Vec<WorkerResponse>,
+        /// Answer a GracefulShutdown with ServerShutdown and close the stream.
+        leave_on_drain: bool,
+    }
+
+    #[tonic::async_trait]
+    impl WorkerService for FakeNode {
+        type SessionStream = ReceiverStream<Result<WorkerResponse, tonic::Status>>;
+
+        async fn session(
+            &self,
+            request: tonic::Request<tonic::Streaming<WorkerRequest>>,
+        ) -> Result<tonic::Response<Self::SessionStream>, tonic::Status> {
+            let mut inbound = request.into_inner();
+            let (tx, rx) = mpsc::channel(64);
+            let node = self.clone();
+            tokio::spawn(async move {
+                while let Some(Ok(req)) = inbound.next().await {
+                    let _ = node.log.send((node.name, req.clone()));
+                    let reply = match req.request {
+                        Some(worker_request::Request::Hello(_)) => node.on_hello.clone(),
+                        Some(worker_request::Request::Shutdown(_)) if node.leave_on_drain => {
+                            let bye = worker_response::Response::ServerShutdown(ServerShutdown {
+                                reason: "restart".into(),
+                                drain_seconds: 0,
+                            });
+                            let _ = tx
+                                .send(Ok(WorkerResponse {
+                                    response: Some(bye),
+                                }))
+                                .await;
+                            return;
+                        }
+                        Some(worker_request::Request::TaskResult(r)) => {
+                            vec![WorkerResponse {
+                                response: Some(worker_response::Response::ResultAck(ack(
+                                    &r.task_id,
+                                    &r.task_run_id,
+                                    ResultStatus::Applied,
+                                ))),
+                            }]
+                        }
+                        _ => vec![],
+                    };
+                    for r in reply {
+                        let _ = tx.send(Ok(r)).await;
+                    }
+                }
+            });
+            Ok(tonic::Response::new(ReceiverStream::new(rx)))
+        }
+
+        async fn checkpoint(
+            &self,
+            _request: tonic::Request<CheckpointRequest>,
+        ) -> Result<tonic::Response<CheckpointResponse>, tonic::Status> {
+            Ok(tonic::Response::new(CheckpointResponse {}))
+        }
+    }
+
+    async fn serve(node: FakeNode) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(WorkerServiceServer::new(node))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        addr
+    }
+
+    /// A node restart in the middle of a drain: the worker moves to the next node, tells it
+    /// it is draining, lists its running task, delivers the result there and only then stops.
+    #[tokio::test]
+    async fn a_drain_survives_a_server_shutdown() {
+        let (log, mut seen) = mpsc::unbounded_channel();
+        let assignment = WorkerResponse {
+            response: Some(worker_response::Response::TaskAssignment(TaskAssignment {
+                task_id: "t1".into(),
+                task_run_id: "r1".into(),
+                attempt_number: 1,
+                ..Default::default()
             })),
         };
-        let slots = self.slots.clone();
-        let all_slots = self.concurrency.max(1) as u32;
-        let session = self.session.clone();
-        async move {
-            let _ = request_tx.send(shutdown).await;
-            let _ = slots.acquire_many(all_slots).await;
-            let deadline = tokio::time::Instant::now() + SHUTDOWN_ACK_WAIT;
-            while !session.unacked.lock().await.is_empty() && tokio::time::Instant::now() < deadline
-            {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+        let a = serve(FakeNode {
+            name: "a",
+            log: log.clone(),
+            on_hello: vec![assignment],
+            leave_on_drain: true,
+        })
+        .await;
+        let b = serve(FakeNode {
+            name: "b",
+            log,
+            on_hello: vec![],
+            leave_on_drain: false,
+        })
+        .await;
+
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (s, r) = (started.clone(), release.clone());
+        let worker = ValkaWorker::builder()
+            .server_addrs(&[format!("http://{a}"), format!("http://{b}")])
+            .queues(&["q"])
+            .handler(move |_ctx| {
+                let (s, r) = (s.clone(), r.clone());
+                async move {
+                    s.notify_one();
+                    r.notified().await;
+                    Ok(serde_json::json!({"ok": true}))
+                }
+            })
+            .build()
+            .await
+            .unwrap();
+        let stop = worker.shutdown_handle();
+        let run = tokio::spawn(worker.run_sessions_for_test());
+
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("the task starts");
+        stop.shutdown();
+
+        // Node b hears the hello (listing the running task) and the drain.
+        let mut on_b = Vec::new();
+        while on_b.len() < 2 {
+            let (node, req) = tokio::time::timeout(Duration::from_secs(5), seen.recv())
+                .await
+                .expect("the worker reaches node b")
+                .unwrap();
+            if node == "b" {
+                on_b.push(req);
             }
+        }
+        let Some(worker_request::Request::Hello(hello)) = &on_b[0].request else {
+            panic!("hello first, got {:?}", on_b[0]);
+        };
+        assert_eq!(hello.running.len(), 1);
+        assert_eq!(hello.running[0].task_run_id, "r1");
+        assert!(matches!(
+            on_b[1].request,
+            Some(worker_request::Request::Shutdown(_))
+        ));
+        assert!(
+            !run.is_finished(),
+            "the drain waits for the running handler"
+        );
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the worker stops once the result is acknowledged")
+            .unwrap()
+            .unwrap();
+        let mut results = Vec::new();
+        while let Ok((node, req)) = seen.try_recv() {
+            if let Some(worker_request::Request::TaskResult(r)) = req.request {
+                results.push((node, r.task_run_id));
+            }
+        }
+        assert_eq!(results, vec![("b", "r1".to_string())]);
+    }
+
+    impl ValkaWorker {
+        /// `run` without the process-wide Ctrl-C listener.
+        async fn run_sessions_for_test(self) -> Result<(), SdkError> {
+            self.run_sessions().await
         }
     }
 }

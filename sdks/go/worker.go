@@ -34,18 +34,28 @@ type ValkaWorker struct {
 	metadata    map[string]interface{}
 	handler     TaskHandler
 
-	semaphore      chan struct{}
-	activeTasks    sync.Map
+	semaphore chan struct{}
+	// Per-task maps hold the latest run of each task. An older run of the same task still
+	// finishing here is stale (the server starts a new run only after the old one ended),
+	// so its cleanup compares before deleting and never removes the newer run.
+	activeTasks    sync.Map // task_id -> *runState
 	runs           sync.Map // task_id -> *pb.RunningTask, sent in WorkerHello on every connect
 	signalChannels sync.Map // task_id -> chan *pb.TaskSignal
 	unacked        sync.Map // task_run_id -> *pb.TaskResult, kept until APPLIED or STALE
 	clientMu       sync.RWMutex
 	client         pb.WorkerServiceClient // current session's client, nil between sessions
-	wg             sync.WaitGroup
+	executing      atomic.Int64           // handlers running or waiting for a slot
 	shuttingDown   bool
 	shutdownMu     sync.Mutex
-	shutdownCh     chan struct{}
+	drainCh        chan struct{} // closed when a graceful shutdown starts
+	shutdownCh     chan struct{} // closed when the drain is over
 	sendCh         chan *pb.WorkerRequest
+}
+
+// runState is one run executing on this worker.
+type runState struct {
+	runID  string
+	cancel context.CancelFunc
 }
 
 // NewWorker creates a new ValkaWorker with functional options.
@@ -76,48 +86,50 @@ func NewWorker(opts ...WorkerOption) (*ValkaWorker, error) {
 		metadata:    cfg.metadata,
 		handler:     cfg.handler,
 		semaphore:   make(chan struct{}, cfg.concurrency),
+		drainCh:     make(chan struct{}),
 		shutdownCh:  make(chan struct{}),
 		sendCh:      make(chan *pb.WorkerRequest, 256),
 	}, nil
 }
 
 // Run starts the worker. Blocks until shutdown or unrecoverable error.
+//
+// Shutdown (or SIGINT/SIGTERM) drains: the server stops sending tasks, running handlers
+// finish and their results are acknowledged, then Run returns. A connection lost meanwhile
+// is re-established (on the next node) and the drain goes on there.
 func (w *ValkaWorker) Run(ctx context.Context) error {
 	// Handle OS signals
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	runDone := make(chan struct{})
+	defer close(runDone)
 	go func() {
 		select {
 		case <-sigCh:
 			w.Shutdown()
 		case <-w.shutdownCh:
+		case <-runDone:
 		}
 	}()
 
 	retry := DefaultRetryPolicy()
 	for {
-		w.shutdownMu.Lock()
-		done := w.shuttingDown
-		w.shutdownMu.Unlock()
-		if done {
+		if w.drained() {
 			return nil
 		}
 
-		err := w.session(ctx)
-		if err == nil {
-			return nil
-		}
-
-		w.shutdownMu.Lock()
-		done = w.shuttingDown
-		w.shutdownMu.Unlock()
-		if done {
+		err := w.session(ctx, retry)
+		if w.drained() {
 			return nil
 		}
 
 		// Next time, try the next node: any node takes any worker.
 		w.nextAddr.Add(1)
 		delay := retry.NextDelay()
+		if w.draining() && delay > drainReconnectDelay {
+			delay = drainReconnectDelay
+		}
 		log.Printf("[valka] Connection lost (%v), reconnecting in %v", err, delay)
 		select {
 		case <-time.After(delay):
@@ -129,7 +141,9 @@ func (w *ValkaWorker) Run(ctx context.Context) error {
 	}
 }
 
-// Shutdown initiates graceful shutdown.
+// Shutdown initiates graceful shutdown and blocks until the drain is over: the server is
+// told to send no more tasks (on the current connection and any later one), running
+// handlers get up to 30s to finish, and their results up to 10s more to be acknowledged.
 func (w *ValkaWorker) Shutdown() {
 	w.shutdownMu.Lock()
 	if w.shuttingDown {
@@ -137,45 +151,64 @@ func (w *ValkaWorker) Shutdown() {
 		return
 	}
 	w.shuttingDown = true
+	// Never blocks: the session's sender sends the GracefulShutdown.
+	close(w.drainCh)
 	w.shutdownMu.Unlock()
 
 	log.Println("[valka] Shutting down, draining active tasks...")
 
-	// Send graceful shutdown message
-	w.sendCh <- &pb.WorkerRequest{
-		Request: &pb.WorkerRequest_Shutdown{
-			Shutdown: &pb.GracefulShutdown{
-				Reason: "client shutdown",
-			},
-		},
+	deadline := time.Now().Add(drainTimeout)
+	for w.executing.Load() > 0 && time.Now().Before(deadline) {
+		time.Sleep(drainPoll)
 	}
-
-	// Wait up to 30s for active tasks to drain; the session keeps receiving meanwhile, so
-	// their results can still be acknowledged.
-	done := make(chan struct{})
-	go func() {
-		w.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		log.Println("[valka] All tasks drained")
-	case <-time.After(30 * time.Second):
+	if w.executing.Load() > 0 {
 		log.Println("[valka] Drain timeout, forcing shutdown")
+	} else {
+		log.Println("[valka] All tasks drained")
 	}
 
-	deadline := time.Now().Add(shutdownAckWait)
-	for w.unackedCount() > 0 && time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
+	ackDeadline := time.Now().Add(shutdownAckWait)
+	for w.unackedCount() > 0 && time.Now().Before(ackDeadline) {
+		time.Sleep(drainPoll)
 	}
 
 	close(w.shutdownCh)
 }
 
+// draining reports whether a graceful shutdown has started.
+func (w *ValkaWorker) draining() bool {
+	select {
+	case <-w.drainCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// drained reports whether the graceful shutdown is over.
+func (w *ValkaWorker) drained() bool {
+	select {
+	case <-w.shutdownCh:
+		return true
+	default:
+		return false
+	}
+}
+
+func shutdownRequest() *pb.WorkerRequest {
+	return &pb.WorkerRequest{
+		Request: &pb.WorkerRequest_Shutdown{
+			Shutdown: &pb.GracefulShutdown{Reason: "client shutdown"},
+		},
+	}
+}
+
 const (
-	resultRetryDelay = time.Second
-	shutdownAckWait  = 5 * time.Second
+	resultRetryDelay    = time.Second
+	drainTimeout        = 30 * time.Second
+	shutdownAckWait     = 10 * time.Second
+	drainPoll           = 50 * time.Millisecond
+	drainReconnectDelay = time.Second
 )
 
 func resultRequest(result *pb.TaskResult) *pb.WorkerRequest {
@@ -247,7 +280,7 @@ func (w *ValkaWorker) handleResultAck(ack *pb.ResultAck) {
 	}
 }
 
-func (w *ValkaWorker) session(ctx context.Context) error {
+func (w *ValkaWorker) session(ctx context.Context, retry *RetryPolicy) error {
 	addr := w.serverAddrs[w.nextAddr.Load()%uint64(len(w.serverAddrs))]
 	dialOpts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -285,6 +318,14 @@ func (w *ValkaWorker) session(ctx context.Context) error {
 	if err := stream.Send(w.helloRequest()); err != nil {
 		return NewConnectionError("failed to send hello", err)
 	}
+	// A drain carried over from an earlier connection: no new tasks on this one either.
+	drainSent := false
+	if w.draining() {
+		if err := stream.Send(shutdownRequest()); err != nil {
+			return NewConnectionError("failed to send shutdown", err)
+		}
+		drainSent = true
+	}
 
 	log.Printf("[valka] Connected as %s (id=%s, queues=%v, concurrency=%d)",
 		w.name, w.workerID, w.queues, w.concurrency)
@@ -293,26 +334,44 @@ func (w *ValkaWorker) session(ctx context.Context) error {
 	senderCtx, senderCancel := context.WithCancel(ctx)
 	defer senderCancel()
 
-	go w.senderLoop(senderCtx, stream)
+	go w.senderLoop(senderCtx, stream, drainSent)
 	go w.heartbeatLoop(senderCtx)
 	w.resendUnacked()
 
+	answered := false
 	for {
 		resp, err := stream.Recv()
 		if err != nil {
 			return NewConnectionError("stream receive error", err)
 		}
+		// The server took the session: back off from scratch after it ends.
+		if !answered {
+			answered = true
+			retry.Reset()
+		}
 		if stopping := w.handleResponse(ctx, resp); stopping {
+			// Reconnect to another node; a drain in progress goes on there.
 			return NewConnectionError("server shutting down", nil)
 		}
 	}
 }
 
-func (w *ValkaWorker) senderLoop(ctx context.Context, stream pb.WorkerService_SessionClient) {
+func (w *ValkaWorker) senderLoop(ctx context.Context, stream pb.WorkerService_SessionClient, drainSent bool) {
+	drain := w.drainCh
+	if drainSent {
+		drain = nil
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-drain:
+			// A shutdown started during this connection: tell the server once.
+			drain = nil
+			if err := stream.Send(shutdownRequest()); err != nil {
+				log.Printf("[valka] Send error: %v", err)
+				return
+			}
 		case msg, ok := <-w.sendCh:
 			if !ok {
 				return
@@ -347,13 +406,20 @@ func (w *ValkaWorker) heartbeatLoop(ctx context.Context) {
 			})
 			w.resendUnacked()
 
-			w.sendCh <- &pb.WorkerRequest{
+			hb := &pb.WorkerRequest{
 				Request: &pb.WorkerRequest_Heartbeat{
 					Heartbeat: &pb.Heartbeat{
 						ActiveTaskIds: activeIDs,
 						TimestampMs:   time.Now().UnixMilli(),
 					},
 				},
+			}
+			select {
+			case w.sendCh <- hb:
+			case <-ctx.Done():
+				return
+			case <-w.shutdownCh:
+				return
 			}
 		}
 	}
@@ -380,10 +446,6 @@ func (w *ValkaWorker) handleResponse(ctx context.Context, resp *pb.WorkerRespons
 }
 
 func (w *ValkaWorker) handleTaskSignal(signal *pb.TaskSignal) {
-	if ch, ok := w.activeTasks.Load(signal.TaskId); ok {
-		// activeTasks stores cancel funcs for cancellation, and signalChannels for signals
-		_ = ch // cancel func stored here
-	}
 	if sigCh, ok := w.signalChannels.Load(signal.TaskId); ok {
 		select {
 		case sigCh.(chan *pb.TaskSignal) <- signal:
@@ -395,30 +457,38 @@ func (w *ValkaWorker) handleTaskSignal(signal *pb.TaskSignal) {
 }
 
 func (w *ValkaWorker) handleTaskAssignment(ctx context.Context, assignment *pb.TaskAssignment) {
-	w.wg.Add(1)
+	// Counted from now on, so a drain waits for tasks that still wait for a slot.
+	w.executing.Add(1)
 
 	taskCtx, taskCancel := context.WithCancel(ctx)
-	w.activeTasks.Store(assignment.TaskId, taskCancel)
-	w.runs.Store(assignment.TaskId, &pb.RunningTask{
+	state := &runState{runID: assignment.TaskRunId, cancel: taskCancel}
+	if prev, loaded := w.activeTasks.Swap(assignment.TaskId, state); loaded {
+		// An older run of this task is still here: it is stale, stop it.
+		prev.(*runState).cancel()
+	}
+	run := &pb.RunningTask{
 		TaskId:        assignment.TaskId,
 		TaskRunId:     assignment.TaskRunId,
 		AttemptNumber: assignment.AttemptNumber,
-	})
+	}
+	w.runs.Store(assignment.TaskId, run)
 
 	// Create signal channel for this task
 	sigCh := make(chan *pb.TaskSignal, 64)
 	w.signalChannels.Store(assignment.TaskId, sigCh)
 
 	go func() {
+		// Runs last: the result is in unacked before the handler stops counting.
+		defer w.executing.Add(-1)
 		// Take the slot here, not in the receive loop, so acks, signals and cancels keep
 		// flowing while the worker is at capacity.
 		w.semaphore <- struct{}{}
 		defer func() {
 			<-w.semaphore
-			w.activeTasks.Delete(assignment.TaskId)
-			w.runs.Delete(assignment.TaskId)
-			w.signalChannels.Delete(assignment.TaskId)
-			w.wg.Done()
+			// Only this run's entries: a newer run of the same task may have replaced them.
+			w.activeTasks.CompareAndDelete(assignment.TaskId, state)
+			w.runs.CompareAndDelete(assignment.TaskId, run)
+			w.signalChannels.CompareAndDelete(assignment.TaskId, sigCh)
 		}()
 
 		w.executeTask(taskCtx, taskCancel, assignment, sigCh)
@@ -426,9 +496,9 @@ func (w *ValkaWorker) handleTaskAssignment(ctx context.Context, assignment *pb.T
 }
 
 func (w *ValkaWorker) handleTaskCancellation(cancellation *pb.TaskCancellation) {
-	if cancelFn, ok := w.activeTasks.Load(cancellation.TaskId); ok {
+	if v, ok := w.activeTasks.Load(cancellation.TaskId); ok {
 		log.Printf("[valka] Task %s cancelled: %s", cancellation.TaskId, cancellation.Reason)
-		cancelFn.(context.CancelFunc)()
+		v.(*runState).cancel()
 	}
 }
 

@@ -65,7 +65,9 @@ type TaskRun struct {
 
 // TaskLog represents a log entry for a task run.
 type TaskLog struct {
-	ID          string          `json:"id"`
+	// ID is the entry's 1-based position in the run's log; pass it as GetRunLogsParams.AfterID
+	// to page.
+	ID          int64           `json:"id"`
 	TaskRunID   string          `json:"task_run_id"`
 	TimestampMs int64           `json:"timestamp_ms"`
 	Level       string          `json:"level"`
@@ -149,6 +151,7 @@ type ListDeadLettersParams struct {
 
 // GetRunLogsParams are query parameters for getting run logs.
 type GetRunLogsParams struct {
-	Limit   int
-	AfterID string
+	Limit int
+	// AfterID returns only entries after this TaskLog.ID (0 = from the start).
+	AfterID int64
 }

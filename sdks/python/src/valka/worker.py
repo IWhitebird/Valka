@@ -24,7 +24,13 @@ logger = logging.getLogger("valka.worker")
 TaskHandler = Callable[[TaskContext], Awaitable[Any]]
 
 RESULT_RETRY_DELAY = 1.0
-SHUTDOWN_ACK_WAIT = 5.0
+# A drain gives running handlers DRAIN_TIMEOUT to finish, then their results
+# SHUTDOWN_ACK_WAIT to be acknowledged.
+DRAIN_TIMEOUT = 30.0
+SHUTDOWN_ACK_WAIT = 10.0
+DRAIN_POLL = 0.05
+# Reconnect delay cap while draining: results are waiting for a connection.
+DRAIN_RECONNECT_DELAY = 1.0
 
 
 class ValkaWorker:
@@ -70,17 +76,28 @@ class ValkaWorker:
         self._handler = handler
 
         self._semaphore = asyncio.Semaphore(concurrency)
+        # Per-task state holds the latest run of each task. An older run of the same task
+        # still finishing here is stale (the server starts a new run only after the old one
+        # ended): it is stopped, and its cleanup never removes the newer run's state.
         self._active_tasks: dict[str, asyncio.Task[None]] = {}
         # Runs still executing, by task id: listed in every WorkerHello so the server can
         # reattach them to the new connection (or adopt or cancel them).
         self._runs: dict[str, tuple[str, int]] = {}
         self._task_contexts: dict[str, TaskContext] = {}
+        # Handlers running or waiting for a slot, until their result is in _unacked.
+        self._executing = 0
+        # Runs the server cancelled (their handler is being stopped) and runs whose handler
+        # is over and whose result is being delivered (no longer cancellable).
+        self._cancelled_runs: set[str] = set()
+        self._delivering: set[str] = set()
         # task_run_id -> TaskResult, kept until the server answers APPLIED or STALE.
         self._unacked: dict[str, Any] = {}
         self._server_stopping = False
         self._stub: Any = None
         self._shutting_down = False
-        self._shutdown_event = asyncio.Event()
+        # Set once a graceful shutdown is over: run() then returns.
+        self._drained = asyncio.Event()
+        # The current session's stream, set only once its WorkerHello is written.
         self._stream: grpc.aio.StreamStreamCall | None = None  # type: ignore[type-arg]
 
     @staticmethod
@@ -115,34 +132,53 @@ class ValkaWorker:
         )
 
     async def run(self) -> None:
-        """Start the worker. Blocks until shutdown or unrecoverable error."""
+        """Start the worker. Blocks until a graceful shutdown is over.
+
+        A shutdown (SIGINT, SIGTERM or :meth:`shutdown`) drains: the server stops sending
+        tasks, running handlers finish and their results are acknowledged. A connection
+        lost meanwhile is re-established (on the next node) and the drain goes on there.
+        """
         loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
+        signals = (signal.SIGINT, signal.SIGTERM)
+        for sig in signals:
             loop.add_signal_handler(sig, lambda: asyncio.ensure_future(self.shutdown()))
 
         retry = RetryPolicy()
-        while not self._shutting_down:
-            try:
-                await self._session(retry)
-            except Exception as exc:
-                if self._shutting_down:
-                    break
-                # Next time, try the next node: any node takes any worker.
-                self._next_addr += 1
-                delay = retry.next_delay_seconds()
-                logger.warning("Connection lost (%s), reconnecting in %.1fs", exc, delay)
-                await asyncio.sleep(delay)
+        try:
+            while not self._drained.is_set():
+                try:
+                    await self._session(retry)
+                except Exception as exc:
+                    if self._drained.is_set():
+                        break
+                    # Next time, try the next node: any node takes any worker.
+                    self._next_addr += 1
+                    delay = retry.next_delay_seconds()
+                    if self._shutting_down:
+                        delay = min(delay, DRAIN_RECONNECT_DELAY)
+                    logger.warning("Connection lost (%s), reconnecting in %.1fs", exc, delay)
+                    try:
+                        await asyncio.wait_for(self._drained.wait(), timeout=delay)
+                    except asyncio.TimeoutError:
+                        pass
+        finally:
+            for sig in signals:
+                loop.remove_signal_handler(sig)
 
     async def shutdown(self) -> None:
         """Initiate graceful shutdown: stop receiving tasks, let in-flight tasks finish and
-        their results be acknowledged, then close the session."""
+        their results be acknowledged, then close the session.
+
+        The drain outlives connections: a session that ends meanwhile is re-established and
+        told about the drain again."""
         if self._shutting_down:
             return
         self._shutting_down = True
-        logger.info("Shutting down, draining %d active tasks...", len(self._active_tasks))
+        logger.info("Shutting down, draining %d active tasks...", self._executing)
         from valka._proto.valka.v1 import worker_pb2
 
         try:
+            # The current session, if any; a later one sends its own after its hello.
             await self._send(
                 worker_pb2.WorkerRequest(
                     shutdown=worker_pb2.GracefulShutdown(reason="client shutdown")
@@ -151,27 +187,29 @@ class ValkaWorker:
         except Exception:
             logger.warning("Could not notify the server of the shutdown", exc_info=True)
 
-        if self._active_tasks:
-            tasks = list(self._active_tasks.values())
-            try:
-                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=30)
-            except asyncio.TimeoutError:
-                logger.warning("Drain timeout, cancelling %d tasks", len(self._active_tasks))
-                for task in self._active_tasks.values():
-                    task.cancel()
+        # Also waits for tasks the server sent before it saw the shutdown.
+        deadline = time.monotonic() + DRAIN_TIMEOUT
+        while self._executing and time.monotonic() < deadline:
+            await asyncio.sleep(DRAIN_POLL)
+        if self._executing:
+            logger.warning("Drain timeout, cancelling %d tasks", self._executing)
+            for task in list(self._active_tasks.values()):
+                task.cancel()
 
         deadline = time.monotonic() + SHUTDOWN_ACK_WAIT
         while self._unacked and time.monotonic() < deadline:
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(DRAIN_POLL)
 
+        self._drained.set()
         if self._stream is not None:
             try:
                 await self._stream.done_writing()
             except Exception:
                 logger.debug("Session already closed", exc_info=True)
-        self._shutdown_event.set()
 
     async def _session(self, retry: RetryPolicy) -> None:
+        """One connection. Returns once a drain is over; raises when the session ends
+        otherwise (the caller reconnects)."""
         from valka._proto.valka.v1 import worker_pb2, worker_pb2_grpc
 
         channel = grpc.aio.insecure_channel(
@@ -183,14 +221,24 @@ class ValkaWorker:
         )
 
         try:
-            self._stub = worker_pb2_grpc.WorkerServiceStub(channel)
-            self._stream = self._stub.Session(metadata=self._call_metadata)
+            stub = worker_pb2_grpc.WorkerServiceStub(channel)
+            stream = stub.Session(metadata=self._call_metadata)
 
-            await self._stream.write(self._hello())
+            await stream.write(self._hello())
+            if self._shutting_down:
+                # A drain carried over from an earlier session: no new tasks here either.
+                await stream.write(
+                    worker_pb2.WorkerRequest(
+                        shutdown=worker_pb2.GracefulShutdown(reason="client shutdown")
+                    )
+                )
+            # Register this session before resending unacked results: a result delivered
+            # concurrently is then either in the snapshot below or sent on this session.
+            self._stub = stub
+            self._stream = stream
             for result in list(self._unacked.values()):
-                await self._stream.write(worker_pb2.WorkerRequest(task_result=result))
+                await stream.write(worker_pb2.WorkerRequest(task_result=result))
 
-            retry.reset()
             logger.info(
                 "Connected as %s (id=%s, queues=%s, concurrency=%d)",
                 self._name,
@@ -203,9 +251,17 @@ class ValkaWorker:
             heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
             self._server_stopping = False
+            answered = False
             try:
-                async for response in self._stream:
-                    await self._handle_response(response)
+                async for response in stream:
+                    if not answered:
+                        # The server took the session: back off from scratch after it ends.
+                        answered = True
+                        retry.reset()
+                    try:
+                        await self._handle_response(response)
+                    except Exception:
+                        logger.exception("Could not handle a message from the server")
                     if self._server_stopping:
                         break
             finally:
@@ -215,16 +271,20 @@ class ValkaWorker:
                 except asyncio.CancelledError:
                     pass
         finally:
-            await channel.close()
             self._stream = None
             self._stub = None
-        if self._server_stopping and not self._shutting_down:
+            await channel.close()
+        if self._drained.is_set():
+            return
+        if self._server_stopping:
+            # Reconnect to another node; a drain in progress goes on there.
             raise ConnectionError("server shutting down")
+        raise ConnectionError("the server closed the session")
 
     async def _heartbeat_loop(self) -> None:
         from valka._proto.valka.v1 import worker_pb2
 
-        while not self._shutting_down:
+        while not self._drained.is_set():
             await asyncio.sleep(10)
             if self._stream is None:
                 break
@@ -314,20 +374,47 @@ class ValkaWorker:
         )
 
     async def _handle_task_assignment(self, assignment: Any) -> None:
-        self._runs[assignment.task_id] = (assignment.task_run_id, assignment.attempt_number)
+        task_id, run_id = assignment.task_id, assignment.task_run_id
+        previous = self._active_tasks.get(task_id)
+        if previous is not None and not previous.done():
+            # An older run of this task is still here: it is stale, stop it.
+            previous.cancel()
+        self._runs[task_id] = (run_id, assignment.attempt_number)
+        self._executing += 1
         task = asyncio.create_task(self._execute_task(assignment))
-        self._active_tasks[assignment.task_id] = task
-        task.add_done_callback(lambda _t: self._task_done(assignment.task_id))
+        self._active_tasks[task_id] = task
+        task.add_done_callback(lambda t: self._task_done(task_id, run_id, t))
 
     def _handle_task_signal(self, signal: Any) -> None:
         ctx = self._task_contexts.get(signal.task_id)
         if ctx is not None:
             ctx._deliver_signal(signal)
 
-    def _task_done(self, task_id: str) -> None:
-        self._active_tasks.pop(task_id, None)
-        self._runs.pop(task_id, None)
-        self._task_contexts.pop(task_id, None)
+    def _handle_task_cancellation(self, cancellation: Any) -> None:
+        """The server cancelled the task (or found its run stale): stop the handler and
+        report it, so the server frees the slot. The run is no longer listed on reconnect."""
+        task_id = cancellation.task_id
+        logger.info("Task %s cancelled by the server: %s", task_id, cancellation.reason)
+        run = self._runs.pop(task_id, None)
+        task = self._active_tasks.get(task_id)
+        if run is None or task is None or task.done() or run[0] in self._delivering:
+            return
+        self._cancelled_runs.add(run[0])
+        task.cancel()
+
+    def _task_done(self, task_id: str, run_id: str, task: asyncio.Task[None]) -> None:
+        self._executing -= 1
+        self._cancelled_runs.discard(run_id)
+        # Only this run's state: a newer run of the same task may have replaced it.
+        if self._active_tasks.get(task_id) is task:
+            del self._active_tasks[task_id]
+        if self._runs.get(task_id, ("",))[0] == run_id:
+            del self._runs[task_id]
+        ctx = self._task_contexts.get(task_id)
+        if ctx is not None and ctx.task_run_id == run_id:
+            del self._task_contexts[task_id]
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("Task %s run %s crashed", task_id, run_id, exc_info=task.exception())
 
     async def _execute_task(self, assignment: Any) -> None:
         from valka._proto.valka.v1 import worker_pb2
@@ -356,7 +443,7 @@ class ValkaWorker:
             attempt_number=assignment.attempt_number,
             raw_input=assignment.input,
             raw_metadata=assignment.metadata,
-            send_fn=self._send,
+            send_fn=self._send_best_effort,
             checkpoints={c.step: c.output for c in assignment.checkpoints},
             checkpoint_fn=checkpoint,
         )
@@ -366,37 +453,61 @@ class ValkaWorker:
         retryable = True
         output = ""
         error_message = ""
+        run_id = assignment.task_run_id
 
-        # The slot is taken here, not in the receive loop, so acks, signals and
-        # cancellations keep flowing while the worker is at capacity.
-        async with self._semaphore:
-            try:
-                result = await self._handler(ctx)
-                success = True
-                if result is not None:
-                    output = json.dumps(result) if not isinstance(result, str) else result
-            except HandlerError as exc:
-                retryable = exc.retryable
-                error_message = str(exc)
-                logger.warning("Task %s handler error: %s", assignment.task_id, exc)
-            except Exception as exc:
-                error_message = str(exc)
-                logger.warning("Task %s failed: %s", assignment.task_id, exc)
+        try:
+            # The slot is taken here, not in the receive loop, so acks, signals and
+            # cancellations keep flowing while the worker is at capacity.
+            async with self._semaphore:
+                try:
+                    result = await self._handler(ctx)
+                    success = True
+                    if result is not None:
+                        output = json.dumps(result) if not isinstance(result, str) else result
+                except HandlerError as exc:
+                    retryable = exc.retryable
+                    error_message = str(exc)
+                    logger.warning("Task %s handler error: %s", assignment.task_id, exc)
+                except Exception as exc:
+                    error_message = str(exc)
+                    logger.warning("Task %s failed: %s", assignment.task_id, exc)
+        except asyncio.CancelledError:
+            if run_id not in self._cancelled_runs:
+                raise  # superseded by a newer run, or the drain timed out: no result
+            # Cancelled by the server: say so, which frees the run's slot there.
+            current = asyncio.current_task()
+            if current is not None and hasattr(current, "uncancel"):
+                current.uncancel()
+            success, retryable, output = False, False, ""
+            error_message = "cancelled by the server"
 
-        await self._deliver(
-            worker_pb2.TaskResult(
-                task_id=assignment.task_id,
-                task_run_id=assignment.task_run_id,
-                success=success,
-                retryable=retryable,
-                output=output,
-                error_message=error_message,
+        # The handler is over: a cancellation can no longer interrupt the delivery.
+        self._delivering.add(run_id)
+        try:
+            await self._deliver(
+                worker_pb2.TaskResult(
+                    task_id=assignment.task_id,
+                    task_run_id=run_id,
+                    success=success,
+                    retryable=retryable,
+                    output=output,
+                    error_message=error_message,
+                )
             )
-        )
+        finally:
+            self._delivering.discard(run_id)
 
     async def _send(self, request: Any) -> None:
         if self._stream is not None:
             await self._stream.write(request)
+
+    async def _send_best_effort(self, request: Any) -> None:
+        """Logs and signal acks: dropped while the session is down, never an error for the
+        handler (a dropped signal ack is redelivered by the server)."""
+        try:
+            await self._send(request)
+        except Exception:
+            logger.debug("Dropped a message: the session is down", exc_info=True)
 
 
 class ValkaWorkerBuilder:

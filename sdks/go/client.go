@@ -160,8 +160,8 @@ func (c *ValkaClient) GetRunLogs(taskID, runID string, params GetRunLogsParams) 
 	if params.Limit > 0 {
 		query.Set("limit", strconv.Itoa(params.Limit))
 	}
-	if params.AfterID != "" {
-		query.Set("after_id", params.AfterID)
+	if params.AfterID > 0 {
+		query.Set("after_id", strconv.FormatInt(params.AfterID, 10))
 	}
 	var logs []TaskLog
 	if err := c.get(fmt.Sprintf("/api/v1/tasks/%s/runs/%s/logs", taskID, runID), query, &logs); err != nil {

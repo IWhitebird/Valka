@@ -104,3 +104,25 @@ func TestWorkerAPIKeyCredentials(t *testing.T) {
 		t.Fatalf("worker config %v %q", w.serverAddrs, w.apiKey)
 	}
 }
+
+// Log ids are numbers (the entry's position in the run's log), and after_id pages by them.
+func TestGetRunLogsDecodesNumericIDs(t *testing.T) {
+	var after atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		after.Store(r.URL.Query().Get("after_id"))
+		_ = json.NewEncoder(w).Encode([]map[string]interface{}{
+			{"id": 3, "task_run_id": "r1", "timestamp_ms": 1, "level": "INFO", "message": "hi"},
+		})
+	}))
+	defer srv.Close()
+	logs, err := NewClient(srv.URL).GetRunLogs("t1", "r1", GetRunLogsParams{AfterID: 2})
+	if err != nil {
+		t.Fatalf("logs: %v", err)
+	}
+	if len(logs) != 1 || logs[0].ID != 3 || logs[0].Level != "INFO" {
+		t.Fatalf("logs %+v", logs)
+	}
+	if got := after.Load(); got != "2" {
+		t.Fatalf("after_id %v", got)
+	}
+}

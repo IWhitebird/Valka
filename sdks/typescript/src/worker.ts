@@ -8,8 +8,10 @@ import {
   WorkerServiceDefinition,
   type DeepPartial,
   type ResultAck,
+  type TaskAssignment,
   type TaskResult,
   type WorkerRequest,
+  type WorkerResponse,
   type RunningTask,
   type WorkerHello,
 } from "./generated/valka/v1/worker.js";
@@ -65,6 +67,11 @@ function createMessageChannel<T>(): MessageChannel<T> {
 }
 
 const RESULT_RETRY_DELAY_MS = 1_000;
+/** A drain gives running handlers and their results this long from the shutdown request. */
+const DRAIN_TIMEOUT_MS = 30_000;
+const DRAIN_POLL_MS = 100;
+/** Reconnect delay cap while draining: results are waiting for a connection. */
+const DRAIN_RECONNECT_DELAY_MS = 1_000;
 
 export class ValkaWorker {
   private readonly workerId: string;
@@ -76,12 +83,14 @@ export class ValkaWorker {
   private readonly concurrency: number;
   private readonly handler: TaskHandler;
   private readonly metadataStr: string;
-  private shutdownResolve: (() => void) | null = null;
-  private readonly shutdownPromise: Promise<void>;
 
-  // Survive reconnects: tasks running or awaiting a result ack (heartbeated on whichever
-  // connection is current), results not yet acknowledged, and the current connection.
-  private readonly running = new Set<string>();
+  // Survive reconnects. Per-task state holds the latest run of each task: an older run of
+  // the same task still finishing here is stale (the server starts a new run only after the
+  // old one ended), and its cleanup never removes the newer run's state.
+  //
+  // task id -> run id of tasks running or awaiting a result ack (heartbeated on whichever
+  // connection is current).
+  private readonly running = new Map<string, string>();
   // Runs still executing, by task id: listed in every WorkerHello so the server can
   // reattach them to the new connection (or adopt or cancel them).
   private readonly runs = new Map<string, RunningTask>();
@@ -91,6 +100,9 @@ export class ValkaWorker {
   private checkpointRpc: ((request: CheckpointRequest) => Promise<unknown>) | null = null;
   private activeCount = 0;
   private readonly slotWaiters: Array<() => void> = [];
+  // Set once a graceful shutdown starts. The drain outlives connections: a session lost
+  // meanwhile is re-established (on the next node) and told about the drain again.
+  private drainDeadline: number | null = null;
 
   private constructor(options: ValkaWorkerOptions) {
     this.workerId = randomUUID();
@@ -107,16 +119,25 @@ export class ValkaWorker {
     this.concurrency = options.concurrency ?? 1;
     this.handler = options.handler;
     this.metadataStr = options.metadata ? JSON.stringify(options.metadata) : "";
-    this.shutdownPromise = new Promise((resolve) => {
-      this.shutdownResolve = resolve;
-    });
   }
 
+  /**
+   * Drain: the server sends no more tasks, running handlers finish and their results are
+   * acknowledged (for up to 30 s), then `run()` resolves.
+   */
   shutdown(): void {
-    if (this.shutdownResolve) {
-      this.shutdownResolve();
-      this.shutdownResolve = null;
-    }
+    if (this.drainDeadline !== null) return;
+    console.log("[valka] Shutdown requested, draining...");
+    this.drainDeadline = Date.now() + DRAIN_TIMEOUT_MS;
+    // The current session, if any; a later one sends its own after its hello.
+    this.outbound?.({ shutdown: { reason: "shutdown" } });
+  }
+
+  /** Whether a drain is over: nothing runs or awaits an ack, or its time is up. */
+  private drainFinished(): boolean {
+    if (this.drainDeadline === null) return false;
+    if (this.running.size === 0 && this.unacked.size === 0) return true;
+    return Date.now() >= this.drainDeadline;
   }
 
   private acquireSlot(): Promise<void> {
@@ -136,7 +157,6 @@ export class ValkaWorker {
     }
   }
 
-  /** Keep the result until it is APPLIED or STALE; a later connection resends it. */
   /** Opens a session: lists runs still executing from before this connection. */
   helloMessage(): WorkerHello {
     return {
@@ -149,6 +169,7 @@ export class ValkaWorker {
     };
   }
 
+  /** Keep the result until it is APPLIED or STALE; a later connection resends it. */
   private deliver(result: TaskResult): void {
     this.unacked.set(result.taskRunId, result);
     this.outbound?.({ taskResult: result });
@@ -163,7 +184,8 @@ export class ValkaWorker {
         );
       }
       this.unacked.delete(ack.taskRunId);
-      this.running.delete(ack.taskId);
+      // Only this run: a newer run of the same task may be running here.
+      if (this.running.get(ack.taskId) === ack.taskRunId) this.running.delete(ack.taskId);
       return;
     }
     setTimeout(() => {
@@ -180,28 +202,61 @@ export class ValkaWorker {
     return new ValkaWorker(options);
   }
 
+  /** Run until a graceful shutdown (SIGINT, SIGTERM or `shutdown()`) is over. */
   async run(): Promise<void> {
     const retryPolicy = new RetryPolicy();
+    const proc = (globalThis as { process?: NodeJS.Process }).process;
+    const onSignal = (): void => this.shutdown();
+    proc?.once("SIGINT", onSignal);
+    proc?.once("SIGTERM", onSignal);
 
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      try {
-        await this.connectAndRun(retryPolicy);
-        console.log("[valka] Worker disconnected gracefully");
-        return;
-      } catch (err) {
+    try {
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        let failure: unknown;
+        try {
+          await this.connectAndRun(retryPolicy);
+          failure = new ConnectionError("the server closed the session");
+        } catch (err) {
+          failure = err;
+        }
+        if (this.drainFinished()) {
+          console.log("[valka] Worker drained and disconnected");
+          return;
+        }
         // Next time, try the next node: any node takes any worker.
         this.nextAddr++;
-        const delay = retryPolicy.nextDelay();
+        let delay = retryPolicy.nextDelay();
+        if (this.drainDeadline !== null) delay = Math.min(delay, DRAIN_RECONNECT_DELAY_MS);
         console.warn(
-          `[valka] Connection lost: ${err instanceof Error ? err.message : err}. ` +
+          `[valka] Connection lost: ${failure instanceof Error ? failure.message : failure}. ` +
             `Reconnecting in ${delay}ms...`,
         );
-        await sleep(delay);
+        if (await this.waitToReconnect(delay)) {
+          console.log("[valka] Worker drained while disconnected");
+          return;
+        }
       }
+    } finally {
+      proc?.removeListener("SIGINT", onSignal);
+      proc?.removeListener("SIGTERM", onSignal);
     }
   }
 
+  /** Sleep before reconnecting; true when a drain finished meanwhile. */
+  private async waitToReconnect(delayMs: number): Promise<boolean> {
+    let until = Date.now() + delayMs;
+    while (Date.now() < until) {
+      if (this.drainFinished()) return true;
+      if (this.drainDeadline !== null) {
+        until = Math.min(until, Date.now() + DRAIN_RECONNECT_DELAY_MS);
+      }
+      await sleep(Math.max(1, Math.min(DRAIN_POLL_MS, until - Date.now())));
+    }
+    return this.drainFinished();
+  }
+
+  /** One session. Resolves when the stream ends, rejects on errors and ServerShutdown. */
   private async connectAndRun(retryPolicy: RetryPolicy): Promise<void> {
     const channel: Channel = createChannel(
       this.serverAddrs[this.nextAddr % this.serverAddrs.length],
@@ -212,177 +267,162 @@ export class ValkaWorker {
       this.apiKey ? { "*": { metadata: Metadata({ authorization: `Bearer ${this.apiKey}` }) } } : {},
     );
     const requests = createMessageChannel<DeepPartial<WorkerRequest>>();
-
-    retryPolicy.reset();
-    console.log(
-      `[valka] Connected: worker_id=${this.workerId} name=${this.name} ` +
-        `queues=[${this.queues.join(",")}] concurrency=${this.concurrency}`,
-    );
-
-    let gracefulShutdown = false;
-    let serverStopping = false;
-
     const send = (msg: DeepPartial<WorkerRequest>): void => {
       requests.send(msg);
     };
+    let heartbeatInterval: ReturnType<typeof setInterval> | undefined;
+    let drainTimer: ReturnType<typeof setInterval> | undefined;
+    let serverStopping = false;
 
-    // Send WorkerHello
-    send({ hello: this.helloMessage() });
-
-    // Register this connection before resending: a result delivered concurrently is
-    // then either in the resend below or sent on this connection.
-    this.outbound = send;
-    // ts-proto's Exact<> generic on fromPartial collapses nice-grpc's inferred request type
-    // to an index signature of `never`; the runtime type is correct.
-    this.checkpointRpc = (request) => client.checkpoint(request as never);
-    for (const result of this.unacked.values()) {
-      send({ taskResult: result });
-    }
-
-    const heartbeatInterval = setInterval(() => {
-      send({
-        heartbeat: {
-          activeTaskIds: Array.from(this.running),
-          timestampMs: Date.now(),
-        },
-      });
-    }, 10_000);
-
-    // Graceful shutdown on signals
-    const shutdownHandler = () => {
-      if (gracefulShutdown) return;
-      console.log("[valka] Shutdown signal received, draining...");
-      gracefulShutdown = true;
-      send({ shutdown: { reason: "SIGINT" } });
-
-      const checkDrained = setInterval(() => {
-        if (this.running.size === 0) {
-          clearInterval(checkDrained);
-          requests.close();
-        }
-      }, 100);
-
-      // Safety timeout: force close after 30s
-      setTimeout(() => {
-        clearInterval(checkDrained);
-        requests.close();
-      }, 30_000);
-    };
-
-    process.once("SIGINT", shutdownHandler);
-    process.once("SIGTERM", shutdownHandler);
-    this.shutdownPromise.then(shutdownHandler);
-
-    const cleanup = () => {
-      this.outbound = null;
-      this.checkpointRpc = null;
-      clearInterval(heartbeatInterval);
-      process.removeListener("SIGINT", shutdownHandler);
-      process.removeListener("SIGTERM", shutdownHandler);
-    };
+    console.log(
+      `[valka] Connecting: worker_id=${this.workerId} name=${this.name} ` +
+        `queues=[${this.queues.join(",")}] concurrency=${this.concurrency}`,
+    );
 
     try {
+      send({ hello: this.helloMessage() });
+      if (this.drainDeadline !== null) {
+        // A drain carried over from an earlier session: no new tasks on this one either.
+        send({ shutdown: { reason: "shutdown" } });
+      }
+
+      // Register this connection before resending: a result delivered concurrently is
+      // then either in the resend below or sent on this connection.
+      this.outbound = send;
+      // ts-proto's Exact<> generic on fromPartial collapses nice-grpc's inferred request type
+      // to an index signature of `never`; the runtime type is correct.
+      this.checkpointRpc = (request) => client.checkpoint(request as never);
+      for (const result of this.unacked.values()) {
+        send({ taskResult: result });
+      }
+
+      heartbeatInterval = setInterval(() => {
+        send({
+          heartbeat: {
+            activeTaskIds: Array.from(this.running.keys()),
+            timestampMs: Date.now(),
+          },
+        });
+      }, 10_000);
+      // Once a drain is over, end the request stream: the server then closes the session.
+      drainTimer = setInterval(() => {
+        if (this.drainFinished()) requests.close();
+      }, DRAIN_POLL_MS);
+
+      let answered = false;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- ts-proto's Exact
       // constraint + TS 5.7's IteratorResult change cause a deep structural mismatch
       // with AsyncIterable generics. The runtime types are correct.
       for await (const response of client.session(requests as any)) {
-        if (response.taskAssignment) {
-          const assignment = response.taskAssignment;
-          this.running.add(assignment.taskId);
-          this.runs.set(assignment.taskId, {
-            taskId: assignment.taskId,
-            taskRunId: assignment.taskRunId,
-            attemptNumber: assignment.attemptNumber,
-          });
-
-          this.acquireSlot().then(async () => {
-            const ctx = new TaskContext(
-              assignment.taskId,
-              assignment.taskRunId,
-              assignment.queueName,
-              assignment.taskName,
-              assignment.attemptNumber,
-              assignment.input,
-              assignment.metadata,
-              (msg) => this.outbound?.(msg),
-              assignment.checkpoints,
-              async (step, output) => {
-                const rpc = this.checkpointRpc;
-                if (!rpc) {
-                  throw new ConnectionError("not connected to the server");
-                }
-                await rpc(
-                  CheckpointRequest.fromPartial({
-                    taskId: assignment.taskId,
-                    taskRunId: assignment.taskRunId,
-                    step,
-                    output,
-                  }),
-                );
-              },
-            );
-            this.taskContexts.set(assignment.taskId, ctx);
-
-            let result: TaskResult;
-            try {
-              const output = await this.handler(ctx);
-              result = {
-                taskId: assignment.taskId,
-                taskRunId: assignment.taskRunId,
-                success: true,
-                retryable: false,
-                output: output != null ? JSON.stringify(output) : "",
-                errorMessage: "",
-              };
-            } catch (err) {
-              result = {
-                taskId: assignment.taskId,
-                taskRunId: assignment.taskRunId,
-                success: false,
-                retryable: err instanceof HandlerError ? err.retryable : true,
-                output: "",
-                errorMessage: err instanceof Error ? err.message : String(err),
-              };
-            }
-            this.taskContexts.delete(assignment.taskId);
-            this.runs.delete(assignment.taskId);
-            this.releaseSlot();
-            this.deliver(result);
-          });
-        } else if (response.taskSignal) {
-          const signal = response.taskSignal;
-          const ctx = this.taskContexts.get(signal.taskId);
-          if (ctx) {
-            ctx._deliverSignal(signal);
-          }
-        } else if (response.taskCancellation) {
-          const cancel = response.taskCancellation;
-          console.log(`[valka] Task cancelled: ${cancel.taskId} (${cancel.reason})`);
-          this.running.delete(cancel.taskId);
-          this.taskContexts.delete(cancel.taskId);
-        } else if (response.resultAck) {
-          this.onResultAck(response.resultAck);
-        } else if (response.heartbeatAck) {
-          // No-op
-        } else if (response.serverShutdown) {
-          const shutdown = response.serverShutdown;
-          console.log(`[valka] Server shutting down: ${shutdown.reason}`);
+        if (!answered) {
+          // The server took the session: back off from scratch after it ends.
+          answered = true;
+          retryPolicy.reset();
+        }
+        if (response.serverShutdown) {
+          console.log(`[valka] Server shutting down: ${response.serverShutdown.reason}`);
           serverStopping = true;
           break;
         }
+        try {
+          this.handleResponse(response);
+        } catch (err) {
+          console.error("[valka] Could not handle a message from the server:", err);
+        }
       }
-    } catch (err) {
-      cleanup();
-      if (gracefulShutdown) return;
-      throw new ConnectionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (this.outbound === send) {
+        this.outbound = null;
+        this.checkpointRpc = null;
+      }
+      clearInterval(heartbeatInterval);
+      clearInterval(drainTimer);
+      requests.close();
+      channel.close();
     }
-
-    cleanup();
-    requests.close();
-    channel.close();
-    if (serverStopping && !gracefulShutdown) {
+    if (serverStopping) {
+      // Reconnect to another node; a drain in progress goes on there.
       throw new ConnectionError("server shutting down");
     }
+  }
+
+  private handleResponse(response: WorkerResponse): void {
+    if (response.taskAssignment) {
+      this.startTask(response.taskAssignment);
+    } else if (response.taskSignal) {
+      const signal = response.taskSignal;
+      this.taskContexts.get(signal.taskId)?._deliverSignal(signal);
+    } else if (response.taskCancellation) {
+      const cancel = response.taskCancellation;
+      console.log(`[valka] Task cancelled: ${cancel.taskId} (${cancel.reason})`);
+      this.running.delete(cancel.taskId);
+      // Not listed on reconnect: the server would only cancel it again.
+      this.runs.delete(cancel.taskId);
+      this.taskContexts.delete(cancel.taskId);
+    } else if (response.resultAck) {
+      this.onResultAck(response.resultAck);
+    }
+  }
+
+  private startTask(assignment: TaskAssignment): void {
+    const { taskId, taskRunId } = assignment;
+    // A newer run replaces an older one of the same task still finishing here: that one is
+    // stale, and its result will be answered STALE.
+    this.running.set(taskId, taskRunId);
+    this.runs.set(taskId, { taskId, taskRunId, attemptNumber: assignment.attemptNumber });
+
+    this.acquireSlot()
+      .then(async () => {
+        const ctx = new TaskContext(
+          taskId,
+          taskRunId,
+          assignment.queueName,
+          assignment.taskName,
+          assignment.attemptNumber,
+          assignment.input,
+          assignment.metadata,
+          (msg) => this.outbound?.(msg),
+          assignment.checkpoints,
+          async (step, output) => {
+            const rpc = this.checkpointRpc;
+            if (!rpc) {
+              throw new ConnectionError("not connected to the server");
+            }
+            await rpc(CheckpointRequest.fromPartial({ taskId, taskRunId, step, output }));
+          },
+        );
+        this.taskContexts.set(taskId, ctx);
+
+        let result: TaskResult;
+        try {
+          const output = await this.handler(ctx);
+          result = {
+            taskId,
+            taskRunId,
+            success: true,
+            retryable: false,
+            output: output != null ? (JSON.stringify(output) ?? "") : "",
+            errorMessage: "",
+          };
+        } catch (err) {
+          result = {
+            taskId,
+            taskRunId,
+            success: false,
+            retryable: err instanceof HandlerError ? err.retryable : true,
+            output: "",
+            errorMessage: err instanceof Error ? err.message : String(err),
+          };
+        }
+        // Only this run's state: a newer run of the same task may have replaced it.
+        if (this.taskContexts.get(taskId) === ctx) this.taskContexts.delete(taskId);
+        if (this.runs.get(taskId)?.taskRunId === taskRunId) this.runs.delete(taskId);
+        this.releaseSlot();
+        this.deliver(result);
+      })
+      .catch((err) => {
+        console.error(`[valka] Task ${taskId} could not run:`, err);
+      });
   }
 }
 

@@ -140,9 +140,9 @@ class ValkaClient:
         task_id: str,
         run_id: str,
         limit: int = 1000,
-        after_id: str | None = None,
+        after_id: int | str | None = None,
     ) -> list[TaskLog]:
-        """Get logs for a specific task run."""
+        """Get logs for a specific task run (``after_id``: only entries after this log id)."""
         params: dict[str, Any] = {"limit": limit}
         if after_id is not None:
             params["after_id"] = after_id

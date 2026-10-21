@@ -70,7 +70,8 @@ class TaskRun(TypedDict, total=False):
 class TaskLog(TypedDict, total=False):
     """Log entry for a task run."""
 
-    id: str
+    # The entry's 1-based position in the run's log; pass it as ``after_id`` to page.
+    id: int
     task_run_id: str
     timestamp_ms: int
     level: str
@@ -163,4 +164,4 @@ class GetRunLogsOptions(TypedDict, total=False):
     """Options for getting run logs."""
 
     limit: int
-    after_id: str
+    after_id: int
