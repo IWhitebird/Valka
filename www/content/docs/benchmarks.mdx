@@ -9,7 +9,7 @@ the commands below.
 
 ## Setup
 
-| | |
+| Item | Value |
 |---|---|
 | Machine | Intel Core i5-12450H (8 cores, 12 threads), 15 GB RAM, Linux 6.14, NVMe |
 | Valka | 0.2.0, release build, default configuration (50 ms group commit, 4096 shards) |
@@ -51,7 +51,7 @@ worker per node; a task is run by whichever node's worker takes it first.
 dead node is **detected** (its lease tombstoned) and when the cluster has **recovered**
 (every shard served by a live node again). Six trials, a different node each time:
 
-| | Detected | Recovered |
+| Of six trials | Detected | Recovered |
 |---|---:|---:|
 | fastest | 9.9 s | 13.5 s |
 | median | 13.5 s | 22.3 s |

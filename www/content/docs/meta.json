@@ -1,19 +1,19 @@
 {
   "pages": [
+    "---Getting Started---",
     "index",
     "quick-start",
     "installation",
-    "---Getting Started---",
+    "---Concepts---",
     "architecture",
     "task-lifecycle",
     "clustering",
-    "---Concepts---",
+    "---API Reference---",
     "rest-api",
     "grpc-api",
     "cli",
-    "---API Reference---",
     "sdks",
-    "---",
+    "---Operations---",
     "dashboard",
     "deployment",
     "benchmarks"
