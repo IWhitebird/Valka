@@ -6,7 +6,7 @@ Run: python signal_demo.py
 
 import asyncio
 
-from valka import ValkaClient, ValkaWorker, TaskContext
+from valka import TaskContext, ValkaClient, ValkaWorker
 
 
 async def handle_task(ctx: TaskContext) -> dict:
@@ -39,7 +39,7 @@ async def handle_task(ctx: TaskContext) -> dict:
         await ctx.log(f"a={a}  b={b}  sum={a + b}")
         try:
             await asyncio.wait_for(stopped.wait(), timeout=1.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
     await ctx.log(f"Final: a={a}  b={b}  sum={a + b}")

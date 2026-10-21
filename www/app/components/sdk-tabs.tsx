@@ -6,147 +6,126 @@ import { AnimateIn } from './animate-in';
 const languages = ['Rust', 'TypeScript', 'Python', 'Go'] as const;
 type Lang = (typeof languages)[number];
 
-const langMeta: Record<Lang, { color: string; activeColor: string; label: string }> = {
-  Rust: {
-    color: 'text-fd-muted-foreground',
-    activeColor: 'text-orange-400 border-orange-400',
-    label: 'RS',
-  },
-  TypeScript: {
-    color: 'text-fd-muted-foreground',
-    activeColor: 'text-blue-400 border-blue-400',
-    label: 'TS',
-  },
-  Python: {
-    color: 'text-fd-muted-foreground',
-    activeColor: 'text-yellow-400 border-yellow-400',
-    label: 'PY',
-  },
-  Go: {
-    color: 'text-fd-muted-foreground',
-    activeColor: 'text-cyan-400 border-cyan-400',
-    label: 'GO',
-  },
+const install: Record<Lang, string> = {
+  Rust: 'cargo add valka-sdk --git https://github.com/IWhitebird/Valka',
+  TypeScript: 'npm install https://github.com/IWhitebird/Valka/releases/download/v0.2.0/valka-sdk-0.2.0.tgz',
+  Python: 'pip install "git+https://github.com/IWhitebird/Valka#subdirectory=sdks/python"',
+  Go: 'go get github.com/IWhitebird/Valka/sdks/go',
 };
 
-const codeSnippets: Record<Lang, string> = {
-  Rust: `<span class="syn-kw">use</span> valka_sdk::{<span class="syn-typ">TaskContext</span>, <span class="syn-typ">ValkaWorker</span>};
-
-<span class="syn-kw">let</span> worker = <span class="syn-typ">ValkaWorker</span>::builder()
+// Hand-highlighted: each snippet compiles against the SDK in this repository.
+const snippets: Record<Lang, string> = {
+  Rust: `<span class="syn-kw">let</span> worker = <span class="syn-typ">ValkaWorker</span>::builder()
     .name(<span class="syn-str">"email-worker"</span>)
-    .server_addr(<span class="syn-str">"http://localhost:50051"</span>)
+    .server_addrs(&amp;[<span class="syn-str">"http://valka-1:50051"</span>, <span class="syn-str">"http://valka-2:50051"</span>])
     .queues(&amp;[<span class="syn-str">"emails"</span>])
     .concurrency(<span class="syn-num">8</span>)
-    .handler(|ctx: <span class="syn-typ">TaskContext</span>| <span class="syn-kw">async</span> <span class="syn-kw">move</span> {
-        <span class="syn-kw">let</span> input: serde_json::<span class="syn-typ">Value</span> = ctx.input()?;
-        <span class="syn-cmt">// process task ...</span>
-        <span class="syn-typ">Ok</span>(serde_json::json!({<span class="syn-str">"status"</span>: <span class="syn-str">"sent"</span>}))
+    .handler(|ctx| <span class="syn-kw">async move</span> {
+        <span class="syn-kw">let</span> input: <span class="syn-typ">Email</span> = ctx.input().map_err(|e| e.to_string())?;
+        send(&amp;input).<span class="syn-kw">await</span>;
+        <span class="syn-typ">Ok</span>(json!({ <span class="syn-str">"sent"</span>: <span class="syn-kw">true</span> }))
     })
     .build()
     .<span class="syn-kw">await</span>?;
-
 worker.run().<span class="syn-kw">await</span>?;`,
 
-  TypeScript: `<span class="syn-kw">import</span> { <span class="syn-typ">ValkaWorker</span>, <span class="syn-kw">type</span> <span class="syn-typ">TaskContext</span> } <span class="syn-kw">from</span> <span class="syn-str">"@valka/sdk"</span>;
+  TypeScript: `<span class="syn-kw">import</span> { <span class="syn-typ">ValkaWorker</span> } <span class="syn-kw">from</span> <span class="syn-str">"@valka/sdk"</span>;
 
 <span class="syn-kw">const</span> worker = <span class="syn-typ">ValkaWorker</span>.builder()
   .name(<span class="syn-str">"email-worker"</span>)
-  .serverAddr(<span class="syn-str">"localhost:50051"</span>)
+  .serverAddrs([<span class="syn-str">"valka-1:50051"</span>, <span class="syn-str">"valka-2:50051"</span>])
   .queues([<span class="syn-str">"emails"</span>])
   .concurrency(<span class="syn-num">8</span>)
-  .handler(<span class="syn-kw">async</span> (ctx: <span class="syn-typ">TaskContext</span>) =&gt; {
-    <span class="syn-kw">const</span> input = ctx.input&lt;{ to: <span class="syn-typ">string</span> }&gt;();
-    <span class="syn-cmt">// process task ...</span>
-    <span class="syn-kw">return</span> { status: <span class="syn-str">"sent"</span> };
+  .handler(<span class="syn-kw">async</span> (ctx) =&gt; {
+    <span class="syn-kw">const</span> input = ctx.input&lt;<span class="syn-typ">Email</span>&gt;();
+    <span class="syn-kw">await</span> send(input);
+    <span class="syn-kw">return</span> { sent: <span class="syn-kw">true</span> };
   })
   .build();
-
 <span class="syn-kw">await</span> worker.run();`,
 
-  Python: `<span class="syn-kw">from</span> valka <span class="syn-kw">import</span> <span class="syn-typ">ValkaWorker</span>, <span class="syn-typ">TaskContext</span>
+  Python: `<span class="syn-kw">import</span> asyncio
+<span class="syn-kw">from</span> valka <span class="syn-kw">import</span> <span class="syn-typ">TaskContext</span>, <span class="syn-typ">ValkaWorker</span>
 
-<span class="syn-kw">async def</span> <span class="syn-fn">handle_task</span>(ctx: <span class="syn-typ">TaskContext</span>) -&gt; <span class="syn-typ">dict</span>:
-    data = ctx.input()
-    <span class="syn-cmt"># process task ...</span>
-    <span class="syn-kw">return</span> {<span class="syn-str">"status"</span>: <span class="syn-str">"sent"</span>}
+<span class="syn-kw">async def</span> <span class="syn-fn">handle</span>(ctx: <span class="syn-typ">TaskContext</span>) -&gt; <span class="syn-typ">dict</span>:
+    <span class="syn-kw">await</span> send(ctx.input())
+    <span class="syn-kw">return</span> {<span class="syn-str">"sent"</span>: <span class="syn-kw">True</span>}
 
 worker = (
     <span class="syn-typ">ValkaWorker</span>.builder()
     .name(<span class="syn-str">"email-worker"</span>)
-    .server_addr(<span class="syn-str">"localhost:50051"</span>)
+    .server_addrs([<span class="syn-str">"valka-1:50051"</span>, <span class="syn-str">"valka-2:50051"</span>])
     .queues([<span class="syn-str">"emails"</span>])
     .concurrency(<span class="syn-num">8</span>)
-    .handler(handle_task)
+    .handler(handle)
     .build()
 )
-<span class="syn-kw">await</span> worker.run()`,
+asyncio.run(worker.run())`,
 
-  Go: `worker, _ := valka.<span class="syn-fn">NewWorker</span>(
+  Go: `worker, err := valka.<span class="syn-fn">NewWorker</span>(
     valka.<span class="syn-fn">WithName</span>(<span class="syn-str">"email-worker"</span>),
-    valka.<span class="syn-fn">WithServerAddr</span>(<span class="syn-str">"localhost:50051"</span>),
+    valka.<span class="syn-fn">WithServerAddrs</span>(<span class="syn-str">"valka-1:50051"</span>, <span class="syn-str">"valka-2:50051"</span>),
     valka.<span class="syn-fn">WithQueues</span>(<span class="syn-str">"emails"</span>),
     valka.<span class="syn-fn">WithConcurrency</span>(<span class="syn-num">8</span>),
-    valka.<span class="syn-fn">WithHandler</span>(<span class="syn-kw">func</span>(ctx *valka.<span class="syn-typ">TaskContext</span>) (<span class="syn-typ">any</span>, <span class="syn-typ">error</span>) {
-        <span class="syn-kw">var</span> input <span class="syn-typ">map</span>[<span class="syn-typ">string</span>]<span class="syn-typ">any</span>
-        ctx.Input(&amp;input)
-        <span class="syn-cmt">// process task ...</span>
-        <span class="syn-kw">return</span> <span class="syn-typ">map</span>[<span class="syn-typ">string</span>]<span class="syn-typ">any</span>{<span class="syn-str">"status"</span>: <span class="syn-str">"sent"</span>}, <span class="syn-kw">nil</span>
+    valka.<span class="syn-fn">WithHandler</span>(<span class="syn-kw">func</span>(ctx *valka.<span class="syn-typ">TaskContext</span>) (<span class="syn-kw">any</span>, <span class="syn-kw">error</span>) {
+        <span class="syn-kw">var</span> input <span class="syn-typ">Email</span>
+        <span class="syn-kw">if</span> err := ctx.<span class="syn-fn">Input</span>(&amp;input); err != <span class="syn-kw">nil</span> {
+            <span class="syn-kw">return nil</span>, err
+        }
+        <span class="syn-kw">return</span> <span class="syn-kw">map</span>[<span class="syn-kw">string</span>]<span class="syn-kw">any</span>{<span class="syn-str">"sent"</span>: <span class="syn-kw">true</span>}, send(input)
     }),
 )
-worker.Run(context.Background())`,
+<span class="syn-kw">if</span> err != <span class="syn-kw">nil</span> {
+    log.<span class="syn-fn">Fatal</span>(err)
+}
+log.<span class="syn-fn">Fatal</span>(worker.<span class="syn-fn">Run</span>(context.<span class="syn-fn">Background</span>()))`,
 };
 
 export function SdkTabs() {
-  const [activeTab, setActiveTab] = useState<Lang>('Rust');
+  const [active, setActive] = useState<Lang>('Rust');
 
   return (
-    <section className="mx-auto max-w-5xl px-6 py-20">
-      <AnimateIn className="mb-12 text-center">
-        <h2 className="text-3xl font-bold tracking-tight sm:text-4xl">
-          One API, every language
+    <section className="mx-auto grid max-w-6xl gap-10 px-6 pb-20 lg:grid-cols-[1fr_1.4fr]">
+      <AnimateIn>
+        <h2 className="text-balance text-3xl font-extrabold tracking-tight">
+          Workers in four languages
         </h2>
-        <p className="mt-4 text-lg text-fd-muted-foreground">
-          Same builder pattern across Rust, TypeScript, Python, and Go.
+        <p className="mt-4 text-lg leading-relaxed text-fd-muted-foreground">
+          A worker lists a few nodes, takes tasks over one gRPC stream and survives any of them
+          dying. Producers create tasks with the client of the same SDK, or with plain HTTP.
+        </p>
+        <p className="mt-4 text-sm text-fd-muted-foreground">
+          Every SDK reads <code className="font-mono text-fd-foreground">VALKA_API_KEY</code> when
+          the cluster requires keys.
         </p>
       </AnimateIn>
 
-      <AnimateIn delay={0.1}>
-        <div className="overflow-hidden rounded-xl border border-white/[0.06] bg-[#0a0a0a]">
-          {/* Language tabs */}
-          <div className="flex gap-1 border-b border-white/[0.06] bg-white/[0.02] px-3 pt-3">
-            {languages.map((lang) => {
-              const active = activeTab === lang;
-              return (
-                <button
-                  key={lang}
-                  onClick={() => setActiveTab(lang)}
-                  className={`relative flex items-center gap-2 rounded-t-lg px-4 py-2.5 text-sm font-medium transition-all ${
-                    active
-                      ? 'bg-[#0a0a0a] text-fd-foreground'
-                      : 'text-fd-muted-foreground hover:text-fd-foreground'
-                  }`}
-                >
-                  <span
-                    className={`inline-flex size-5 items-center justify-center rounded text-[10px] font-bold transition-colors ${
-                      active ? langMeta[lang].activeColor : langMeta[lang].color
-                    }`}
-                  >
-                    {langMeta[lang].label}
-                  </span>
-                  {lang}
-                  {active && (
-                    <span className="absolute bottom-0 left-3 right-3 h-px bg-fd-primary" />
-                  )}
-                </button>
-              );
-            })}
+      <AnimateIn delay={0.08} className="min-w-0">
+        <div className="overflow-hidden rounded-xl border border-fd-border bg-[#0d1211] shadow-sm">
+          <div role="tablist" aria-label="SDK language" className="flex border-b border-white/[0.06] px-2">
+            {languages.map((lang) => (
+              <button
+                key={lang}
+                role="tab"
+                aria-selected={active === lang}
+                onClick={() => setActive(lang)}
+                className={`relative px-3.5 py-3 text-sm font-medium transition-colors ${
+                  active === lang ? 'text-[#e8eeeb]' : 'text-[#7f8c87] hover:text-[#c3ccc8]'
+                }`}
+              >
+                {lang}
+                {active === lang && (
+                  <span className="absolute inset-x-3 -bottom-px h-0.5 rounded-full bg-[#67c2aa]" />
+                )}
+              </button>
+            ))}
           </div>
-
-          {/* Code block */}
-          <div className="overflow-x-auto p-6">
-            <pre className="text-[13px] leading-relaxed">
-              <code dangerouslySetInnerHTML={{ __html: codeSnippets[activeTab] }} />
-            </pre>
+          <pre className="overflow-x-auto p-5 font-mono text-[12.5px] leading-relaxed text-[#d7dfdb]">
+            <code dangerouslySetInnerHTML={{ __html: snippets[active] }} />
+          </pre>
+          <div className="border-t border-white/[0.06] px-5 py-3 font-mono text-xs text-[#94a19c]">
+            <span className="text-[#67c2aa]">$ </span>
+            {install[active]}
           </div>
         </div>
       </AnimateIn>

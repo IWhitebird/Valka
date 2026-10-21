@@ -84,10 +84,10 @@ The server starts on **gRPC `:50051`** and **REST `:8989`**.
 
 | Language | Package | Install |
 |----------|---------|---------|
-| **Rust** | `valka-sdk` | `cargo add valka-sdk` |
-| **TypeScript** | `@valka/sdk` | `npm install @valka/sdk` |
+| **Rust** | `valka-sdk` | `cargo add valka-sdk --git https://github.com/IWhitebird/Valka` |
+| **TypeScript** | `@valka/sdk` | `npm install https://github.com/IWhitebird/Valka/releases/download/v0.2.0/valka-sdk-0.2.0.tgz` |
 | **Go** | `github.com/IWhitebird/Valka/sdks/go` | `go get github.com/IWhitebird/Valka/sdks/go` |
-| **Python** | `valka` | `pip install valka` |
+| **Python** | `valka` | `pip install "git+https://github.com/IWhitebird/Valka@v0.2.0#subdirectory=sdks/python"` |
 
 Any language can also interact via the REST API.
 

@@ -1,11 +1,11 @@
 # Valka Go SDK
 
-Go SDK for the [Valka](https://github.com/your-org/valka) distributed task queue.
+Go SDK for the [Valka](https://github.com/IWhitebird/Valka) distributed task queue.
 
 ## Installation
 
 ```bash
-go get github.com/IWhitebird/Valka/sdks/go
+go get github.com/IWhitebird/Valka/sdks/go@v0.2.0
 ```
 
 ## Quick Start

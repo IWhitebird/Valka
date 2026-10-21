@@ -1,11 +1,11 @@
 # Valka Python SDK
 
-Python SDK for the [Valka](https://github.com/your-org/valka) distributed task queue.
+Python SDK for the [Valka](https://github.com/IWhitebird/Valka) distributed task queue.
 
 ## Installation
 
 ```bash
-pip install valka
+pip install "git+https://github.com/IWhitebird/Valka@v0.2.0#subdirectory=sdks/python"
 ```
 
 ## Quick Start
@@ -15,6 +15,7 @@ pip install valka
 ```python
 import asyncio
 from valka import ValkaClient
+
 
 async def main():
     async with ValkaClient("http://localhost:8989") as client:
@@ -34,6 +35,7 @@ async def main():
         tasks = await client.list_tasks(queue_name="emails", limit=10)
         print(f"Found {len(tasks)} tasks")
 
+
 asyncio.run(main())
 ```
 
@@ -43,11 +45,13 @@ asyncio.run(main())
 import asyncio
 from valka import ValkaWorker, TaskContext
 
+
 async def handle_task(ctx: TaskContext) -> dict:
     data = ctx.input()
     await ctx.log(f"Sending email to {data['to']}")
     # ... do work ...
     return {"delivered": True}
+
 
 async def main():
     worker = (
@@ -60,6 +64,7 @@ async def main():
         .build()
     )
     await worker.run()
+
 
 asyncio.run(main())
 ```

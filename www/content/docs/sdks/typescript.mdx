@@ -6,8 +6,12 @@ description: Build workers and manage tasks with the TypeScript SDK.
 ## Installation
 
 ```bash
-npm install @valka/sdk
+npm install https://github.com/IWhitebird/Valka/releases/download/v0.2.0/valka-sdk-0.2.0.tgz
 ```
+
+The package is not on npm yet: each GitHub release carries it as a tarball. To build it from a
+checkout instead, run `npm install && npm pack` in `sdks/typescript` and install the `.tgz` it
+writes. Node.js 18 or newer.
 
 The TypeScript SDK provides:
 - **ValkaWorker**: process tasks from queues

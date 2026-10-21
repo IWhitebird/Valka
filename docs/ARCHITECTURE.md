@@ -299,7 +299,7 @@ Each node owns one object, `nodes/{node}/lease`:
 ```json
 { "node": "valka-2", "inc": 7, "state": "alive", "counter": 18342, "trunc": 120,
   "unsplit": [], "internal_addr": "valka-2:50052", "grpc_addr": "…", "http_addr": "…",
-  "version": "0.1.0", "protocol": 2, "started_at": "…" }
+  "version": "0.2.0", "protocol": 2, "started_at": "…" }
 ```
 
 `trunc` is the current incarnation's watermark (§7); `unsplit` lists earlier incarnations

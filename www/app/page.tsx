@@ -1,261 +1,296 @@
 import { HomeLayout } from 'fumadocs-ui/layouts/home';
 import Link from 'next/link';
 import { baseOptions } from '@/lib/layout.shared';
-import {
-  Archive,
-  Zap,
-  Code,
-  Activity,
-  ArrowRight,
-  Github,
-  Layers,
-  Signal,
-  RotateCcw,
-  Globe,
-  Shield,
-  BarChart3,
-} from 'lucide-react';
+import { ArrowRight, Github } from 'lucide-react';
 import { AnimateIn } from '@/components/animate-in';
 import { SdkTabs } from '@/components/sdk-tabs';
 
-const features = [
+// The cluster status a reader would see a few seconds after `kill -9 valka-2`.
+const failover = [
+  { prompt: true, text: 'docker compose -f docker-compose.cluster.yml up -d' },
+  { prompt: true, text: 'valka task create --queue emails --name send-welcome -q' },
+  { prompt: false, text: '01a1602b-94b9-7bd0-b8e7-36b0311c0aab' },
+  { prompt: true, text: 'docker compose -f docker-compose.cluster.yml kill -s SIGKILL valka-2' },
+  { prompt: true, text: 'valka cluster status' },
+  { prompt: false, text: 'Cluster 01a15f9e…  health OK  shards 4096  clustered' },
+  { prompt: false, text: '' },
+  { prompt: false, text: 'NODE       INC STATUS    SHARDS  PENDING' },
+  { prompt: false, text: 'valka-1      3 alive       2051       14' },
+  { prompt: false, text: 'valka-3      4 alive       2045        9' },
+  { prompt: false, text: 'valka-2      7 dead           -        -' },
+];
+
+const guarantees = [
   {
-    icon: Archive,
-    title: 'One Bucket, No Database',
-    description:
-      'An S3-compatible bucket is the only source of truth. No Postgres, no Redis, no broker. Nodes are disposable and rebuild from the WAL.',
+    title: 'Saved before it is acknowledged',
+    body: 'Every create, result and cancel is a record in a write-ahead log stored in your bucket. A node answers OK only after the segment holding it is written and the node has re-read its own lease, so a node that was declared dead cannot acknowledge anything.',
   },
   {
-    icon: Zap,
-    title: 'Zero-Latency Dispatch',
-    description:
-      'In-memory matching engine routes tasks to waiting workers instantly via oneshot channels.',
+    title: 'One writer per shard',
+    body: 'State is split into shards. Each has exactly one owner, recorded in the bucket and moved only by compare-and-swap. No database, no Raft, no gossip, no leader: nodes that share nothing but a bucket still never write the same shard.',
   },
   {
-    icon: Globe,
-    title: 'Polyglot SDKs',
-    description:
-      'First-class SDKs for Rust, TypeScript, Python, and Go. Same builder pattern, every language.',
-  },
-  {
-    icon: Activity,
-    title: 'Fully Observable',
-    description:
-      'Real-time log streaming, event bus, Prometheus metrics, and a built-in web dashboard.',
-  },
-  {
-    icon: Signal,
-    title: 'Task Signals',
-    description:
-      'Send real-time signals to running workers over the gRPC bidirectional stream.',
-  },
-  {
-    icon: RotateCcw,
-    title: 'Smart Retries & DLQ',
-    description:
-      'Configurable exponential backoff, dead letter queue, and automatic lease recovery.',
+    title: 'Work survives the failure',
+    body: 'Workers keep running when their node dies, reconnect anywhere and reattach their tasks. Results are acknowledged end to end, and every create carries an idempotency key, so retries never make a second task.',
   },
 ];
 
-const steps = [
+const bucket = `cluster.json                     cluster id, shard count
+nodes/valka-2/lease              who is alive: incarnation, state, renew counter
+owners/b1/02731                  which node owns shard 2731, at which generation
+wal/valka-2/0000000007-…0120.seg one group-committed batch of records
+snapshots/b1/02731/…-split.snap  shard 2731's state, rebuilt from a dead node's log
+splits/valka-2/7                 "incarnation 7 of valka-2 is dead and redistributed"
+queues/3f/emails                 a queue's partition count
+logs/…/{run}/…                   task log lines`;
+
+const writePath = [
+  { label: 'Your request', detail: 'REST or gRPC, to any node' },
+  { label: 'Shard owner', detail: 'validates and applies it in memory' },
+  { label: 'WAL segment', detail: 'group commit to the bucket, ≤ 50 ms' },
+  { label: 'Lease check', detail: 'still the owner? only then OK' },
+  { label: 'A worker', detail: 'gets the task the moment it is saved' },
+];
+
+const capabilities = [
+  ['Steps', 'Checkpoint each step; a retry skips the finished ones.'],
+  ['Signals', 'Send messages to a running task and get acknowledgements.'],
+  ['Retries and dead letters', 'Exponential backoff, then a dead-letter queue.'],
+  ['Scheduled tasks', 'Run no earlier than a given time.'],
+  ['Idempotency keys', 'One task per key, exact across the whole cluster.'],
+  ['Queue partitions', 'Spread a hot queue over nodes; resize online.'],
+  ['Dashboard and CLI', 'Tasks, workers, shard map, drains and shard moves.'],
+  ['Metrics and runbooks', 'Prometheus metrics, alert rules, what to do when they fire.'],
+  ['API keys', 'Keys for producers and workers, a separate admin token.'],
+];
+
+const checks = [
   {
-    step: '01',
-    title: 'Ingest',
-    description:
-      'Tasks arrive via REST or gRPC, are appended to the write-ahead log, and are acknowledged once the segment is in the bucket. Matching starts immediately.',
+    value: '7',
+    label: 'protocol bugs found by the TLA+ model',
+    detail: 'before any cluster code existed; the model runs in CI',
   },
   {
-    step: '02',
-    title: 'Match',
-    description:
-      'Hot path: instant delivery to a waiting worker over an in-memory channel. Otherwise the task waits in the in-RAM pending index and is fed to workers as capacity frees.',
+    value: '4',
+    label: 'found by a randomized simulation',
+    detail: 'thousands of seeds of kills, freezes and bucket faults, with a history checker',
   },
   {
-    step: '03',
-    title: 'Execute',
-    description:
-      'Workers receive tasks over a single gRPC bidirectional stream. Heartbeats, logs, signals, and results all flow over one connection.',
+    value: '4',
+    label: 'found by chaos on real processes',
+    detail: 'kill -9, freezes and restarts under load on a three-node cluster',
   },
 ];
+
+function SectionHeading({ title, lead }: { title: string; lead?: string }) {
+  return (
+    <AnimateIn className="mb-10 max-w-2xl">
+      <h2 className="text-balance text-3xl font-extrabold tracking-tight">{title}</h2>
+      {lead && <p className="mt-3 text-lg text-fd-muted-foreground">{lead}</p>}
+    </AnimateIn>
+  );
+}
 
 export default function Home() {
   return (
     <HomeLayout {...baseOptions()}>
-      {/* ========================= HERO ========================= */}
-      <section className="relative flex flex-col items-center px-6 pb-24 pt-28 text-center sm:pt-40">
-        {/* Background layers */}
-        <div className="pointer-events-none absolute inset-0 -z-10 overflow-hidden">
-          {/* Dot grid */}
-          <div className="hero-grid absolute inset-0" />
-          {/* Gradient orbs */}
-          <div className="float-orb absolute left-1/2 top-0 h-[600px] w-[900px] -translate-x-1/2 -translate-y-1/3 bg-[radial-gradient(ellipse,rgba(103,194,170,0.12),transparent_70%)]" />
-          <div className="float-orb-reverse pulse-glow absolute left-1/4 top-1/4 size-[500px] -translate-x-1/2 bg-[radial-gradient(circle,rgba(62,159,136,0.08),transparent_70%)]" />
-          <div className="float-orb pulse-glow absolute right-1/4 top-1/4 size-[500px] translate-x-1/2 bg-[radial-gradient(circle,rgba(194,122,72,0.07),transparent_70%)]" />
-          {/* Bottom fade */}
-          <div className="absolute bottom-0 left-0 right-0 h-32 bg-gradient-to-t from-[var(--color-fd-background)] to-transparent" />
-        </div>
-
-        {/* Badge */}
-        <div className="hero-animate hero-animate-d1 mb-8 inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-4 py-1.5 text-sm text-fd-muted-foreground backdrop-blur-sm">
-          <Layers className="size-3.5" />
-          <span>Rust-native distributed task queue</span>
-        </div>
-
-        {/* Headline */}
-        <h1 className="hero-animate hero-animate-d2 max-w-4xl text-5xl font-extrabold tracking-tight sm:text-6xl lg:text-7xl">
-          The task queue that{' '}
-          <span className="text-fd-primary">just works</span>
-        </h1>
-
-        {/* Subtitle */}
-        <p className="hero-animate hero-animate-d3 mt-6 max-w-2xl text-lg leading-relaxed text-fd-muted-foreground sm:text-xl">
-          An S3-compatible bucket is your only dependency. No database, no
-          message broker, no cache layer. Just nodes you can kill at any time.
-        </p>
-
-        {/* CTA buttons */}
-        <div className="hero-animate hero-animate-d4 mt-10 flex flex-wrap items-center justify-center gap-4">
-          <Link
-            href="/docs"
-            className="group inline-flex items-center gap-2 rounded-lg bg-white px-6 py-3 text-sm font-semibold text-black transition-all hover:bg-white/90 hover:shadow-[0_0_24px_rgba(255,255,255,0.15)]"
-          >
-            Get Started
-            <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
-          </Link>
-          <a
-            href="https://github.com/IWhitebird/Valka"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.03] px-6 py-3 text-sm font-semibold text-fd-foreground backdrop-blur-sm transition-all hover:border-white/20 hover:bg-white/[0.06]"
-          >
-            <Github className="size-4" />
-            View on GitHub
-          </a>
-        </div>
-      </section>
-
-      {/* ========================= STATS BAR ========================= */}
-      <div className="hero-animate hero-animate-d5 mx-auto max-w-5xl px-6">
-        <div className="flex flex-wrap items-center justify-center gap-x-10 gap-y-4 rounded-xl border border-white/[0.06] bg-white/[0.02] px-8 py-5">
-          {[
-            { icon: Archive, label: 'One Bucket, Zero Databases' },
-            { icon: Code, label: '4 SDK Languages' },
-            { icon: Zap, label: 'gRPC Streaming' },
-            { icon: Shield, label: 'Apache 2.0' },
-            { icon: BarChart3, label: 'Built-in Dashboard' },
-          ].map((s) => (
-            <div
-              key={s.label}
-              className="flex items-center gap-2 text-sm text-fd-muted-foreground"
-            >
-              <s.icon className="size-4 text-fd-primary" />
-              {s.label}
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* ========================= FEATURES ========================= */}
-      <section className="mx-auto max-w-6xl px-6 py-28">
-        <AnimateIn className="mb-14 text-center">
-          <h2 className="text-3xl font-bold tracking-tight sm:text-4xl">
-            Everything you need, nothing you don&apos;t
-          </h2>
-          <p className="mt-4 text-lg text-fd-muted-foreground">
-            Built from the ground up for simplicity and performance.
+      {/* Hero: the claim, and what it looks like when a node dies. */}
+      <section className="mx-auto grid max-w-6xl items-center gap-12 px-6 pb-20 pt-16 sm:pt-24 lg:grid-cols-[1.05fr_1fr]">
+        <div>
+          <p className="mb-5 font-mono text-sm text-fd-primary">Open source · Apache-2.0 · written in Rust</p>
+          <h1 className="text-balance text-4xl font-extrabold tracking-tight sm:text-5xl lg:text-[3.4rem] lg:leading-[1.05]">
+            A task queue whose only dependency is a bucket
+          </h1>
+          <p className="mt-6 max-w-xl text-lg leading-relaxed text-fd-muted-foreground">
+            Every task, retry and result is in your S3-compatible bucket before Valka says OK.
+            Nodes hold their shards in memory and are disposable: kill one, and the others take
+            its work over in seconds.
           </p>
-        </AnimateIn>
-
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {features.map((f, i) => (
-            <AnimateIn key={f.title} delay={i * 0.08}>
-              <div className="card-glow group relative h-full overflow-hidden rounded-xl border border-white/[0.06] bg-white/[0.02] p-6 transition-all duration-300 hover:border-white/[0.12] hover:bg-white/[0.04]">
-                <div
-                  className="pointer-events-none absolute inset-0 -z-10 bg-gradient-to-b from-fd-primary/15 to-fd-primary/0 opacity-0 transition-opacity duration-500 group-hover:opacity-100"
-                />
-                <div className="mb-4 inline-flex size-10 items-center justify-center rounded-lg bg-fd-primary/10">
-                  <f.icon className="size-5 text-fd-primary" />
-                </div>
-                <h3 className="mb-2 font-semibold tracking-tight">{f.title}</h3>
-                <p className="text-sm leading-relaxed text-fd-muted-foreground">
-                  {f.description}
-                </p>
-              </div>
-            </AnimateIn>
-          ))}
-        </div>
-      </section>
-
-      {/* ========================= SDK SHOWCASE ========================= */}
-      <SdkTabs />
-
-      {/* ========================= HOW IT WORKS ========================= */}
-      <section className="mx-auto max-w-5xl px-6 py-28">
-        <AnimateIn className="mb-14 text-center">
-          <h2 className="text-3xl font-bold tracking-tight sm:text-4xl">How it works</h2>
-          <p className="mt-4 text-lg text-fd-muted-foreground">
-            Two paths, one goal: get tasks to workers as fast as possible.
-          </p>
-        </AnimateIn>
-
-        <div className="grid gap-6 md:grid-cols-3">
-          {steps.map((s, i) => (
-            <AnimateIn key={s.step} delay={i * 0.12}>
-              <div
-                className="card-glow group relative h-full overflow-hidden rounded-xl border border-fd-primary/20 bg-white/[0.02] p-6 transition-all duration-300 hover:bg-white/[0.04]"
-              >
-                <div className="mb-5 inline-flex size-12 items-center justify-center rounded-xl bg-fd-primary/10">
-                  <span className="text-xl font-black text-fd-primary">{s.step}</span>
-                </div>
-                <h3 className="mb-3 text-lg font-semibold tracking-tight">{s.title}</h3>
-                <p className="text-sm leading-relaxed text-fd-muted-foreground">
-                  {s.description}
-                </p>
-              </div>
-            </AnimateIn>
-          ))}
-        </div>
-
-        <AnimateIn className="mt-8 text-center" delay={0.3}>
-          <Link
-            href="/docs/architecture"
-            className="group inline-flex items-center gap-1.5 text-sm font-medium text-fd-muted-foreground transition-colors hover:text-fd-foreground"
-          >
-            Read the full architecture docs
-            <ArrowRight className="size-3.5 transition-transform group-hover:translate-x-0.5" />
-          </Link>
-        </AnimateIn>
-      </section>
-
-      {/* ========================= CTA ========================= */}
-      <section className="relative flex flex-col items-center px-6 pb-32 pt-16 text-center">
-        <div className="pointer-events-none absolute inset-0 -z-10 overflow-hidden">
-          <div className="float-orb-reverse absolute bottom-0 left-1/2 h-[400px] w-[700px] -translate-x-1/2 translate-y-1/3 bg-[radial-gradient(ellipse,rgba(103,194,170,0.1),transparent_70%)]" />
-        </div>
-
-        <AnimateIn>
-          <h2 className="text-3xl font-bold tracking-tight sm:text-4xl">
-            Ready to simplify your task queue?
-          </h2>
-          <p className="mx-auto mt-4 mb-10 max-w-lg text-lg text-fd-muted-foreground">
-            Read the docs, spin up a server, and ship your first worker in minutes.
-          </p>
-          <div className="flex flex-wrap items-center justify-center gap-4">
+          <div className="mt-9 flex flex-wrap items-center gap-3">
             <Link
-              href="/docs"
-              className="group inline-flex items-center gap-2 rounded-lg bg-white px-6 py-3 text-sm font-semibold text-black transition-all hover:bg-white/90 hover:shadow-[0_0_24px_rgba(255,255,255,0.15)]"
+              href="/docs/quick-start"
+              className="group inline-flex items-center gap-2 rounded-lg bg-fd-primary px-5 py-2.5 text-sm font-semibold text-fd-primary-foreground transition-opacity hover:opacity-90"
             >
-              Read the Docs
+              Get started
               <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
             </Link>
             <Link
-              href="/docs/quick-start"
-              className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.03] px-6 py-3 text-sm font-semibold text-fd-foreground backdrop-blur-sm transition-all hover:border-white/20 hover:bg-white/[0.06]"
+              href="/docs/architecture"
+              className="inline-flex items-center gap-2 rounded-lg border border-fd-border px-5 py-2.5 text-sm font-semibold transition-colors hover:bg-fd-accent"
             >
-              Quick Start Guide
+              How it works
             </Link>
+            <a
+              href="https://github.com/IWhitebird/Valka"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-2 rounded-lg px-3 py-2.5 text-sm font-semibold text-fd-muted-foreground transition-colors hover:text-fd-foreground"
+            >
+              <Github className="size-4" />
+              GitHub
+            </a>
           </div>
+        </div>
+
+        <div className="min-w-0 overflow-hidden rounded-xl border border-fd-border bg-[#0d1211] shadow-sm">
+          <div className="flex items-center gap-1.5 border-b border-white/[0.06] px-4 py-2.5">
+            <span className="size-2.5 rounded-full bg-white/15" />
+            <span className="size-2.5 rounded-full bg-white/15" />
+            <span className="size-2.5 rounded-full bg-white/15" />
+            <span className="ml-3 font-mono text-xs text-[#94a19c]">three nodes, one bucket</span>
+          </div>
+          <pre className="overflow-x-auto p-5 font-mono text-[12.5px] leading-relaxed text-[#d7dfdb]">
+            {failover.map((l, i) => (
+              <div key={i}>
+                {l.prompt ? (
+                  <>
+                    <span className="text-[#67c2aa]">$ </span>
+                    {l.text}
+                  </>
+                ) : (
+                  <span className={l.text.includes('dead') ? 'text-[#e2a47a]' : 'text-[#94a19c]'}>
+                    {l.text || ' '}
+                  </span>
+                )}
+              </div>
+            ))}
+          </pre>
+        </div>
+      </section>
+
+      {/* Guarantees: the mechanisms, not adjectives. */}
+      <section className="border-y border-fd-border bg-fd-card/40">
+        <div className="mx-auto grid max-w-6xl gap-10 px-6 py-16 md:grid-cols-3">
+          {guarantees.map((g, i) => (
+            <AnimateIn key={g.title} delay={i * 0.06}>
+              <h3 className="text-lg font-bold tracking-tight">{g.title}</h3>
+              <p className="mt-3 text-[15px] leading-relaxed text-fd-muted-foreground">{g.body}</p>
+            </AnimateIn>
+          ))}
+        </div>
+      </section>
+
+      {/* The write path. */}
+      <section className="mx-auto max-w-6xl px-6 py-20">
+        <SectionHeading
+          title="What happens to a write"
+          lead="The same path for a create, a result, a cancel or a retry timer firing."
+        />
+        <ol className="grid gap-3 md:grid-cols-5">
+          {writePath.map((s, i) => (
+            <AnimateIn key={s.label} delay={i * 0.05}>
+              <li className="relative h-full rounded-lg border border-fd-border bg-fd-card px-4 py-4">
+                <p className="font-semibold">{s.label}</p>
+                <p className="mt-1 text-sm text-fd-muted-foreground">{s.detail}</p>
+                {i < writePath.length - 1 && (
+                  <ArrowRight
+                    aria-hidden
+                    className="absolute -right-3 top-1/2 z-10 hidden size-4 -translate-y-1/2 text-fd-muted-foreground md:block"
+                  />
+                )}
+              </li>
+            </AnimateIn>
+          ))}
+        </ol>
+      </section>
+
+      {/* The bucket. */}
+      <section className="mx-auto grid max-w-6xl gap-10 px-6 pb-20 lg:grid-cols-[1fr_1.4fr]">
+        <AnimateIn>
+          <h2 className="text-balance text-3xl font-extrabold tracking-tight">
+            Everything lives in your bucket
+          </h2>
+          <p className="mt-4 text-lg leading-relaxed text-fd-muted-foreground">
+            Plain objects you can list, read and back up. The log is compressed JSON, so any tool
+            can follow it. Run one node against a local directory while you build, and a cluster
+            against S3, MinIO or another compatible store in production.
+          </p>
+          <Link
+            href="/docs/clustering"
+            className="group mt-6 inline-flex items-center gap-1.5 text-sm font-semibold text-fd-primary"
+          >
+            How nodes share it
+            <ArrowRight className="size-3.5 transition-transform group-hover:translate-x-0.5" />
+          </Link>
         </AnimateIn>
+        <AnimateIn delay={0.08} className="min-w-0">
+          <pre className="overflow-x-auto rounded-xl border border-fd-border bg-fd-card p-5 font-mono text-[12.5px] leading-relaxed text-fd-muted-foreground">
+            {bucket}
+          </pre>
+        </AnimateIn>
+      </section>
+
+      {/* SDKs. */}
+      <SdkTabs />
+
+      {/* Capabilities. */}
+      <section className="mx-auto max-w-6xl px-6 py-20">
+        <SectionHeading title="Built for real work" />
+        <dl className="grid gap-x-10 gap-y-6 sm:grid-cols-2 lg:grid-cols-3">
+          {capabilities.map(([term, desc]) => (
+            <div key={term} className="border-t border-fd-border pt-4">
+              <dt className="font-semibold">{term}</dt>
+              <dd className="mt-1 text-sm text-fd-muted-foreground">{desc}</dd>
+            </div>
+          ))}
+        </dl>
+      </section>
+
+      {/* Verification. */}
+      <section className="border-y border-fd-border bg-fd-card/40">
+        <div className="mx-auto max-w-6xl px-6 py-20">
+          <SectionHeading
+            title="Tested the way it fails"
+            lead="Each bug below was found before release and fixed with a regression test."
+          />
+          <div className="grid gap-8 md:grid-cols-3">
+            {checks.map((c) => (
+              <AnimateIn key={c.label}>
+                <p className="font-display text-5xl font-extrabold tabular-nums text-fd-primary">{c.value}</p>
+                <p className="mt-2 font-semibold">{c.label}</p>
+                <p className="mt-1 text-sm text-fd-muted-foreground">{c.detail}</p>
+              </AnimateIn>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* Quick start. */}
+      <section className="mx-auto max-w-6xl px-6 py-20">
+        <div className="grid gap-10 lg:grid-cols-2">
+          <AnimateIn>
+            <h2 className="text-balance text-3xl font-extrabold tracking-tight">Try it in a minute</h2>
+            <p className="mt-4 text-lg text-fd-muted-foreground">
+              One node against a local directory, or three nodes and an S3-compatible store in
+              Docker. The dashboard runs on every node.
+            </p>
+            <div className="mt-8 flex flex-wrap gap-3">
+              <Link
+                href="/docs/quick-start"
+                className="group inline-flex items-center gap-2 rounded-lg bg-fd-primary px-5 py-2.5 text-sm font-semibold text-fd-primary-foreground transition-opacity hover:opacity-90"
+              >
+                Quick start
+                <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
+              </Link>
+              <Link
+                href="/docs/deployment"
+                className="inline-flex items-center gap-2 rounded-lg border border-fd-border px-5 py-2.5 text-sm font-semibold transition-colors hover:bg-fd-accent"
+              >
+                Deployment
+              </Link>
+            </div>
+          </AnimateIn>
+          <AnimateIn delay={0.08} className="min-w-0">
+            <pre className="overflow-x-auto rounded-xl border border-fd-border bg-fd-card p-5 font-mono text-[13px] leading-relaxed">
+              <span className="text-fd-muted-foreground"># one node, data in ./data</span>
+              {'\n'}cargo run -p valka-server{'\n\n'}
+              <span className="text-fd-muted-foreground"># three nodes: dashboard on :8981, :8982, :8983</span>
+              {'\n'}docker compose -f docker-compose.cluster.yml up -d{'\n\n'}
+              <span className="text-fd-muted-foreground"># break it and watch it recover</span>
+              {'\n'}scripts/chaos.sh
+            </pre>
+          </AnimateIn>
+        </div>
       </section>
     </HomeLayout>
   );

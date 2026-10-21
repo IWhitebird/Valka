@@ -9,9 +9,9 @@
     "types:check": "fumadocs-mdx && tsc --noEmit"
   },
   "dependencies": {
-    "fumadocs-core": "latest",
-    "fumadocs-mdx": "latest",
-    "fumadocs-ui": "latest",
+    "fumadocs-core": "16.6.3",
+    "fumadocs-mdx": "14.2.7",
+    "fumadocs-ui": "16.6.3",
     "lucide-react": "^0.570.0",
     "mermaid": "^11.12.3",
     "next": "^16.0.0",

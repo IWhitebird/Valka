@@ -1,0 +1,194 @@
+name: Release
+
+# Push a tag `vX.Y.Z` (matching the workspace version in Cargo.toml) to publish:
+#   - the image ghcr.io/iwhitebird/valka:X.Y.Z and :X.Y
+#   - a GitHub release with the notes from CHANGELOG.md, Linux binaries (server, CLI and
+#     dashboard), the TypeScript SDK tarball and the Python SDK wheel
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re)publish, e.g. v0.2.0
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: iwhitebird/valka
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  verify:
+    name: Verify the tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - id: v
+        name: Tag, Cargo.toml, SDK versions and CHANGELOG agree
+        run: |
+          version="${TAG#v}"
+          cargo_version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          ts_version=$(node -p "require('./sdks/typescript/package.json').version")
+          py_version=$(sed -n 's/^version = "\(.*\)"/\1/p' sdks/python/pyproject.toml)
+          for v in "$cargo_version" "$ts_version" "$py_version"; do
+            if [ "$v" != "$version" ]; then
+              echo "::error::tag $TAG but versions are Cargo $cargo_version, TypeScript $ts_version, Python $py_version"
+              exit 1
+            fi
+          done
+          grep -q "^## \[$version\]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no [$version] section"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  binaries:
+    name: Linux binaries
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build the dashboard
+        working-directory: web
+        run: npm ci && npm run build
+      - name: Build the server and the CLI
+        run: cargo build --release --locked -p valka-server -p valka-cli
+      - name: Package
+        run: |
+          name="valka-${TAG}-x86_64-linux"
+          mkdir -p "dist/$name/web"
+          cp target/release/valka-server target/release/valka "dist/$name/"
+          cp -r web/dist "dist/$name/web/dist"
+          cp LICENSE README.md CHANGELOG.md deploy/valka.example.toml "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  sdks:
+    name: SDK packages
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: TypeScript tarball
+        working-directory: sdks/typescript
+        run: |
+          npm ci
+          npm run build
+          npm pack --pack-destination ../../dist
+      - name: Python wheel and sdist
+        working-directory: sdks/python
+        run: |
+          pip install build
+          python -m build --outdir ../../dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdks
+          path: dist/*
+
+  image:
+    name: Image (ghcr.io)
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tags
+        id: tags
+        run: |
+          v="${{ needs.verify.outputs.version }}"
+          echo "tags=${REGISTRY}/${IMAGE_NAME}:${v},${REGISTRY}/${IMAGE_NAME}:${v%.*}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/IWhitebird/Valka
+            org.opencontainers.image.version=${{ needs.verify.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: GitHub release
+    needs: [verify, binaries, sdks, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release notes from CHANGELOG.md
+        run: |
+          v="${{ needs.verify.outputs.version }}"
+          awk -v v="$v" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          cat >> notes.md <<EOF
+
+          ### Install
+
+          - Image: \`docker pull ${REGISTRY}/${IMAGE_NAME}:${v}\`
+          - Linux binaries: \`valka-${TAG}-x86_64-linux.tar.gz\` below (server, CLI, dashboard)
+          - Rust SDK: \`cargo add valka-sdk --git https://github.com/IWhitebird/Valka --tag ${TAG}\`
+          - TypeScript SDK: \`npm install https://github.com/IWhitebird/Valka/releases/download/${TAG}/valka-sdk-${v}.tgz\`
+          - Python SDK: \`pip install https://github.com/IWhitebird/Valka/releases/download/${TAG}/valka-${v}-py3-none-any.whl\`
+          - Go SDK: \`go get github.com/IWhitebird/Valka/sdks/go@${TAG}\`
+          EOF
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" dist/* --title "Valka ${TAG}" --notes-file notes.md --verify-tag
+          fi
