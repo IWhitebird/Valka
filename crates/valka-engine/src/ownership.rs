@@ -563,6 +563,8 @@ impl Engine {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "split dead incarnation"
         );
+        // Claims refused while this log was unsplit can go through now.
+        self.clear_claim_backoff();
         if let Err(e) = split::delete_incarnation_log(store, node, inc).await {
             warn!(node, inc, error = %e, "deleting split log failed; the collector retries");
         }

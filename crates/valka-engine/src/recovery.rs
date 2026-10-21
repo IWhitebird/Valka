@@ -1,6 +1,7 @@
 //! Per-shard index rebuild after a claim, and the snapshot / truncation round.
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use futures::StreamExt;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -241,28 +242,30 @@ impl Engine {
             }
             return 0;
         }
-        let mut written = 0;
-        for c in batch {
-            match snapshot::write(&self.inner.store, &c.key, &c.snap).await {
-                Ok(_) => {
-                    written += 1;
-                    if let Err(e) = snapshot::prune(
-                        &self.inner.store,
-                        c.key.shard,
-                        self.inner.cfg.wal.snapshots_to_keep.max(1),
-                    )
-                    .await
-                    {
-                        warn!(shard = %c.key.shard, error = %e, "snapshot prune failed");
+        // Shards are independent: write them concurrently, or a round over thousands of
+        // dirty shards (and the snapshots of a clean stop) takes minutes on a bucket.
+        let keep = self.inner.cfg.wal.snapshots_to_keep.max(1);
+        let concurrency = self.inner.cfg.cluster.claim_concurrency.max(1);
+        futures::stream::iter(batch)
+            .map(|c| async move {
+                match snapshot::write(&self.inner.store, &c.key, &c.snap).await {
+                    Ok(_) => {
+                        if let Err(e) = snapshot::prune(&self.inner.store, c.key.shard, keep).await
+                        {
+                            warn!(shard = %c.key.shard, error = %e, "snapshot prune failed");
+                        }
+                        1
+                    }
+                    Err(e) => {
+                        error!(shard = %c.key.shard, error = %e, "snapshot write failed; keeping WAL");
+                        self.restore_bookkeeping(&c);
+                        0
                     }
                 }
-                Err(e) => {
-                    error!(shard = %c.key.shard, error = %e, "snapshot write failed; keeping WAL");
-                    self.restore_bookkeeping(&c);
-                }
-            }
-        }
-        written
+            })
+            .buffer_unordered(concurrency)
+            .fold(0, |n, w| async move { n + w })
+            .await
     }
 
     fn restore_bookkeeping(&self, c: &Captured) {

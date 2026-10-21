@@ -569,3 +569,36 @@ async fn garbage_collector_removes_split_logs_and_old_snapshots() {
     let per_shard = valka_wal::snapshot::list_all(&store).await.unwrap();
     assert!(per_shard.values().all(|v| v.len() <= 2));
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_takeover_does_not_wait_out_claim_backoff() {
+    // Found by the failover benchmark: peers saw a dead node's lease expire by their own
+    // clock and tried its shards before the guardian had split its log; each refusal
+    // doubled a backoff (up to 30 s), so some shards were taken over 20 s after the split.
+    let b = bucket();
+    let a = start(&b, "a").await;
+    let n2 = start(&b, "b").await;
+    wait_until("converged", 20, || {
+        a.engine.owned_shards().len() + n2.engine.owned_shards().len() == SHARDS as usize
+            && !a.engine.owned_shards().is_empty()
+    })
+    .await;
+    // One of a's shards, refused so often that its next attempt is a minute away.
+    let shard = a.engine.owned_shards()[0];
+    n2.engine.inner.membership.backoff.lock().insert(
+        shard,
+        (
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(30),
+        ),
+    );
+
+    a.engine.halt();
+    a.faults.set_puts_down(true);
+    // lease_timeout is 3 s: the split and every claim follow within a few rounds.
+    wait_until("b serves every shard", 8, || {
+        n2.engine.owned_shards().len() == SHARDS as usize
+    })
+    .await;
+    assert!(n2.engine.owns(shard));
+}

@@ -69,7 +69,7 @@ pub(crate) struct Membership {
     members: Mutex<BTreeMap<String, Member>>,
     last_refresh: Mutex<Option<Instant>>,
     /// Shards that were not claimable: next attempt, and the current backoff.
-    backoff: Mutex<HashMap<ShardId, (Instant, Duration)>>,
+    pub(crate) backoff: Mutex<HashMap<ShardId, (Instant, Duration)>>,
     last_gc: Mutex<Option<Instant>>,
     /// Operator pins from `placement.json` (shard -> node) and the ETag they were read at.
     pins: Mutex<(BTreeMap<u16, String>, Option<String>)>,
@@ -190,8 +190,25 @@ impl Engine {
         } else {
             m.dead_since = None;
         }
+        // A peer that died, restarted or finished splitting may have unblocked claims this
+        // node backed off from: retry them on the next round, not after the backoff (up
+        // to 30 s), or a takeover waits for it. Renewals change none of these.
+        let unblocks = m.lease.as_ref().is_some_and(|prev| {
+            prev.state != v.record.state
+                || prev.inc != v.record.inc
+                || prev.unsplit != v.record.unsplit
+        });
         m.lease = Some(v.record);
         m.fetched_at = Some(now);
+        drop(members);
+        if unblocks {
+            self.clear_claim_backoff();
+        }
+    }
+
+    /// Forget every claim backoff: the next placement round tries those shards again.
+    pub(crate) fn clear_claim_backoff(&self) {
+        self.inner.membership.backoff.lock().clear();
     }
 
     /// Nodes that take part in placement, this one included when it may serve.
