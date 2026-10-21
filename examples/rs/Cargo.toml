@@ -34,3 +34,7 @@ path = "steps.rs"
 [[example]]
 name = "chaos"
 path = "chaos.rs"
+
+[[example]]
+name = "bench"
+path = "bench.rs"
