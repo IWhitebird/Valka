@@ -2056,3 +2056,31 @@ async fn log_ingester_keeps_draining_while_the_bucket_is_slow() {
         assert_eq!(ts, want, "run-{r}: every line, in order");
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_oversized_result_is_a_definite_failure() {
+    // Found by the code review: a result larger than the payload limit was stored as is,
+    // and one too large for a gRPC message broke the worker's stream on every resend.
+    use crate::ResultOutcome::Applied;
+    let store = Store::memory();
+    let mut cfg = EngineConfig::for_tests("node-a");
+    cfg.limits.max_payload_bytes = 100;
+    let e = Engine::open(store.clone(), cfg).await.unwrap();
+    let t = e.create_task(create("q")).await.unwrap();
+    let d = e.dispatch(&t.id, "w").unwrap();
+    let big = completed(serde_json::json!("x".repeat(500)));
+    assert_eq!(e.report_result(&t.id, &d.run_id, big).await, Applied);
+    let big_again = completed(serde_json::json!("x".repeat(500)));
+    assert_eq!(e.report_result(&t.id, &d.run_id, big_again).await, Applied);
+    let v = e.get_task(&t.id).unwrap();
+    assert_eq!(
+        v.status,
+        TaskStatus::Failed,
+        "not retried: it would fail again"
+    );
+    assert!(
+        v.error_message
+            .unwrap()
+            .contains("limits.max_payload_bytes")
+    );
+}

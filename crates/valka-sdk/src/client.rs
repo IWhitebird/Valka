@@ -124,7 +124,10 @@ impl ValkaClient {
         let addr = self.nodes[self.next % self.nodes.len()].clone();
         match connect_channel(&addr, self.timeout).await {
             Ok(channel) => {
-                let c = ApiServiceClient::with_interceptor(channel, self.auth.clone());
+                // The server bounds what a task carries (its payload limit); gRPC's 4 MiB
+                // default would refuse a large task or result on the way back.
+                let c = ApiServiceClient::with_interceptor(channel, self.auth.clone())
+                    .max_decoding_message_size(usize::MAX);
                 self.conn = Some(c.clone());
                 Ok(c)
             }

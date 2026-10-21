@@ -217,6 +217,9 @@ class ValkaWorker:
             options=[
                 ("grpc.keepalive_time_ms", 10_000),
                 ("grpc.keepalive_timeout_ms", 5_000),
+                # The server bounds what a task carries (its payload limit); gRPC's 4 MiB
+                # default would break the stream on a large assignment.
+                ("grpc.max_receive_message_length", -1),
             ],
         )
 

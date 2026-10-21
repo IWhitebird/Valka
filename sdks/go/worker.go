@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/signal"
 	"sync"
@@ -288,6 +289,9 @@ func (w *ValkaWorker) session(ctx context.Context, retry *RetryPolicy) error {
 			Time:    10 * time.Second,
 			Timeout: 5 * time.Second,
 		}),
+		// The server bounds what a task carries (its payload limit); gRPC's 4 MiB default
+		// would break the stream on a large assignment.
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(math.MaxInt32)),
 	}
 	if w.apiKey != "" {
 		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(apiKeyCreds(w.apiKey)))

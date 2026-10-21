@@ -735,6 +735,7 @@ impl Engine {
         run_id: &str,
         result: RunResult,
     ) -> ResultOutcome {
+        let result = self.bound_result(result);
         let recorded = match &result {
             RunResult::Completed(output) => self
                 .complete_run(task_id, run_id, output.clone())
@@ -760,6 +761,38 @@ impl Engine {
                     Ok(_) => ResultOutcome::Stale,
                 }
             }
+        }
+    }
+
+    /// A result over `limits.max_payload_bytes` is stored as a definite, non-retryable
+    /// failure saying so: refusing it would make the worker resend it forever.
+    fn bound_result(&self, result: RunResult) -> RunResult {
+        let max = self.inner.cfg.limits.max_payload_bytes;
+        if max == 0 {
+            return result;
+        }
+        match result {
+            RunResult::Completed(Some(output)) if json_size(&output) > max => RunResult::Failed {
+                error: format!(
+                    "the result output is {} bytes; the limit is {max} \
+                     (limits.max_payload_bytes). Store large results elsewhere and return a \
+                     reference",
+                    json_size(&output)
+                ),
+                retryable: false,
+            },
+            RunResult::Failed {
+                mut error,
+                retryable,
+            } if error.len() > max => {
+                let mut end = max;
+                while !error.is_char_boundary(end) {
+                    end -= 1;
+                }
+                error.truncate(end);
+                RunResult::Failed { error, retryable }
+            }
+            other => other,
         }
     }
 

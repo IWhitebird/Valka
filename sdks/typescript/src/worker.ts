@@ -260,6 +260,10 @@ export class ValkaWorker {
   private async connectAndRun(retryPolicy: RetryPolicy): Promise<void> {
     const channel: Channel = createChannel(
       this.serverAddrs[this.nextAddr % this.serverAddrs.length],
+      undefined,
+      // The server bounds what a task carries (its payload limit); gRPC's 4 MiB default
+      // would break the stream on a large assignment.
+      { "grpc.max_receive_message_length": -1 },
     );
     const client = createClient(
       WorkerServiceDefinition,

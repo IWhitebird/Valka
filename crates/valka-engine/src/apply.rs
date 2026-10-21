@@ -226,6 +226,11 @@ impl ShardState {
                         TaskStatus::DeadLetter
                     }
                 };
+                // Signals the ended run received but never acknowledged go to the next
+                // attempt.
+                if to == TaskStatus::Retry {
+                    self.requeue_delivered_signals(task_id);
+                }
                 let t = &self.tasks[task_id];
                 out.push(Transition {
                     task_id: task_id.clone(),
@@ -310,6 +315,7 @@ impl ShardState {
                     worker_id: Some(worker),
                     error: None,
                 });
+                self.requeue_delivered_signals(task_id);
             }
 
             WalRecord::TaskCheckpointed {
@@ -474,14 +480,7 @@ impl ShardState {
                 }
             }
 
-            WalRecord::SignalsReset { task_id } => {
-                for s in self.signals.values_mut() {
-                    if s.task_id == *task_id && s.status == SignalStatus::Delivered {
-                        s.status = SignalStatus::Pending;
-                        s.delivered_at = None;
-                    }
-                }
-            }
+            WalRecord::SignalsReset { task_id } => self.requeue_delivered_signals(task_id),
 
             WalRecord::ShardCleared => {
                 for (_, t) in self.tasks.drain() {
@@ -751,6 +750,41 @@ mod tests {
             task_id: "a".into(),
         }));
         assert!(orphan.dead_letters.is_empty());
+    }
+
+    #[test]
+    fn a_retried_run_leaves_its_unacknowledged_signals_to_the_next_attempt() {
+        // Found by the code review: a signal delivered to a run whose lease then expired
+        // stayed DELIVERED, so the next attempt never received it.
+        let mut s = ShardState::new(ShardId(0));
+        s.apply(&mut env(WalRecord::TaskCreated { task: spec("a") }));
+        s.apply(&mut env(WalRecord::TaskDispatched {
+            task_id: "a".into(),
+            run_id: "r1".into(),
+            attempt: 1,
+            worker_id: "w".into(),
+            node_id: "n".into(),
+            lease_until: Utc::now(),
+        }));
+        s.apply(&mut env(WalRecord::SignalCreated {
+            signal_id: "sig".into(),
+            task_id: "a".into(),
+            signal_name: "ping".into(),
+            payload: None,
+        }));
+        s.apply(&mut env(WalRecord::SignalDelivered {
+            signal_id: "sig".into(),
+            task_id: "a".into(),
+        }));
+        assert_eq!(s.signals["sig"].status, SignalStatus::Delivered);
+        s.apply(&mut env(WalRecord::LeaseExpired {
+            task_id: "a".into(),
+            run_id: "r1".into(),
+            error: "lease expired".into(),
+            outcome: FailureOutcome::Retry { at: Utc::now() },
+        }));
+        assert_eq!(s.tasks["a"].status, TaskStatus::Retry);
+        assert_eq!(s.signals["sig"].status, SignalStatus::Pending);
     }
 
     #[test]

@@ -422,7 +422,10 @@ impl ValkaWorker {
             &self.server_addrs[self.next_addr.load(Ordering::Relaxed) % self.server_addrs.len()];
         let channel = connect_channel(addr, Duration::from_secs(10)).await?;
 
-        let mut client = WorkerServiceClient::with_interceptor(channel, self.auth.clone());
+        // The server bounds what a task carries (its payload limit); gRPC's 4 MiB default
+        // would break the stream on a large assignment.
+        let mut client = WorkerServiceClient::with_interceptor(channel, self.auth.clone())
+            .max_decoding_message_size(usize::MAX);
         let (request_tx, request_rx) = mpsc::channel::<WorkerRequest>(256);
         let response = client.session(ReceiverStream::new(request_rx)).await?;
         let mut inbound = response.into_inner();

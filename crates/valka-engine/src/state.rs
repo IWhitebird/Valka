@@ -464,6 +464,17 @@ impl ShardState {
         victims.len()
     }
 
+    /// Signals of `task_id` delivered to a run that ended without acknowledging them go
+    /// back to PENDING, for the next run (or a reconnected worker) to receive.
+    pub(crate) fn requeue_delivered_signals(&mut self, task_id: &str) {
+        for s in self.signals.values_mut() {
+            if s.task_id == task_id && s.status == SignalStatus::Delivered {
+                s.status = SignalStatus::Pending;
+                s.delivered_at = None;
+            }
+        }
+    }
+
     /// Remove a task with everything that hangs off it: its idempotency key (if it still
     /// names this task), its signals, its dead-letter entries.
     pub(crate) fn remove_task(&mut self, task_id: &str) -> Option<TaskState> {
