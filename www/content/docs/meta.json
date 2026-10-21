@@ -15,6 +15,7 @@
     "sdks",
     "---",
     "dashboard",
-    "deployment"
+    "deployment",
+    "benchmarks"
   ]
 }

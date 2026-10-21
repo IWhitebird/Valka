@@ -5,19 +5,21 @@ import { ArrowRight, Github } from 'lucide-react';
 import { AnimateIn } from '@/components/animate-in';
 import { SdkTabs } from '@/components/sdk-tabs';
 
-// The cluster status a reader would see a few seconds after `kill -9 valka-2`.
+// Real output: `valka cluster status` a few seconds after `kill -9` of one node of the
+// compose cluster (columns trimmed to fit).
 const failover = [
-  { prompt: true, text: 'docker compose -f docker-compose.cluster.yml up -d' },
-  { prompt: true, text: 'valka task create --queue emails --name send-welcome -q' },
-  { prompt: false, text: '01a1602b-94b9-7bd0-b8e7-36b0311c0aab' },
-  { prompt: true, text: 'docker compose -f docker-compose.cluster.yml kill -s SIGKILL valka-2' },
+  { prompt: true, text: 'export COMPOSE_FILE=docker-compose.cluster.yml' },
+  { prompt: true, text: 'docker compose up -d' },
+  { prompt: true, text: 'export VALKA_HTTP=http://localhost:8981' },
+  { prompt: true, text: 'export VALKA_API_KEY=change-me-api-key' },
+  { prompt: true, text: 'docker compose kill -s SIGKILL valka-2' },
   { prompt: true, text: 'valka cluster status' },
-  { prompt: false, text: 'Cluster 01a15f9e…  health OK  shards 4096  clustered' },
+  { prompt: false, text: 'Cluster 01a1605b…  health OK  shards 4096  clustered' },
   { prompt: false, text: '' },
-  { prompt: false, text: 'NODE       INC STATUS    SHARDS  PENDING' },
-  { prompt: false, text: 'valka-1      3 alive       2051       14' },
-  { prompt: false, text: 'valka-3      4 alive       2045        9' },
-  { prompt: false, text: 'valka-2      7 dead           -        -' },
+  { prompt: false, text: 'NODE       INC STATUS   SHARDS  PENDING  RUNNING' },
+  { prompt: false, text: 'valka-1      7 alive      1409        1        0' },
+  { prompt: false, text: 'valka-3      8 alive      2687        2        0' },
+  { prompt: false, text: 'valka-2      7 dead          -        -        -' },
 ];
 
 const guarantees = [
@@ -35,14 +37,14 @@ const guarantees = [
   },
 ];
 
-const bucket = `cluster.json                     cluster id, shard count
-nodes/valka-2/lease              who is alive: incarnation, state, renew counter
-owners/b1/02731                  which node owns shard 2731, at which generation
-wal/valka-2/0000000007-…0120.seg one group-committed batch of records
-snapshots/b1/02731/…-split.snap  shard 2731's state, rebuilt from a dead node's log
-splits/valka-2/7                 "incarnation 7 of valka-2 is dead and redistributed"
-queues/3f/emails                 a queue's partition count
-logs/…/{run}/…                   task log lines`;
+const bucket = `cluster.json                      cluster id, shard count
+nodes/valka-2/lease               liveness: incarnation, renewals
+owners/b1/02731                   owner and generation of shard 2731
+wal/valka-2/…07-…0120.seg         one group commit of records
+snapshots/b1/02731/…-split.snap   shard 2731, rebuilt from a dead log
+splits/valka-2/7                  incarnation 7 is dead and split
+queues/3f/emails                  partition count of a queue
+logs/…/{run}/…                    task log lines`;
 
 const writePath = [
   { label: 'Your request', detail: 'REST or gRPC, to any node' },
@@ -76,9 +78,14 @@ const checks = [
     detail: 'thousands of seeds of kills, freezes and bucket faults, with a history checker',
   },
   {
-    value: '4',
+    value: '3',
     label: 'found by chaos on real processes',
     detail: 'kill -9, freezes and restarts under load on a three-node cluster',
+  },
+  {
+    value: '7',
+    label: 'found by load and failover benchmarks',
+    detail: 'a livelock, 30-second stalls, a per-worker ceiling, slow takeovers',
   },
 ];
 
@@ -104,7 +111,7 @@ export default function Home() {
           <p className="mt-6 max-w-xl text-lg leading-relaxed text-fd-muted-foreground">
             Every task, retry and result is in your S3-compatible bucket before Valka says OK.
             Nodes hold their shards in memory and are disposable: kill one, and the others take
-            its work over in seconds.
+            its work over once its lease runs out.
           </p>
           <div className="mt-9 flex flex-wrap items-center gap-3">
             <Link
@@ -243,7 +250,7 @@ export default function Home() {
             title="Tested the way it fails"
             lead="Each bug below was found before release and fixed with a regression test."
           />
-          <div className="grid gap-8 md:grid-cols-3">
+          <div className="grid gap-8 sm:grid-cols-2 lg:grid-cols-4">
             {checks.map((c) => (
               <AnimateIn key={c.label}>
                 <p className="font-display text-5xl font-extrabold tabular-nums text-fd-primary">{c.value}</p>

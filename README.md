@@ -31,9 +31,9 @@ Most task queues bolt together a message broker, a database, and a cache. Every 
 **Valka takes a different approach.** An S3-compatible bucket is the single source of truth: every state transition is appended to a write-ahead log, group-committed to the bucket, and nothing is acknowledged before it lands there. Nodes hold only rebuildable RAM state, so any node can be killed at any time and a fresh one rebuilds itself from snapshots plus the WAL tail. An in-memory matching engine and gRPC bidirectional streaming replace the message broker entirely.
 
 - **One dependency.** If you have a bucket (S3, MinIO, R2, or a local directory), you can run Valka.
-- **Diskless, disposable nodes.** Acked = durable in the bucket, 11 nines of durability, no replication to operate.
+- **Diskless, disposable nodes.** Acknowledged means durable in the bucket (on S3, eleven nines), with no replication to operate.
 - **Free history and CDC.** The WAL is plain zstd-compressed JSON; anything can tail it straight from the bucket.
-- **Zero-latency hot path.** Tasks are matched to waiting workers in-memory — no polling.
+- **In-memory hot path.** A task reaches a waiting worker the moment it is durable, with no polling: pickup is the commit latency plus about a millisecond ([benchmarks](docs/BENCHMARKS.md)).
 - **Polyglot.** Rust, TypeScript, Go, and Python SDKs. Or just use the REST API.
 - **Observable.** Real-time log streaming, event feeds, Prometheus metrics, and a web dashboard out of the box.
 

@@ -556,7 +556,7 @@ G1 or G2.
 
 | Scenario | What happens | Visible effect | Guarantees |
 |---|---|---|---|
-| `kill -9` node A | Guardian: lease unchanged 10 s → tombstone → split (~1 s) → desired owners claim → serve | A's shards unavailable ~11–15 s; A's workers reconnect to other nodes and reattach | G1 G2 G5 |
+| `kill -9` node A | Guardian: lease unchanged 10 s → tombstone → split (~1 s) → desired owners claim → serve | A's shards unavailable ~11–15 s by design (13–27 s measured, see BENCHMARKS.md); A's workers reconnect to other nodes and reattach | G1 G2 G5 |
 | A frozen 30 s (SIGSTOP / GC / VM freeze), then resumes | Taken over during the freeze. On resume: in-flight PUTs hit the seal or land above it; the own-lease check fails; renewal fails → poison, exit, restart as a new incarnation | A's unacked requests fail; clients retry elsewhere | G1 G2 |
 | A cut off from the bucket | Can't PUT, so no acks; self-fences at 7 s; tombstoned at 10 s; shards move | A's shards unavailable ~15 s | G1 G2 G5 |
 | Network split between nodes, bucket reachable | Leases keep renewing, so no takeover. Forwarding across the split fails; each side serves the shards it owns | Cross-side requests get `Unavailable` until it heals | G1 G2 |

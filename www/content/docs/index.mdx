@@ -25,10 +25,10 @@ never touches a database.
 - **Disposable nodes**: live state is in RAM and rebuilt from the bucket, so any node can be
   killed or replaced
 - **One node or many**: point more nodes at the same bucket. Any node takes any request, and a
-  dead node's work moves to the others in about 15 s
+  dead node's work moves to the others once its lease runs out (15–30 s, see [Benchmarks](/docs/benchmarks))
 - **Workers ride through node failures**: they reconnect and reattach their running tasks
-- **Zero-latency hot path**: tasks are matched to waiting workers in memory, no polling
-- **Polyglot SDKs**: Rust, TypeScript, Go, and Python with the same builder pattern
+- **In-memory hot path**: a task reaches a waiting worker the moment it is durable, no polling
+- **Polyglot SDKs**: Rust, TypeScript, Go, and Python, with the same worker model
 - **gRPC bidirectional streaming**: single connection per worker, real-time task delivery
 - **Automatic retries**: exponential backoff with dead letter queue
 - **Step checkpoints**: a retried task skips the steps an earlier attempt finished

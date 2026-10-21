@@ -491,7 +491,7 @@ dispatched again.
 
 | What happens | What the cluster does | What you see |
 |---|---|---|
-| `kill -9` on a node | Its lease stops changing; after 10 s its guardian tombstones it, splits its log (~1 s), and the desired owners claim its shards | Its shards are unavailable for ~11–15 s (`UNAVAILABLE`, clients retry). Its workers reconnect elsewhere and reattach. Nothing acknowledged is lost |
+| `kill -9` on a node | Its lease stops changing; after 10 s its guardian tombstones it, splits its log (~1 s), and the desired owners claim its shards | Its shards are unavailable until claimed: 13–27 s in the [failover benchmark](BENCHMARKS.md#failover-three-nodes-in-docker-minio), where claiming dominates on a slow bucket (`UNAVAILABLE`, clients retry). Its workers reconnect elsewhere and reattach. Nothing acknowledged is lost |
 | Node frozen 30 s, then wakes up | Taken over while frozen. On waking, its segment PUTs hit the seal or are ignored, its own-lease check fails, its renewal fails: it exits and restarts as a new incarnation | Requests it held fail; clients retry elsewhere |
 | Node cut off from the bucket | It can't PUT, so it acknowledges nothing; after 7 s it stops serving; after 10 s it is tombstoned and its shards move | ~15 s unavailability for its shards |
 | Network split between nodes (all reach the bucket) | No takeover: leases keep renewing. Forwarding across the split fails | Cross-side requests get `UNAVAILABLE` until it heals |
@@ -511,8 +511,8 @@ Guaranteed, under every failure above:
   success response is in the bucket and survives any node failure.
 - **One history per shard.** Two nodes never write diverging histories of the same shard.
 - **Bounded recovery.** At most 64 MiB of log per node to replay or split.
-- **Failover.** A dead node's shards are served again within ~15 s, as long as some node
-  can reach the bucket.
+- **Failover.** A dead node's shards are served again within the lease timeout plus the
+  claims (13–27 s measured), as long as some node can reach the bucket.
 - **Exact idempotency.** Two creates with the same idempotency key produce one task.
 
 Not guaranteed, by design:

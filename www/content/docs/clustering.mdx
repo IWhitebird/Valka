@@ -39,7 +39,7 @@ cluster of one: it runs the same protocol, alone.
 - **Any node takes any request.** It runs it locally, forwards it to the shard's owner, or asks
   every node and merges the answers.
 - **Workers attach to any node** and run tasks owned by any node.
-- **A dead node's shards move to the others in about 15 s.** Nothing acknowledged is lost.
+- **A dead node's shards move to the others once its lease runs out** (13–27 s in the [failover benchmark](/docs/benchmarks)). Nothing acknowledged is lost.
 - **Node-to-node calls never decide ownership.** If they fail, requests are retried; the bucket
   still says who owns what.
 
