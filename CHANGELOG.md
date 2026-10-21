@@ -65,6 +65,15 @@ PostgreSQL implementation (0.1) lives on in the `legacy-postgres` branch.
   (`examples/rs/bench.rs`). Load tests found and fixed a feeder livelock, a per-worker limit of
   about 20 results a second, and offers that waited 30 s after a refused batch.
 
+### Behaviour to know about
+
+- Queue names are limited to ASCII letters, digits and `. _ - : @` (at most 128
+  characters, no leading dot): they name objects in the bucket.
+- Idempotency keys are scoped to a queue: the same key in two queues makes two tasks.
+- Delivery is at least once. A task can run twice around a failure (a worker that loses
+  its node mid-run, a lease that expires); handlers should be idempotent, and step
+  checkpoints let a retry skip finished work.
+
 ### Removed
 
 - PostgreSQL and every other external service. The `valka-db` and `valka-scheduler` crates are

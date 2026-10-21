@@ -49,7 +49,7 @@ cargo fmt --check                # Format check
 | `valka-server` | Binary: assembles all services (gRPC + REST + internal listener + engine + log ingester); `api.rs` routes every request (local / forward / scatter), `feeder.rs` remote fetching, `relay.rs` cluster events, `admin.rs` admin API |
 | `valka-sdk` | Rust worker SDK: ValkaClient (task CRUD) + ValkaWorker (builder pattern, stream) |
 | `valka-cli` | CLI: `valka task create/get/list/cancel`, `valka logs tail`, `valka worker list`, `valka cluster status/members/drain/move/unpin`, `valka queue list/partitions` (`--server` repeatable, `--api-key`, `--admin-token`) |
-| `valka-tests` | Unit + integration test suite (255 tests, incl. 3-node clusters over real localhost gRPC, plus MinIO-gated) |
+| `valka-tests` | Unit + integration test suite (283 tests, incl. 3-node clusters over real localhost gRPC, plus MinIO-gated) |
 | `examples/rs` | Rust examples (producer, worker, full_lifecycle, signal_demo, steps) |
 
 ## SDKs
@@ -87,7 +87,8 @@ Queues have partitions (`queues/{hh}/{queue}`, default 16); keyed creates use `j
 ### Public API keys, limits and safe retries
 - `VALKA_API_KEYS` (comma-separated) guards REST `/api/v1/*` (not the admin routes, which use `VALKA_ADMIN_TOKEN`) and gRPC `ApiService`/`WorkerService` (`valka_server::auth`: REST middleware + tonic interceptor, constant-time). Unset = open with a startup warning. `/healthz`, `/metrics`, the dashboard files and gRPC health/reflection stay open; the SSE stream also takes `?access_token=`. A 401 for a bad API key has code `UNAUTHENTICATED`; the admin API's is `UNAUTHORIZED`.
 - `[limits]` (`LimitsConfig`): `max_tasks_in_ram` (default 1M; creates over it get `ServerError::ResourceExhausted` → 429 / RESOURCE_EXHAUSTED; near it finished tasks are evicted early, keeping a minute for retried creates) and `max_payload_bytes` (input/metadata, default 1 MiB). The engine samples tasks in RAM every second (`valka_tasks_in_ram`).
-- A create with an idempotency key already in use returns the original task (REST 200 instead of 201, `idempotent-replayed: true`; gRPC response metadata), after a WAL sync so the answer is durable. All SDK clients generate `auto-…` keys for keyless creates, retry transient failures (unavailable, timeout, 429/502/503/504) on the next node of their address list, and never retry cancels or signals; workers take several addresses and rotate on reconnect. Keys: `VALKA_API_KEY` env in every SDK and the CLI.
+- Queue names: ASCII letters, digits and `. _ - : @`, at most 128 (`valka_core::validate_queue_name`; they are object keys). Idempotency keys are per queue.
+- A create with an idempotency key already in use (in its queue) returns the original task (REST 200 instead of 201, `idempotent-replayed: true`; gRPC response metadata), after a WAL sync so the answer is durable. All SDK clients generate `auto-…` keys for keyless creates, retry transient failures (unavailable, timeout, 429/502/503/504) on the next node of their address list, and never retry cancels or signals; workers take several addresses and rotate on reconnect. Keys: `VALKA_API_KEY` env in every SDK and the CLI.
 
 ### Time in tests
 `TokioClock` derives wall time from tokio's instant, so `#[tokio::test(start_paused = true)]` + `tokio::time::advance` moves leases, retries and timestamps deterministically. `FaultyStore` (valka-wal) injects latency, errors, lost PUT acks and freezes.
@@ -122,7 +123,8 @@ Workers can receive signals on running tasks (e.g. progress requests, config upd
 - `POST /api/v1/tasks/:id/signal` or gRPC `SendSignal` creates a signal
 - Dispatcher delivers `TaskSignal` to the worker; worker replies with `SignalAck`
 - Status tracking: PENDING → DELIVERED → ACKNOWLEDGED
-- On worker disconnect, unacknowledged signals reset to PENDING for redelivery
+- On worker disconnect, unacknowledged signals reset to PENDING; the owner redelivers PENDING signals while the task runs, and a run that ends for a retry leaves its unacknowledged signals to the next attempt
+- A worker silent past its heartbeat timeout is disconnected (its stream is closed so it reconnects); worker handles and matching slots are per connection
 
 ### Sync Match (Hot Path)
 CreateTask → WAL append → durable → `MatchingSink::offer` → oneshot to waiting worker → gRPC push
@@ -170,11 +172,13 @@ Dev default is `./data` via the `local` backend. MinIO for S3 semantics: `docker
 
 ```bash
 cargo test --workspace                                   # everything, no external services
-cargo test -p valka-wal                                  # 40: store, codec, writer under faults, snapshots, leases, owners, split/seal
-cargo test -p valka-engine                               # 64: lifecycle, timers (paused time), recovery, checkpoints, results, log budget, crash/replay proptest, multi-node takeover/drain/fencing, TLA+ regressions, randomized simulation
-cargo test -p valka-tests                                # 255: unit + REST + lifecycle + dispatcher + gRPC e2e with the SDK, server exit, 3-node routing/workers/admin/mTLS
+cargo test -p valka-wal                                  # 42: store, codec, writer under faults, snapshots, leases, owners, split/seal
+cargo test -p valka-engine                               # 88: lifecycle, timers (paused time), recovery, checkpoints, results, log budget, crash/replay proptest, multi-node takeover/drain/fencing, TLA+ regressions, randomized simulation
+cargo test -p valka-tests                                # 283: unit + REST + lifecycle + dispatcher + gRPC e2e with the SDK, server exit, 3-node routing/workers/admin/mTLS
 VALKA_SIM_SEEDS=200 cargo test -p valka-engine randomized_cluster   # more simulation seeds
 scripts/chaos.sh                                         # chaos on the 3-node compose cluster (docker)
+scripts/bench-failover.sh                                # kill -9 failover timing on the compose cluster
+cargo run --release -p valka-examples --example bench    # load generator; results in docs/BENCHMARKS.md
 VALKA_TEST_S3_ENDPOINT=http://localhost:9000 AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
   cargo test -p valka-tests --features minio minio_    # real S3: CAS, self-test, two-node takeover (bucket valka-test)
 ```
