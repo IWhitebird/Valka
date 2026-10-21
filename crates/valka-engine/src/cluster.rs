@@ -13,7 +13,7 @@
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
@@ -73,6 +73,9 @@ pub(crate) struct Membership {
     last_gc: Mutex<Option<Instant>>,
     /// Operator pins from `placement.json` (shard -> node) and the ETag they were read at.
     pins: Mutex<(BTreeMap<u16, String>, Option<String>)>,
+    /// Incarnations this node knows are split: a dead lease names its incarnation forever,
+    /// and the guardian would otherwise check (HEAD) it again on every round.
+    split_done: Mutex<HashSet<(String, u32)>>,
 }
 
 impl Membership {
@@ -87,6 +90,7 @@ impl Membership {
             backoff: Mutex::new(HashMap::new()),
             last_gc: Mutex::new(None),
             pins: Mutex::new((BTreeMap::new(), None)),
+            split_done: Mutex::new(HashSet::new()),
         }
     }
 
@@ -206,6 +210,22 @@ impl Engine {
         }
     }
 
+    /// Once this incarnation has been up for the join delay (by its own clock), say so in
+    /// its lease: peers place shards on it then, without comparing clocks.
+    async fn announce_settled(&self) {
+        let lease = &self.inner.lease;
+        let record = lease.record();
+        if record.settled == Some(true) || record.state != LeaseState::Alive {
+            return;
+        }
+        let join = chrono::Duration::from_std(self.inner.membership.join_delay).unwrap_or_default();
+        if self.inner.clock.now() - record.started_at >= join
+            && let Err(e) = lease.mark_settled().await
+        {
+            debug!(error = %e, "announcing settled failed; retried next round");
+        }
+    }
+
     /// Forget every claim backoff: the next placement round tries those shards again.
     pub(crate) fn clear_claim_backoff(&self) {
         self.inner.membership.backoff.lock().clear();
@@ -230,7 +250,10 @@ impl Engine {
             if l.state != LeaseState::Alive {
                 continue;
             }
-            cands.push((node.clone(), wall - l.started_at >= join));
+            // A peer says itself when it is settled, by its own clock; only leases of
+            // older versions need comparing its start time with this node's clock.
+            let settled = l.settled.unwrap_or_else(|| wall - l.started_at >= join);
+            cands.push((node.clone(), settled));
         }
         // Newcomers wait out the join delay, unless nobody is past it (a cold start).
         let any_settled = cands.iter().any(|(_, settled)| *settled);
@@ -487,9 +510,19 @@ impl Engine {
 
     /// Split every incarnation of a dead node that is not split yet.
     async fn split_node(&self, dead: &LeaseRecord) {
+        let done = &self.inner.membership.split_done;
         for u in dead.incarnations() {
-            if let Err(e) = self.split_incarnation(&dead.node, u.inc, u.trunc).await {
-                warn!(node = %dead.node, inc = u.inc, error = %e, "split failed; will retry");
+            let key = (dead.node.clone(), u.inc);
+            if done.lock().contains(&key) {
+                continue;
+            }
+            match self.split_incarnation(&dead.node, u.inc, u.trunc).await {
+                Ok(()) => {
+                    done.lock().insert(key);
+                }
+                Err(e) => {
+                    warn!(node = %dead.node, inc = u.inc, error = %e, "split failed; will retry")
+                }
             }
         }
     }
@@ -521,6 +554,7 @@ impl Engine {
             if due {
                 self.refresh_membership().await;
             }
+            self.announce_settled().await;
             self.guardian_round().await;
             self.placement_round().await;
             let gc_due = self
@@ -588,7 +622,7 @@ impl Engine {
         }
 
         // 3. Markers whose log is gone and that no snapshot points into, unless an owner
-        //    record still names that incarnation (a claim needs the marker).
+        //    record (a claim needs the marker) or a lease still names that incarnation.
         let candidates: Vec<&(String, u32)> = markers
             .iter()
             .filter(|m| !logs.contains_key(*m) && !referenced.contains(*m))
@@ -597,6 +631,16 @@ impl Engine {
         if !candidates.is_empty() {
             for (_, v) in owners::list_all(store).await? {
                 owner_refs.insert((v.record.node.clone(), v.record.inc));
+            }
+            // A lease names its incarnations forever (a dead node's lease is never
+            // rewritten): without the marker its guardian would split it again, and this
+            // collector delete the marker again, every round.
+            for (node, _) in lease::list(store).await? {
+                if let Some(v) = lease::get(store, &node).await? {
+                    for u in v.record.incarnations() {
+                        owner_refs.insert((node.clone(), u.inc));
+                    }
+                }
             }
         }
         for m in candidates {

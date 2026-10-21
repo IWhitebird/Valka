@@ -80,6 +80,11 @@ pub struct LeaseRecord {
     pub started_at: DateTime<Utc>,
     #[serde(default)]
     pub dead_by: Option<String>,
+    /// Set by the node itself once it has been up for the join delay, by its own clock:
+    /// peers then place shards on it without comparing their clock with its `started_at`.
+    /// `None` in leases written by versions before 0.2.
+    #[serde(default)]
+    pub settled: Option<bool>,
 }
 
 fn one() -> u64 {
@@ -300,6 +305,7 @@ impl LeaseKeeper {
                 protocol: PROTOCOL,
                 started_at: Utc::now(),
                 dead_by: None,
+                settled: Some(false),
             };
             if let Some(o) = &old {
                 next.inc = o.record.inc + 1;
@@ -459,6 +465,14 @@ impl LeaseKeeper {
             return Ok(());
         }
         self.update(|r| r.trunc = r.trunc.max(seq)).await
+    }
+
+    /// Tell peers this incarnation is past its join delay (see [`LeaseRecord::settled`]).
+    pub async fn mark_settled(&self) -> Result<(), WalError> {
+        if self.current.lock().record.settled == Some(true) {
+            return Ok(());
+        }
+        self.update(|r| r.settled = Some(true)).await
     }
 
     /// Forget an older incarnation once its log is split.

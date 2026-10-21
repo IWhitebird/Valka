@@ -50,9 +50,23 @@ fn read(path: &str, what: &str) -> anyhow::Result<Vec<u8>> {
     std::fs::read(path).map_err(|e| anyhow::anyhow!("reading cluster.{what} ({path}): {e}"))
 }
 
+/// The three mTLS files, when mTLS is configured. Some but not all of them set is a
+/// mistake that must not quietly fall back to plaintext (and send the cluster token in
+/// clear): it is an error.
+fn tls_files(c: &ClusterConfig) -> anyhow::Result<Option<(&str, &str, &str)>> {
+    match (&c.tls_cert, &c.tls_key, &c.tls_ca) {
+        (Some(cert), Some(key), Some(ca)) => Ok(Some((cert, key, ca))),
+        (None, None, None) => Ok(None),
+        _ => anyhow::bail!(
+            "cluster mTLS needs all of tls_cert, tls_key and tls_ca \
+             (VALKA_CLUSTER__TLS_CERT, _KEY, _CA); only some are set"
+        ),
+    }
+}
+
 /// Server side of mTLS: present our certificate, require one signed by the cluster CA.
 pub fn server_tls(c: &ClusterConfig) -> anyhow::Result<Option<ServerTlsConfig>> {
-    let (Some(cert), Some(key), Some(ca)) = (&c.tls_cert, &c.tls_key, &c.tls_ca) else {
+    let Some((cert, key, ca)) = tls_files(c)? else {
         return Ok(None);
     };
     install_crypto_provider();
@@ -68,7 +82,7 @@ pub fn server_tls(c: &ClusterConfig) -> anyhow::Result<Option<ServerTlsConfig>> 
 
 /// Client side of mTLS: trust the cluster CA, present our certificate.
 pub fn client_tls(c: &ClusterConfig) -> anyhow::Result<Option<ClientTlsConfig>> {
-    let (Some(cert), Some(key), Some(ca)) = (&c.tls_cert, &c.tls_key, &c.tls_ca) else {
+    let Some((cert, key, ca)) = tls_files(c)? else {
         return Ok(None);
     };
     install_crypto_provider();
@@ -85,6 +99,16 @@ pub fn client_tls(c: &ClusterConfig) -> anyhow::Result<Option<ClientTlsConfig>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_partial_mtls_config_is_an_error() {
+        let mut c = ClusterConfig::default();
+        assert!(server_tls(&c).unwrap().is_none(), "no mTLS configured");
+        c.tls_cert = Some("cert.pem".into());
+        c.tls_key = Some("key.pem".into());
+        assert!(server_tls(&c).is_err());
+        assert!(client_tls(&c).is_err());
+    }
 
     #[test]
     fn token_interceptor() {

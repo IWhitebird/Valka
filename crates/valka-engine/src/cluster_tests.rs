@@ -638,3 +638,24 @@ async fn a_claim_never_falls_back_past_an_unreadable_snapshot() {
     );
     assert_eq!(a2.engine.owned_shards().len(), SHARDS as usize - 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_node_announces_in_its_lease_when_it_is_settled() {
+    // Found by the code review: peers judged a node's join delay by comparing their clock
+    // with its start time; it now says itself when it is settled, by its own clock.
+    let b = bucket();
+    let mut c = cfg("a");
+    c.cluster.join_delay_ms = 2_000;
+    let _a = start_with(&b, c).await;
+    let settled = || async {
+        lease::get(&plain(&b), "a")
+            .await
+            .unwrap()
+            .unwrap()
+            .record
+            .settled
+    };
+    assert_eq!(settled().await, Some(false));
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(settled().await, Some(true));
+}
