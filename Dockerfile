@@ -21,8 +21,8 @@ COPY proto/ proto/
 COPY crates/ crates/
 COPY examples/ examples/
 
-# Parallel compile jobs (empty: all cores). Lower it to keep a laptop responsive.
-ARG CARGO_BUILD_JOBS=
+# Parallel compile jobs (`default`: all cores). Lower it to keep a laptop responsive.
+ARG CARGO_BUILD_JOBS=default
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 
 # Build release with BuildKit cache mounts for cargo registry + target
