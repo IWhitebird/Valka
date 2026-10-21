@@ -1,5 +1,5 @@
 import { credentials } from "@/lib/credentials";
-import { fetchAPI } from "./client";
+import { fetchAPI, pathSegment } from "./client";
 import type { AuditRecord, QueueInfo } from "./types";
 
 /** Admin calls carry the admin token instead of the API key. */
@@ -20,7 +20,7 @@ export const adminApi = {
   },
 
   drainNode(node: string): Promise<{ accepted: boolean }> {
-    return fetchAPI(`/api/v1/cluster/nodes/${encodeURIComponent(node)}/drain`, asAdmin({ method: "POST" }));
+    return fetchAPI(`/api/v1/cluster/nodes/${pathSegment(node)}/drain`, asAdmin({ method: "POST" }));
   },
 
   moveShard(shard: number, to: string): Promise<{ shard: number; pinned_to: string }> {
@@ -39,7 +39,7 @@ export const adminApi = {
     partitions: number,
   ): Promise<{ queue: string; partitions: number; previous: number | null; nodes_not_told: string[] }> {
     return fetchAPI(
-      `/api/v1/queues/${encodeURIComponent(queue)}/partitions`,
+      `/api/v1/queues/${pathSegment(queue)}/partitions`,
       asAdmin({ method: "PUT", body: JSON.stringify({ partitions }) }),
     );
   },

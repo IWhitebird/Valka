@@ -1,5 +1,7 @@
 import { Inbox } from "lucide-react";
 import type { Task } from "@/api/types";
+import { errorMessage } from "@/api/client";
+import { ErrorNote } from "@/components/ui/error-note";
 import {
   Card,
   CardHeader,
@@ -11,8 +13,10 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Separator } from "@/components/ui/separator";
 
 interface QueueOverviewProps {
+  /** The most recent tasks (no endpoint counts tasks per queue): the bars describe these only. */
   tasks: Task[];
   isLoading: boolean;
+  error?: unknown;
 }
 
 interface QueueStats {
@@ -113,9 +117,22 @@ function QueueOverviewSkeleton() {
   );
 }
 
-export function QueueOverview({ tasks, isLoading }: QueueOverviewProps) {
+export function QueueOverview({ tasks, isLoading, error }: QueueOverviewProps) {
   if (isLoading) {
     return <QueueOverviewSkeleton />;
+  }
+
+  if (error) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Queue Overview</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <ErrorNote>Could not load recent tasks: {errorMessage(error)}</ErrorNote>
+        </CardContent>
+      </Card>
+    );
   }
 
   const queueMap = new Map<string, QueueStats>();
@@ -148,8 +165,8 @@ export function QueueOverview({ tasks, isLoading }: QueueOverviewProps) {
         <CardTitle>Queue Overview</CardTitle>
         <CardDescription>
           {queues.length > 0
-            ? `${queues.length} active queue${queues.length !== 1 ? "s" : ""}`
-            : "No queues active"}
+            ? `${queues.length} queue${queues.length !== 1 ? "s" : ""} among the ${tasks.length.toLocaleString()} most recent task${tasks.length !== 1 ? "s" : ""}`
+            : "No recent tasks"}
         </CardDescription>
       </CardHeader>
       <CardContent>

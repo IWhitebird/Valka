@@ -22,7 +22,7 @@ export function ClusterPage() {
             page; node stats are gathered from every live node.
           </p>
         </div>
-        <Button variant="outline" size="icon" onClick={() => refetch()}>
+        <Button variant="outline" size="icon" aria-label="Refresh cluster state" onClick={() => refetch()}>
           <RefreshCw className="h-4 w-4" />
         </Button>
       </div>

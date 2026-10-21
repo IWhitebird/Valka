@@ -11,12 +11,14 @@ import {
   Grid2x2,
 } from "lucide-react";
 import type { Task } from "@/api/types";
-import { formatDate } from "@/lib/utils";
+import { errorMessage } from "@/api/client";
+import { formatDate, isTerminalStatus } from "@/lib/utils";
 import { useCancelTask } from "@/hooks/use-tasks";
 import { useClusterOverview } from "@/hooks/use-cluster";
 import { TaskStatusBadge } from "@/components/tasks/task-status-badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { ErrorNote } from "@/components/ui/error-note";
 import { Separator } from "@/components/ui/separator";
 
 interface TaskDetailPanelProps {
@@ -67,10 +69,8 @@ export function TaskDetailPanel({ task }: TaskDetailPanelProps) {
   const shard = overview ? shardOfTaskId(task.id, overview.num_shards) : null;
   const cancelTask = useCancelTask();
 
-  const canCancel =
-    task.status === "PENDING" ||
-    task.status === "DISPATCHING" ||
-    task.status === "RUNNING";
+  // Any task that has not ended can be cancelled, one waiting to retry included.
+  const canCancel = !isTerminalStatus(task.status);
 
   return (
     <div className="space-y-6">
@@ -95,6 +95,10 @@ export function TaskDetailPanel({ task }: TaskDetailPanelProps) {
           )}
         </div>
       </div>
+
+      {cancelTask.isError && (
+        <ErrorNote compact>Could not cancel the task: {errorMessage(cancelTask.error)}</ErrorNote>
+      )}
 
       {/* Details Card */}
       <Card>

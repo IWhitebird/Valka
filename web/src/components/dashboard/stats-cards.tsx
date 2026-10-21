@@ -5,7 +5,9 @@ import {
   CheckCircle,
   XCircle,
 } from "lucide-react";
-import type { Task } from "@/api/types";
+import type { TaskCounts } from "@/api/types";
+import { errorMessage } from "@/api/client";
+import { ErrorNote } from "@/components/ui/error-note";
 import { cn } from "@/lib/utils";
 import {
   Card,
@@ -14,8 +16,10 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 
 interface StatsCardsProps {
-  tasks: Task[];
+  /** Tasks in RAM across the cluster (summed per-node counts from `/api/v1/cluster`). */
+  counts: TaskCounts | undefined;
   isLoading: boolean;
+  error?: unknown;
 }
 
 interface StatCardProps {
@@ -94,7 +98,7 @@ function StatCardSkeleton() {
   );
 }
 
-export function StatsCards({ tasks, isLoading }: StatsCardsProps) {
+export function StatsCards({ counts, isLoading, error }: StatsCardsProps) {
   if (isLoading) {
     return (
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-5">
@@ -105,14 +109,20 @@ export function StatsCards({ tasks, isLoading }: StatsCardsProps) {
     );
   }
 
-  const counts: Record<string, number> = {
-    total: tasks.length,
-    pending: tasks.filter((t) => t.status === "PENDING").length,
-    running: tasks.filter((t) => t.status === "RUNNING").length,
-    completed: tasks.filter((t) => t.status === "COMPLETED").length,
-    failed: tasks.filter(
-      (t) => t.status === "FAILED" || t.status === "DEAD_LETTER"
-    ).length,
+  if (!counts) {
+    return (
+      <ErrorNote>
+        Could not load task counts{error ? `: ${errorMessage(error)}` : "."}
+      </ErrorNote>
+    );
+  }
+
+  const values: Record<(typeof stats)[number]["key"], number> = {
+    total: counts.total,
+    pending: counts.pending,
+    running: counts.running,
+    completed: counts.completed,
+    failed: counts.failed + counts.dead_letter,
   };
 
   return (
@@ -121,7 +131,7 @@ export function StatsCards({ tasks, isLoading }: StatsCardsProps) {
         <StatCard
           key={stat.key}
           title={stat.title}
-          value={counts[stat.key]}
+          value={values[stat.key]}
           icon={stat.icon}
           iconColor={stat.iconColor}
           iconBg={stat.iconBg}

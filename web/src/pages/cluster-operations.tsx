@@ -20,6 +20,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useAdminAction, useAudit, useQueues } from "@/hooks/use-admin";
+import { useHasAdminToken } from "@/hooks/use-credentials";
 import { useClusterOverview, usePlacement } from "@/hooks/use-cluster";
 import { credentials } from "@/lib/credentials";
 import { nodeStatusDot } from "@/lib/cluster";
@@ -51,9 +52,9 @@ function Outcome({ ok, error }: { ok?: string | null; error?: string | null }) {
   );
 }
 
-function AdminToken({ onChange }: { onChange: () => void }) {
+function AdminToken() {
   const [token, setToken] = useState("");
-  const current = credentials.adminToken();
+  const current = useHasAdminToken();
   if (current) {
     return (
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-card px-4 py-3">
@@ -63,10 +64,7 @@ function AdminToken({ onChange }: { onChange: () => void }) {
         <Button
           variant="outline"
           size="sm"
-          onClick={() => {
-            credentials.setAdminToken(null);
-            onChange();
-          }}
+          onClick={() => credentials.setAdminToken(null)}
         >
           Forget token
         </Button>
@@ -80,7 +78,6 @@ function AdminToken({ onChange }: { onChange: () => void }) {
         e.preventDefault();
         credentials.setAdminToken(token.trim());
         setToken("");
-        onChange();
       }}
     >
       <div className="flex flex-wrap items-end gap-3">
@@ -116,8 +113,13 @@ function DrainDialog({
 }) {
   const drain = useAdminAction((n: string) => adminApi.drainNode(n));
   const shards = node && hasStats(node) ? node.shards_owned : null;
+  // The dialog stays mounted between nodes: forget the last attempt when it closes.
+  const close = (message?: string) => {
+    drain.reset();
+    onClose(message);
+  };
   return (
-    <Dialog open={node !== null} onOpenChange={(open) => !open && onClose()}>
+    <Dialog open={node !== null} onOpenChange={(open) => !open && close()}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>Drain {node?.node_id}?</DialogTitle>
@@ -130,7 +132,7 @@ function DrainDialog({
         </DialogHeader>
         {drain.isError && <Outcome error={(drain.error as Error).message} />}
         <DialogFooter>
-          <Button variant="outline" onClick={() => onClose()}>
+          <Button variant="outline" onClick={() => close()}>
             Keep it running
           </Button>
           <Button
@@ -139,7 +141,7 @@ function DrainDialog({
             onClick={() =>
               node &&
               drain.mutate(node.node_id, {
-                onSuccess: () => onClose(`${node.node_id} is handing its shards over.`),
+                onSuccess: () => close(`${node.node_id} is handing its shards over.`),
               })
             }
           >
@@ -254,6 +256,9 @@ function Placement({ canAct }: { canAct: boolean }) {
           className="flex flex-wrap items-end gap-3"
           onSubmit={(e) => {
             e.preventDefault();
+            // One outcome at a time: an earlier unpin's error must not hide this move's.
+            unpin.reset();
+            setMessage(null);
             move.mutate(
               { shard: shardNumber, to },
               {
@@ -304,11 +309,13 @@ function Placement({ canAct }: { canAct: boolean }) {
                   className="rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-40"
                   disabled={!canAct || unpin.isPending}
                   aria-label={`Unpin shard ${s}`}
-                  onClick={() =>
+                  onClick={() => {
+                    move.reset();
+                    setMessage(null);
                     unpin.mutate(Number(s), {
                       onSuccess: () => setMessage(`Shard ${s} is back under automatic placement.`),
-                    })
-                  }
+                    });
+                  }}
                 >
                   <PinOff className="h-3.5 w-3.5" />
                 </button>
@@ -339,16 +346,14 @@ function PartitionsDialog({
   );
   const n = Number(value);
   const valid = Number.isInteger(n) && n >= 1 && n <= 4096;
+  // The dialog stays mounted between queues: forget the last attempt when it closes.
+  const close = (message?: string) => {
+    setValue("");
+    set.reset();
+    onClose(message);
+  };
   return (
-    <Dialog
-      open={queue !== null}
-      onOpenChange={(open) => {
-        if (!open) {
-          setValue("");
-          onClose();
-        }
-      }}
-    >
+    <Dialog open={queue !== null} onOpenChange={(open) => !open && close()}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>Partitions of {queue}</DialogTitle>
@@ -367,8 +372,7 @@ function PartitionsDialog({
               { queue, n },
               {
                 onSuccess: (r) => {
-                  setValue("");
-                  onClose(`${r.queue} now has ${r.partitions} partitions (was ${r.previous ?? current}).`);
+                  close(`${r.queue} now has ${r.partitions} partitions (was ${r.previous ?? current}).`);
                 },
               },
             );
@@ -387,7 +391,7 @@ function PartitionsDialog({
           </div>
           {set.isError && <Outcome error={(set.error as Error).message} />}
           <DialogFooter>
-            <Button type="button" variant="outline" onClick={() => onClose()}>
+            <Button type="button" variant="outline" onClick={() => close()}>
               Cancel
             </Button>
             <Button type="submit" disabled={!valid || n === current || set.isPending}>
@@ -508,8 +512,7 @@ function Audit({ canAct }: { canAct: boolean }) {
 }
 
 export function ClusterOperationsPage() {
-  const [, refresh] = useState(0);
-  const canAct = credentials.adminToken() !== null;
+  const canAct = useHasAdminToken();
   return (
     <div className="space-y-6">
       <div>
@@ -520,7 +523,7 @@ export function ClusterOperationsPage() {
         </p>
       </div>
       <ClusterTabs />
-      <AdminToken onChange={() => refresh((n) => n + 1)} />
+      <AdminToken />
       <div className="grid gap-6 xl:grid-cols-2">
         <Nodes canAct={canAct} />
         <Placement canAct={canAct} />

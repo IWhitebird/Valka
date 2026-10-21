@@ -11,6 +11,13 @@ const ADMIN_TOKEN = "valka.adminToken";
 /** Fired when the server refuses a request for a missing or wrong API key. */
 export const UNAUTHENTICATED_EVENT = "valka:unauthenticated";
 
+/** Fired when this tab sets or forgets a credential. */
+export const CREDENTIALS_EVENT = "valka:credentials";
+
+function changed(): void {
+  window.dispatchEvent(new CustomEvent(CREDENTIALS_EVENT));
+}
+
 function read(storage: () => Storage, key: string): string | null {
   try {
     return storage().getItem(key) || null;
@@ -38,6 +45,7 @@ export const credentials = {
   setApiKey(key: string | null): void {
     apiKeyFallback = key;
     write(() => localStorage, API_KEY, key);
+    changed();
   },
   adminToken(): string | null {
     return read(() => sessionStorage, ADMIN_TOKEN) ?? adminFallback;
@@ -45,5 +53,15 @@ export const credentials = {
   setAdminToken(token: string | null): void {
     adminFallback = token;
     write(() => sessionStorage, ADMIN_TOKEN, token);
+    changed();
+  },
+  /** Call `listener` when a credential changes here or (the API key) in another tab. */
+  subscribe(listener: () => void): () => void {
+    window.addEventListener(CREDENTIALS_EVENT, listener);
+    window.addEventListener("storage", listener);
+    return () => {
+      window.removeEventListener(CREDENTIALS_EVENT, listener);
+      window.removeEventListener("storage", listener);
+    };
   },
 };

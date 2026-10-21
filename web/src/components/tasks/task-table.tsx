@@ -1,6 +1,7 @@
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { ChevronLeft, ChevronRight, ListTodo, Trash2 } from "lucide-react";
 import type { Task } from "@/api/types";
+import { errorMessage } from "@/api/client";
 import { truncateId, formatRelative } from "@/lib/utils";
 import { useDeleteTask } from "@/hooks/use-tasks";
 import { TaskStatusBadge } from "./task-status-badge";
@@ -13,6 +14,7 @@ import {
   TableCell,
 } from "@/components/ui/table";
 import { Button } from "@/components/ui/button";
+import { ErrorNote } from "@/components/ui/error-note";
 import { Skeleton } from "@/components/ui/skeleton";
 
 interface TaskTableProps {
@@ -20,6 +22,8 @@ interface TaskTableProps {
   isLoading: boolean;
   offset: number;
   limit: number;
+  /** Whether a task exists after this page (the page asked the server for one more). */
+  hasMore: boolean;
   onPageChange: (offset: number) => void;
 }
 
@@ -55,15 +59,77 @@ function SkeletonRows() {
   );
 }
 
+function Pager({
+  offset,
+  count,
+  limit,
+  hasMore,
+  onPageChange,
+}: {
+  offset: number;
+  count: number;
+  limit: number;
+  hasMore: boolean;
+  onPageChange: (offset: number) => void;
+}) {
+  return (
+    <div className="mt-4 flex items-center justify-between">
+      <p className="text-xs text-muted-foreground">
+        {count > 0 ? `Showing ${offset + 1} - ${offset + count}` : "No tasks on this page"}
+      </p>
+      <div className="flex items-center gap-2">
+        <Button
+          variant="outline"
+          size="icon-sm"
+          aria-label="Previous page"
+          onClick={() => onPageChange(Math.max(0, offset - limit))}
+          disabled={offset === 0}
+        >
+          <ChevronLeft className="h-4 w-4" />
+        </Button>
+        <Button
+          variant="outline"
+          size="icon-sm"
+          aria-label="Next page"
+          onClick={() => onPageChange(offset + limit)}
+          disabled={!hasMore}
+        >
+          <ChevronRight className="h-4 w-4" />
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 export function TaskTable({
   tasks,
   isLoading,
   offset,
   limit,
+  hasMore,
   onPageChange,
 }: TaskTableProps) {
   const navigate = useNavigate();
   const deleteTask = useDeleteTask();
+  const deleteError = deleteTask.isError && (
+    <ErrorNote compact className="mb-3">
+      Could not delete task {truncateId(deleteTask.variables ?? "")}:{" "}
+      {errorMessage(deleteTask.error)}
+    </ErrorNote>
+  );
+
+  if (!isLoading && tasks.length === 0 && offset > 0) {
+    // A page past the end (its tasks were deleted): keep the way back.
+    return (
+      <div>
+        {deleteError}
+        <div className="flex h-40 items-center justify-center rounded-lg border bg-card text-sm text-muted-foreground">
+          No more tasks
+        </div>
+        <Pager offset={offset} count={0} limit={limit} hasMore={false} onPageChange={onPageChange} />
+      </div>
+    );
+  }
 
   if (!isLoading && tasks.length === 0) {
     return (
@@ -79,6 +145,7 @@ export function TaskTable({
 
   return (
     <div>
+      {deleteError}
       <div className="overflow-hidden rounded-lg border">
         <Table>
           <TableHeader>
@@ -114,11 +181,18 @@ export function TaskTable({
               tasks.map((task) => (
                 <TableRow
                   key={task.id}
-                  onClick={() => navigate(`/tasks/${task.id}`)}
+                  onClick={() => navigate(`/tasks/${encodeURIComponent(task.id)}`)}
                   className="cursor-pointer"
                 >
                   <TableCell className="px-4 font-mono text-xs text-muted-foreground">
-                    {truncateId(task.id)}
+                    <Link
+                      to={`/tasks/${encodeURIComponent(task.id)}`}
+                      className="rounded-sm underline-offset-2 hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      aria-label={`Open task ${task.task_name} (${task.id})`}
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      {truncateId(task.id)}
+                    </Link>
                   </TableCell>
                   <TableCell className="px-4 text-muted-foreground">
                     {task.queue_name}
@@ -141,6 +215,8 @@ export function TaskTable({
                       variant="ghost"
                       size="icon-sm"
                       className="text-muted-foreground hover:text-destructive"
+                      aria-label={`Delete task ${truncateId(task.id)}`}
+                      disabled={deleteTask.isPending && deleteTask.variables === task.id}
                       onClick={(e) => {
                         e.stopPropagation();
                         if (window.confirm(`Delete task ${task.id.slice(0, 8)}...?`)) {
@@ -158,29 +234,13 @@ export function TaskTable({
         </Table>
       </div>
 
-      <div className="mt-4 flex items-center justify-between">
-        <p className="text-xs text-muted-foreground">
-          Showing {offset + 1} - {offset + tasks.length}
-        </p>
-        <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="icon-sm"
-            onClick={() => onPageChange(Math.max(0, offset - limit))}
-            disabled={offset === 0}
-          >
-            <ChevronLeft className="h-4 w-4" />
-          </Button>
-          <Button
-            variant="outline"
-            size="icon-sm"
-            onClick={() => onPageChange(offset + limit)}
-            disabled={tasks.length < limit}
-          >
-            <ChevronRight className="h-4 w-4" />
-          </Button>
-        </div>
-      </div>
+      <Pager
+        offset={offset}
+        count={tasks.length}
+        limit={limit}
+        hasMore={hasMore}
+        onPageChange={onPageChange}
+      />
     </div>
   );
 }

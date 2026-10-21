@@ -7,12 +7,12 @@ import {
   AlertTriangle,
   Server,
 } from "lucide-react";
-import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { useClusterOverview } from "@/hooks/use-cluster";
+import { useHasApiKey } from "@/hooks/use-credentials";
 import { credentials } from "@/lib/credentials";
 
 const navigation = [
@@ -28,13 +28,12 @@ export function Sidebar() {
   const location = useLocation();
   const queryClient = useQueryClient();
   const { data: overview } = useClusterOverview();
-  const [signedIn, setSignedIn] = useState(() => credentials.apiKey() !== null);
+  const signedIn = useHasApiKey();
   const version = overview?.nodes.find((n) => n.node_id === overview.this_node)?.version;
 
   function signOut() {
     credentials.setApiKey(null);
     credentials.setAdminToken(null);
-    setSignedIn(false);
     queryClient.invalidateQueries();
   }
 

@@ -1,4 +1,10 @@
-import type { ClusterHealth, ClusterNode, ClusterNodeStats, NodeStatus } from "@/api/types";
+import type {
+  ClusterHealth,
+  ClusterNode,
+  ClusterNodeStats,
+  NodeStatus,
+  TaskCounts,
+} from "@/api/types";
 import { hasStats } from "@/api/types";
 
 /** Shard count of a new bucket; a cluster's real count is `ClusterOverview.num_shards`. */
@@ -18,6 +24,39 @@ export function shardOfTaskId(taskId: string, numShards = DEFAULT_NUM_SHARDS): n
 /** Sum a per-node figure over the nodes that answered with their stats. */
 export function sumStats(nodes: ClusterNode[], f: (n: ClusterNodeStats) => number): number {
   return nodes.reduce((s, n) => s + (hasStats(n) ? f(n) : 0), 0);
+}
+
+const TASK_COUNT_KEYS = [
+  "pending",
+  "running",
+  "retry",
+  "completed",
+  "failed",
+  "dead_letter",
+  "cancelled",
+  "total",
+] as const satisfies readonly (keyof TaskCounts)[];
+
+/**
+ * Tasks held in RAM across the cluster: every answering node's own counts, summed (each task
+ * lives on exactly one node, its shard's owner).
+ */
+export function sumTaskCounts(nodes: ClusterNode[]): TaskCounts {
+  const sum: TaskCounts = {
+    pending: 0,
+    running: 0,
+    retry: 0,
+    completed: 0,
+    failed: 0,
+    dead_letter: 0,
+    cancelled: 0,
+    total: 0,
+  };
+  for (const n of nodes) {
+    if (!hasStats(n)) continue;
+    for (const k of TASK_COUNT_KEYS) sum[k] += n.tasks[k];
+  }
+  return sum;
 }
 
 /** The tail of a snapshot key: `{gen}-{seq}-{ptr}.snap`. */

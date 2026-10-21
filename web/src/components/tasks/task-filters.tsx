@@ -39,12 +39,13 @@ export function TaskFilters({
       <Input
         type="text"
         placeholder="Filter by queue..."
+        aria-label="Filter by queue"
         value={queueName}
         onChange={(e) => setQueueName(e.target.value)}
         className="w-48"
       />
       <Select value={status} onValueChange={setStatus}>
-        <SelectTrigger className="w-44">
+        <SelectTrigger className="w-44" aria-label="Filter by status">
           <SelectValue placeholder="All Statuses" />
         </SelectTrigger>
         <SelectContent>

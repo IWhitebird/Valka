@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -35,6 +35,7 @@ const overview = {
 };
 
 function api(path: string): unknown {
+  if (path.startsWith("/api/v1/cluster/audit")) return [];
   if (path.startsWith("/api/v1/cluster/placement")) return { pins: { "7": "n1" }, effective_protocol: 2, eligible_nodes: ["n1"] };
   if (path.startsWith("/api/v1/queues")) return [{ queue: "emails", partitions: 4, served_partitions: 16, previous: null, version: 2, created_at: "", partition_shards: [] }];
   if (path.startsWith("/api/v1/cluster")) return overview;
@@ -65,5 +66,36 @@ describe("ClusterOperationsPage", () => {
     expect(screen.getByLabelText("Admin token")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Drain/ })).toBeDisabled();
     expect(screen.getByText("Set the admin token to see who changed what.")).toBeInTheDocument();
+  });
+
+  it("does not carry a failed drain over to the next node's dialog", async () => {
+    credentials.setAdminToken("admin");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (path: string, init?: RequestInit) => {
+        if (path.endsWith("/drain") && init?.method === "POST") {
+          return new Response(JSON.stringify({ error: "n1 did not accept the drain", code: "UNAVAILABLE" }), {
+            status: 503,
+          });
+        }
+        return new Response(JSON.stringify(api(path)), { status: 200 });
+      }),
+    );
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MemoryRouter>
+          <ClusterOperationsPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /Drain/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Drain node" }));
+    expect(await within(dialog).findByText("n1 did not accept the drain")).toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Keep it running" }));
+    fireEvent.click(screen.getByRole("button", { name: /Drain/ }));
+    const reopened = await screen.findByRole("dialog");
+    expect(within(reopened).queryByText("n1 did not accept the drain")).not.toBeInTheDocument();
   });
 });

@@ -99,7 +99,18 @@ export function TaskRunsTable({
                 )}
               >
                 <TableCell className="px-4 font-mono text-xs text-muted-foreground">
-                  {truncateId(run.id)}
+                  <button
+                    type="button"
+                    className="rounded-sm underline-offset-2 hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    aria-pressed={selectedRunId === run.id}
+                    aria-label={`Show logs of attempt ${run.attempt_number} (run ${truncateId(run.id)})`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onSelectRun(run.id);
+                    }}
+                  >
+                    {truncateId(run.id)}
+                  </button>
                 </TableCell>
                 <TableCell className="px-4">#{run.attempt_number}</TableCell>
                 <TableCell className="px-4">

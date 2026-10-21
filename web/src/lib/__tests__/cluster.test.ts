@@ -7,6 +7,7 @@ import {
   shardOfTaskId,
   snapshotName,
   sumStats,
+  sumTaskCounts,
 } from "../cluster";
 import type { ClusterNode } from "@/api/types";
 
@@ -65,6 +66,35 @@ describe("sumStats", () => {
     const answered = { node_id: "a", wal: { unflushed_records: 2 }, shards_owned: 10 } as unknown as ClusterNode;
     const lease = { node_id: "b", inc: 3, status: "dead", protocol: 2, unsplit: [] } as unknown as ClusterNode;
     expect(sumStats([answered, lease], (n) => n.shards_owned)).toBe(10);
+  });
+});
+
+describe("sumTaskCounts", () => {
+  it("adds every answering node's task counts", () => {
+    const counts = (n: number) => ({
+      pending: n,
+      running: 2 * n,
+      retry: 0,
+      completed: 10 * n,
+      failed: 1,
+      dead_letter: n,
+      cancelled: 0,
+      total: 14 * n + 1,
+    });
+    const a = { node_id: "a", wal: {}, tasks: counts(1) } as unknown as ClusterNode;
+    const b = { node_id: "b", wal: {}, tasks: counts(3) } as unknown as ClusterNode;
+    const lease = { node_id: "c", inc: 3, status: "dead", protocol: 2, unsplit: [] } as unknown as ClusterNode;
+    expect(sumTaskCounts([a, b, lease])).toEqual({
+      pending: 4,
+      running: 8,
+      retry: 0,
+      completed: 40,
+      failed: 2,
+      dead_letter: 4,
+      cancelled: 0,
+      total: 58,
+    });
+    expect(sumTaskCounts([]).total).toBe(0);
   });
 });
 

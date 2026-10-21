@@ -2,13 +2,15 @@ import { useState } from "react";
 import { Radio, Send, CheckCircle2, Truck, Clock } from "lucide-react";
 import type { TaskSignal, TaskStatus } from "@/api/types";
 import { useTaskSignals, useSendSignal } from "@/hooks/use-tasks";
-import { formatDate, truncateId, cn } from "@/lib/utils";
+import { errorMessage } from "@/api/client";
+import { formatDate, isTerminalStatus, truncateId, cn } from "@/lib/utils";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
+import { ErrorNote } from "@/components/ui/error-note";
 import {
   Table,
   TableHeader,
@@ -67,17 +69,14 @@ function SkeletonRows() {
 }
 
 export function TaskSignalsPanel({ taskId, taskStatus }: TaskSignalsPanelProps) {
-  const { data: signals = [], isLoading } = useTaskSignals(taskId);
+  const { data: signals = [], isLoading, error: signalsError } = useTaskSignals(taskId);
   const sendSignal = useSendSignal();
   const [signalName, setSignalName] = useState("");
   const [payload, setPayload] = useState("");
   const [payloadError, setPayloadError] = useState<string | null>(null);
 
-  const canSendSignal =
-    taskStatus === "PENDING" ||
-    taskStatus === "DISPATCHING" ||
-    taskStatus === "RUNNING" ||
-    taskStatus === "RETRY";
+  // The server takes signals for any task that has not ended.
+  const canSendSignal = !isTerminalStatus(taskStatus);
 
   function handleSendSignal() {
     if (!signalName.trim()) return;
@@ -167,6 +166,11 @@ export function TaskSignalsPanel({ taskId, taskStatus }: TaskSignalsPanelProps) 
                 {sendSignal.isPending ? "Sending..." : "Send"}
               </Button>
             </div>
+            {sendSignal.isError && (
+              <ErrorNote compact className="mt-3">
+                Could not send the signal: {errorMessage(sendSignal.error)}
+              </ErrorNote>
+            )}
           </CardContent>
         </Card>
       )}
@@ -199,6 +203,8 @@ export function TaskSignalsPanel({ taskId, taskStatus }: TaskSignalsPanelProps) 
             </TableBody>
           </Table>
         </div>
+      ) : signalsError && signals.length === 0 ? (
+        <ErrorNote>Could not load signals: {errorMessage(signalsError)}</ErrorNote>
       ) : signals.length === 0 ? (
         <div className="flex h-32 flex-col items-center justify-center rounded-lg border bg-card">
           <Radio className="h-8 w-8 text-muted-foreground/50" />

@@ -1,9 +1,10 @@
 import { credentials } from "@/lib/credentials";
-import type { TaskEvent, TaskStatus, RawTaskEvent } from "./types";
+import type { EventStatus, TaskEvent, RawTaskEvent } from "./types";
 
-// Proto status enum values → string status
-const STATUS_MAP: Record<number, TaskStatus> = {
-  0: "PENDING",
+// Proto status enum values → string status. The server sends 0 (UNSPECIFIED) when a task
+// leaves the system: deleted, or removed by "Clear All".
+const STATUS_MAP: Record<number, EventStatus> = {
+  0: "DELETED",
   1: "PENDING",
   2: "DISPATCHING",
   3: "RUNNING",
@@ -14,25 +15,33 @@ const STATUS_MAP: Record<number, TaskStatus> = {
   8: "CANCELLED",
 };
 
-function parseRawEvent(raw: RawTaskEvent): TaskEvent {
+export function parseRawEvent(raw: RawTaskEvent): TaskEvent {
   return {
     event_id: raw.event_id,
     task_id: raw.task_id,
     queue_name: raw.queue_name,
-    status: STATUS_MAP[raw.new_status] ?? "PENDING",
+    status: STATUS_MAP[raw.new_status] ?? "UNKNOWN",
     timestamp: new Date(raw.timestamp_ms).toISOString(),
   };
 }
 
-export function subscribeEvents(
-  onEvent: (event: TaskEvent) => void,
-  onError?: (error: Event) => void,
-): () => void {
+export interface EventHandlers {
+  onEvent: (event: TaskEvent) => void;
+  /** The stream is connected (also after an automatic reconnect). */
+  onOpen?: () => void;
+  onError?: (error: Event) => void;
+}
+
+export function subscribeEvents({ onEvent, onOpen, onError }: EventHandlers): () => void {
   // EventSource cannot send headers: the server also takes the key as ?access_token=.
   const apiKey = credentials.apiKey();
   const eventSource = new EventSource(
     apiKey ? `/api/v1/events?access_token=${encodeURIComponent(apiKey)}` : "/api/v1/events",
   );
+
+  eventSource.onopen = () => {
+    onOpen?.();
+  };
 
   eventSource.onmessage = (event) => {
     try {

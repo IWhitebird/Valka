@@ -73,7 +73,7 @@ export interface Worker {
 }
 
 export interface DeadLetter {
-  id: number;
+  id: string;
   task_id: string;
   queue_name: string;
   task_name: string;
@@ -93,12 +93,15 @@ export interface RawTaskEvent {
   timestamp_ms: number;
 }
 
+/** A task's new status in an event; DELETED when the task left the system. */
+export type EventStatus = TaskStatus | "DELETED" | "UNKNOWN";
+
 // Parsed event for UI display
 export interface TaskEvent {
   event_id: string;
   task_id: string;
   queue_name: string;
-  status: TaskStatus;
+  status: EventStatus;
   timestamp: string;
 }
 

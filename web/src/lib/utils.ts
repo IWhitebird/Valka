@@ -34,6 +34,14 @@ export const STATUS_OPTIONS = [
   { value: "CANCELLED", label: "Cancelled" },
 ] as const;
 
+/** Statuses a task never leaves: it cannot be cancelled or signalled any more. */
+const TERMINAL_STATUSES: readonly string[] = ["COMPLETED", "FAILED", "DEAD_LETTER", "CANCELLED"];
+
+/** Matches the server's `is_terminal`: every other status (RETRY included) can be cancelled. */
+export function isTerminalStatus(status: string): boolean {
+  return TERMINAL_STATUSES.includes(status);
+}
+
 export function statusColor(status: string): string {
   switch (status) {
     case "PENDING":
@@ -52,6 +60,8 @@ export function statusColor(status: string): string {
       return "bg-rose-500/10 text-rose-400 border-rose-500/20";
     case "CANCELLED":
       return "bg-neutral-500/10 text-neutral-400 border-neutral-500/20";
+    case "DELETED":
+      return "bg-zinc-500/10 text-zinc-500 border-zinc-500/20 line-through";
     default:
       return "bg-zinc-500/10 text-zinc-400 border-zinc-500/20";
   }
@@ -75,7 +85,20 @@ export function statusDotColor(status: string): string {
       return "bg-rose-400";
     case "CANCELLED":
       return "bg-neutral-400";
+    case "DELETED":
+      return "bg-zinc-600";
     default:
       return "bg-zinc-400";
   }
+}
+
+/**
+ * A `datetime-local` value (`2026-10-22T14:30`, local time) as the UTC instant the server
+ * takes; undefined when empty or invalid. The input itself must keep the local form: it
+ * clears any other value.
+ */
+export function localDateTimeToIso(value: string): string | undefined {
+  if (!value) return undefined;
+  const at = new Date(value);
+  return Number.isNaN(at.getTime()) ? undefined : at.toISOString();
 }

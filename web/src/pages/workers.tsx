@@ -1,14 +1,17 @@
 import { useQuery } from "@tanstack/react-query";
 import { RefreshCw } from "lucide-react";
+import { errorMessage } from "@/api/client";
 import { workersApi } from "@/api/workers";
 import { WorkerTable } from "@/components/workers/worker-table";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { ErrorNote } from "@/components/ui/error-note";
 
 export function WorkersPage() {
   const {
-    data: workers = [],
+    data,
     isLoading,
+    error,
     refetch,
   } = useQuery({
     queryKey: ["workers"],
@@ -16,6 +19,7 @@ export function WorkersPage() {
     refetchInterval: 5_000,
   });
 
+  const workers = data ?? [];
   const totalActiveTasks = workers.reduce((sum, w) => sum + w.active_tasks, 0);
   const totalCapacity = workers.reduce((sum, w) => sum + w.concurrency, 0);
 
@@ -28,7 +32,7 @@ export function WorkersPage() {
             Connected workers and their status
           </p>
         </div>
-        <Button variant="outline" size="icon" onClick={() => refetch()}>
+        <Button variant="outline" size="icon" aria-label="Refresh workers" onClick={() => refetch()}>
           <RefreshCw className="h-4 w-4" />
         </Button>
       </div>
@@ -60,7 +64,18 @@ export function WorkersPage() {
         </Card>
       </div>
 
-      <WorkerTable workers={workers} isLoading={isLoading} />
+      {error && !data ? (
+        <ErrorNote>Could not load workers: {errorMessage(error)}</ErrorNote>
+      ) : (
+        <>
+          {error && (
+            <ErrorNote compact>
+              Could not refresh workers, showing the last answer: {errorMessage(error)}
+            </ErrorNote>
+          )}
+          <WorkerTable workers={workers} isLoading={isLoading} />
+        </>
+      )}
     </div>
   );
 }

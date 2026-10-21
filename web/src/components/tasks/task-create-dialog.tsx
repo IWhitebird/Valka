@@ -12,6 +12,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
+import { localDateTimeToIso } from "@/lib/utils";
 
 interface TaskCreateDialogProps {
   open: boolean;
@@ -64,20 +65,25 @@ export function TaskCreateDialog({ open, onClose }: TaskCreateDialogProps) {
         priority,
         max_retries: maxRetries,
         timeout_seconds: timeoutSeconds,
-        scheduled_at: scheduledAt || undefined,
+        scheduled_at: localDateTimeToIso(scheduledAt),
         idempotency_key: idempotencyKey || undefined,
         metadata: parsedMetadata,
       },
       {
         onSuccess: () => {
-          resetForm();
-          onClose();
+          handleClose();
         },
         onError: (err) => {
           setError(err.message);
         },
       },
     );
+  }
+
+  function handleClose() {
+    resetForm();
+    createTask.reset();
+    onClose();
   }
 
   function resetForm() {
@@ -94,7 +100,7 @@ export function TaskCreateDialog({ open, onClose }: TaskCreateDialogProps) {
   }
 
   return (
-    <Dialog open={open} onOpenChange={(isOpen) => !isOpen && onClose()}>
+    <Dialog open={open} onOpenChange={(isOpen) => !isOpen && handleClose()}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Create Task</DialogTitle>
@@ -181,12 +187,12 @@ export function TaskCreateDialog({ open, onClose }: TaskCreateDialogProps) {
 
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-2">
-              <Label htmlFor="scheduled_at">Schedule At (ISO 8601)</Label>
+              <Label htmlFor="scheduled_at">Schedule At (local time)</Label>
               <Input
                 id="scheduled_at"
                 type="datetime-local"
                 value={scheduledAt}
-                onChange={(e) => setScheduledAt(e.target.value ? new Date(e.target.value).toISOString() : "")}
+                onChange={(e) => setScheduledAt(e.target.value)}
               />
             </div>
             <div className="space-y-2">
@@ -214,7 +220,7 @@ export function TaskCreateDialog({ open, onClose }: TaskCreateDialogProps) {
           </div>
 
           <DialogFooter>
-            <Button type="button" variant="outline" onClick={onClose}>
+            <Button type="button" variant="outline" onClick={handleClose}>
               Cancel
             </Button>
             <Button type="submit" disabled={createTask.isPending}>

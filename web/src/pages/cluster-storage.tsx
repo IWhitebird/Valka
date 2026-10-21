@@ -20,7 +20,7 @@ export function ClusterStoragePage() {
             The bucket is the only durable state. Segments below every snapshot are truncated automatically.
           </p>
         </div>
-        <Button variant="outline" size="icon" onClick={() => refetch()}>
+        <Button variant="outline" size="icon" aria-label="Refresh storage stats" onClick={() => refetch()}>
           <RefreshCw className="h-4 w-4" />
         </Button>
       </div>

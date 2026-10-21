@@ -1,6 +1,7 @@
 import { Link, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft } from "lucide-react";
+import { errorMessage } from "@/api/client";
 import { workersApi } from "@/api/workers";
 import { ClusterTabs } from "@/components/cluster/cluster-tabs";
 import { SnapshotPanel } from "@/components/cluster/snapshot-panel";
@@ -9,6 +10,7 @@ import { WalPanel } from "@/components/cluster/wal-panel";
 import { hasStats } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { ErrorNote } from "@/components/ui/error-note";
 import { Skeleton } from "@/components/ui/skeleton";
 import { WorkerTable } from "@/components/workers/worker-table";
 import { useClusterOverview, useMembers, useShards } from "@/hooks/use-cluster";
@@ -17,7 +19,7 @@ import { cn, formatDate } from "@/lib/utils";
 
 export function ClusterNodePage() {
   const { nodeId = "" } = useParams<{ nodeId: string }>();
-  const { data: overview, isLoading } = useClusterOverview();
+  const { data: overview, isLoading, error } = useClusterOverview();
   const { data: shards = [] } = useShards({ node: nodeId });
   const { data: workers = [], isLoading: workersLoading } = useQuery({
     queryKey: ["workers"],
@@ -38,6 +40,9 @@ export function ClusterNodePage() {
       <ClusterTabs />
 
       {isLoading && <Skeleton className="h-24 w-full" />}
+      {error && !overview && (
+        <ErrorNote>Could not load cluster state: {errorMessage(error)}</ErrorNote>
+      )}
       {overview && !node && (
         <p className="text-sm text-muted-foreground">Node "{nodeId}" is not part of this cluster.</p>
       )}

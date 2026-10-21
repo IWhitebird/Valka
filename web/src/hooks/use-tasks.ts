@@ -1,5 +1,14 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { tasksApi } from "@/api/tasks";
+import {
+  EMPTY_LOG_WINDOW,
+  appendLogs,
+  earlierRequest,
+  logsSettled,
+  prependLogs,
+  readNewLogs,
+  type LogWindow,
+} from "@/lib/logs";
 import type {
   ListTasksParams,
   CreateTaskRequest,
@@ -49,6 +58,8 @@ export function useDeleteTask() {
     mutationFn: (taskId: string) => tasksApi.delete(taskId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      // A deleted dead-lettered task takes its dead letter with it.
+      queryClient.invalidateQueries({ queryKey: ["dead-letters"] });
     },
   });
 }
@@ -81,12 +92,49 @@ export function useTaskCheckpoints(taskId: string) {
   });
 }
 
-export function useTaskRunLogs(taskId: string, runId: string) {
+function runLogsKey(taskId: string, runId: string) {
+  return ["tasks", taskId, "runs", runId, "logs"];
+}
+
+/**
+ * A run's log, newest lines kept. The first load catches up with the whole log; refreshes ask
+ * only for lines after the newest one held, every 5 s until the run is over and a refresh
+ * finds nothing new.
+ */
+export function useTaskRunLogs(taskId: string, runId: string, runFinished: boolean) {
+  const queryClient = useQueryClient();
   return useQuery({
-    queryKey: ["tasks", taskId, "runs", runId, "logs"],
-    queryFn: () => tasksApi.getRunLogs(taskId, runId),
+    queryKey: runLogsKey(taskId, runId),
+    queryFn: async () => {
+      const key = runLogsKey(taskId, runId);
+      const start = queryClient.getQueryData<LogWindow>(key) ?? EMPTY_LOG_WINDOW;
+      const read = await readNewLogs(start, (afterId, limit) =>
+        tasksApi.getRunLogs(taskId, runId, { afterId, limit }),
+      );
+      // "Load earlier" may have changed the window meanwhile: add the new lines to that.
+      const latest = queryClient.getQueryData<LogWindow>(key);
+      if (latest && latest !== start) {
+        return { ...appendLogs(latest, read.lines), caughtUp: read.caughtUp, added: read.added };
+      }
+      return read;
+    },
     enabled: !!taskId && !!runId,
-    refetchInterval: 5_000,
+    refetchInterval: (query) => (logsSettled(query.state.data, runFinished) ? false : 5_000),
+  });
+}
+
+/** Load the lines just before the first one shown. */
+export function useLoadEarlierLogs(taskId: string, runId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async () => {
+      const key = runLogsKey(taskId, runId);
+      const current = queryClient.getQueryData<LogWindow>(key);
+      const request = current ? earlierRequest(current) : null;
+      if (!request) return;
+      const lines = await tasksApi.getRunLogs(taskId, runId, request);
+      queryClient.setQueryData<LogWindow>(key, (w) => (w ? prependLogs(w, lines) : w));
+    },
   });
 }
 
