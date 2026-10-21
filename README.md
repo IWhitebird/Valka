@@ -149,6 +149,21 @@ again, so steps with external side effects should still be idempotent. Checkpoin
 visible at `GET /api/v1/tasks/{id}/checkpoints` and on the task page. Runnable examples:
 `examples/{rs,typescript,go,python}` (`steps`).
 
+## Performance
+
+Measured on a laptop (Intel i5-12450H) with CPU limits; setup, method, failover and how to
+reproduce every number are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+| 1,024 creates in flight | One node, local disk | Three nodes, MinIO |
+|---|---:|---:|
+| Creates per second | 17,830 | 15,613 |
+| Acknowledgement p50 / p99 | 57 / 75 ms | 63 / 132 ms |
+| Pickup p50 / p99 | 81 / 307 ms | 64 / 132 ms |
+| Tasks run | all | all |
+
+After `kill -9` of a node, every shard is served again 12–28 s later (lease timeout, then
+claims). A five-minute chaos run of kills, freezes and restarts lost nothing.
+
 ## Architecture
 
 ```
@@ -275,12 +290,15 @@ Layered via [figment](https://github.com/SergioBenitez/Figment): defaults → `v
 - [x] Polyglot SDKs — Rust, TypeScript, Go, Python
 - [x] Object-storage WAL: diskless nodes, snapshots, exact replay, fault-injected tests
 - [x] Many nodes on one bucket: leases, owner records, log splitting, placement, routing, cross-node workers, worker reattach, admin API (TLA+-checked protocol, randomized simulation, chaos rig)
+- [x] API keys, per-node limits, idempotent replay of creates; node lists and safe retries in every SDK
+- [x] Load and failover benchmarks
 
 ### Up Next
 
-- [ ] Helm chart and systemd units
+- [ ] Publish the SDKs to crates.io, npm and PyPI
+- [ ] Helm chart and systemd units; arm64 images
 - [ ] Network-split chaos and a 24 h soak
-- [ ] Task priorities and weighted fair queuing
+- [ ] Weighted fair queuing across queues
 - [ ] Cron / recurring task scheduling
 - [ ] Rate limiting per queue
 - [ ] Task batching
